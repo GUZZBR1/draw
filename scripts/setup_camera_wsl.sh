@@ -15,6 +15,10 @@
 # Se o attach ainda falhar, ele desabilita a funcao e confere o status dela.
 # Funcao de video aberta vira parada do servico FrameServer.
 # Depois ele tenta o attach uma ultima vez.
+# No fim, com a camera anexada, o script confere a permissao de /dev/video*.
+# Sem leitura e escrita para o usuario, ele o adiciona ao grupo video.
+# Se foi este script que parou os servicos de audio do Windows, ele religa
+# o Audiosrv no fim e confere a camera de novo.
 #
 # Rodar de novo e seguro. Apos reiniciar o WSL, so o attach precisa ser refeito.
 # DRAW_DRY_RUN=1 mostra os comandos sem executar nada.
@@ -32,7 +36,7 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-echo "Draw. Setup da camera no WSL. Script v6."
+echo "Draw. Setup da camera no WSL. Script v7."
 
 say()  { printf '\n==> %s\n' "$*"; }
 warn() { printf 'AVISO: %s\n' "$*" >&2; }
@@ -163,6 +167,7 @@ bind_usbipd() { # $1 = 1 para --force (arranca a camera do Windows a forca)
 }
 
 ATTACH_OUT=""
+AUDIO_STOPPED=0
 try_attach() {
   if [ "$DRY_RUN" = "1" ]; then
     run "$USBIPD" attach --wsl --busid "$BUSID"
@@ -277,6 +282,7 @@ act_on_vetoed_function() {
     echo "A funcao vetada e de audio. Classe $PNP_CLASS. Nome $PNP_NAME."
     say "Parando os servicos de audio do Windows. A confirmacao de administrador vai abrir duas vezes."
     stop_audio_services
+    AUDIO_STOPPED=1
     verify_audio_services_stopped \
       || die "A parada dos servicos de audio nao pegou. Os status impressos acima sao a prova disso. Rode o script de novo e aceite as confirmacoes de administrador."
     say "Tentando o attach com os servicos de audio parados."
@@ -421,8 +427,25 @@ if ls /dev/video* >/dev/null 2>&1; then
   ls -l /dev/video*
   command -v lsusb >/dev/null 2>&1 && lsusb | grep -iE 'camera|webcam|uvc' || true
   FIRST_VIDEO="$(ls /dev/video* | head -1)"
-  if [ ! -r "$FIRST_VIDEO" ]; then
-    warn "$FIRST_VIDEO sem permissao de leitura. Rode: sudo usermod -aG video $USER. Depois reinicie o WSL com wsl --shutdown no PowerShell."
+  if [ ! -r "$FIRST_VIDEO" ] || [ ! -w "$FIRST_VIDEO" ]; then
+    say "Ajustando a permissao de $FIRST_VIDEO. Adicionando ${USER:-$(id -un)} ao grupo video."
+    run sudo usermod -aG video "${USER:-$(id -un)}"
+    echo "As proximas sessoes ja entram com a permissao."
+    echo "Nesta sessao, rode o Draw assim: sg video -c \"python3 main.py\""
+  else
+    echo "Permissao de $FIRST_VIDEO ok para o usuario ${USER:-$(id -un)}."
+  fi
+  if [ "$AUDIO_STOPPED" = "1" ]; then
+    say "Religando o servico de audio do Windows (Audiosrv). Clique em Sim na confirmacao de administrador."
+    run powershell.exe -NoProfile -Command \
+      "Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile','-Command','Start-Service Audiosrv') -Verb RunAs -Wait"
+    sleep 1
+    if ls /dev/video* >/dev/null 2>&1; then
+      echo "Audio religado e a camera continua anexada: /dev/video* presente."
+    else
+      warn "Depois de religar o audio, /dev/video* sumiu. O Windows pode ter retomado a camera."
+      warn "Rode o script de novo para anexar outra vez."
+    fi
   fi
   say "Camera conectada ao WSL. Agora e so: python main.py"
 else

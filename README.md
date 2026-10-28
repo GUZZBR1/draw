@@ -92,6 +92,12 @@ futuro vivem no Linux, a solução é separar **captura** de **processamento**:
   imprime a identificação e para, porque não há ação segura conhecida
   para ela.
 
+Quando a câmera se comportar mal, rode primeiro `python main.py --check`.
+Ele valida cada porta de entrada em ordem: o OpenCV, a existência de
+`/dev/video*`, a permissão do seu usuário sobre o dispositivo e a leitura
+de um quadro real. Cada falha sai nomeada, com a correção exata na linha
+seguinte. Rode ele antes de mexer em qualquer outra coisa.
+
 - **Rota reserva: ponte de captura no Windows:** se a rota do usbipd
   falhar na sua máquina, um único `ffmpeg.exe` no Windows pode ler a
   webcam e servir o vídeo como stream MJPEG para o Draw no WSL, que

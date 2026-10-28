@@ -2,6 +2,7 @@
 
 Uso:
   python main.py                                  # webcam local (indice 0)
+  python main.py --check                          # valida a camera e sai
   python main.py --markers                        # folha-modelo impressa
   python main.py --source 1                       # outra webcam local
   python main.py --source http://192.168.0.10:8080/video   # camera via rede
@@ -15,6 +16,9 @@ Teclas: s = salvar o canvas como PNG, q/Esc = sair.
 """
 
 import argparse
+import glob
+import os
+import sys
 import time
 from pathlib import Path
 
@@ -61,39 +65,157 @@ def is_wsl():
         return False
 
 
+def _configure_local_capture(capture):
+    # MJPG comprimido e 720p: o formato cru padrao (YUYV em 1080p)
+    # estoura a banda do USB virtual do usbip no WSL e a entrega de
+    # quadros trava com timeout de select() no V4L2.
+    capture.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+    capture.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+    capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+
+
+def _local_open_hint(source):
+    """Diagnostico por porta: nomeia a primeira condicao que impede a abertura."""
+    node = f"/dev/video{source}"
+    if not sys.platform.startswith("linux"):
+        return (
+            "Nenhuma webcam local respondeu nesse indice. "
+            "Confira se a webcam esta conectada e livre."
+        )
+    if not os.path.exists(node):
+        hint = f"A camera nao esta conectada a este sistema: {node} nao existe. "
+        if is_wsl():
+            hint += (
+                "Anexe a camera ao WSL com: bash scripts/setup_camera_wsl.sh. "
+                "A alternativa e uma camera via rede: python main.py "
+                "--source http://<ip-da-camera>:8080/video."
+            )
+        else:
+            hint += "Confira se a webcam esta conectada a este computador."
+        return hint
+    if not os.access(node, os.R_OK | os.W_OK):
+        return (
+            f"{node} existe, mas este processo nao tem permissao de "
+            "leitura e escrita nele. A porta que falhou e a permissao. "
+            "Correcao definitiva: sudo usermod -aG video $USER "
+            "(vale nas proximas sessoes). "
+            'Correcao nesta sessao: sg video -c "python3 main.py".'
+        )
+    return (
+        f"{node} existe e este processo tem permissao nele, mas a "
+        "abertura falhou. Outro programa provavelmente esta usando a "
+        "camera. Feche esse programa e tente de novo."
+    )
+
+
 def _open_capture(source):
     capture = cv2.VideoCapture(source)
     if capture.isOpened():
         if isinstance(source, int):
-            # MJPG comprimido e 720p: o formato cru padrao (YUYV em 1080p)
-            # estoura a banda do USB virtual do usbip no WSL e a entrega de
-            # quadros trava com timeout de select() no V4L2.
-            capture.set(
-                cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG")
-            )
-            capture.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-            capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+            _configure_local_capture(capture)
         return capture
-    hint = (
-        f"Nao consegui abrir a fonte de video: {source!r}. "
-    )
+    hint = f"Nao consegui abrir a fonte de video: {source!r}. "
     if isinstance(source, int):
-        hint += "Nenhuma webcam local respondeu nesse indice. "
-        if is_wsl():
-            hint += (
-                "Voce esta no WSL: por padrao ele nao enxerga a webcam do "
-                "Windows (nenhum /dev/video* existe ai). Use uma camera via "
-                "rede: python main.py --source http://<ip-da-camera>:8080/video. "
-                "Veja a secao 'Rodando no WSL' do README."
-            )
-        else:
-            hint += "Confira se a webcam esta conectada e livre."
+        hint += _local_open_hint(source)
     else:
         hint += (
             "Confira se a URL esta certa, se a camera esta transmitindo e "
             "se este computador alcanca o endereco dela na rede."
         )
     raise RuntimeError(hint)
+
+
+def _video_nodes():
+    return sorted(
+        path
+        for path in glob.glob("/dev/video*")
+        if path[len("/dev/video"):].isdigit()
+    )
+
+
+def run_check(source=0):
+    """Validacao da camera local, porta por porta. Retorna 0 ou 1."""
+    print(f"PASS: OpenCV disponivel. Versao {cv2.__version__}.")
+
+    nodes = _video_nodes()
+    if not nodes:
+        print("FAIL: nenhum /dev/video* existe neste sistema.")
+        if is_wsl():
+            print(
+                "  Correcao: anexe a camera com "
+                "bash scripts/setup_camera_wsl.sh. A alternativa e uma "
+                "camera via rede com --source."
+            )
+        else:
+            print("  Correcao: conecte uma webcam a este computador.")
+        return 1
+    print(f"PASS: dispositivos de video encontrados: {', '.join(nodes)}.")
+
+    all_ok = True
+    node = nodes[0]
+
+    access = os.access(node, os.R_OK | os.W_OK)
+    group_note = ""
+    try:
+        import grp
+
+        gid = os.stat(node).st_gid
+        try:
+            group_name = grp.getgrgid(gid).gr_name
+        except KeyError:
+            group_name = str(gid)
+        in_group = gid in os.getgroups()
+        group_note = (
+            f" Grupo dono de {node}: {group_name}. "
+            f"Este processo esta nesse grupo: {'sim' if in_group else 'nao'}."
+        )
+    except Exception:
+        group_note = ""
+    if access:
+        print(f"PASS: este processo le e escreve em {node}.{group_note}")
+    else:
+        print(
+            f"FAIL: este processo nao tem permissao de leitura e "
+            f"escrita em {node}.{group_note}"
+        )
+        print(
+            "  Correcao definitiva: sudo usermod -aG video $USER "
+            "(vale nas proximas sessoes)."
+        )
+        print('  Correcao nesta sessao: sg video -c "python3 main.py".')
+        all_ok = False
+
+    index = int(node[len("/dev/video"):])
+    capture = cv2.VideoCapture(index)
+    if not capture.isOpened():
+        print(
+            f"FAIL: nao consegui abrir {node}. Outro programa "
+            "provavelmente esta usando a camera."
+        )
+        return 1
+    _configure_local_capture(capture)
+    frame = None
+    deadline = time.time() + 3.0
+    while time.time() < deadline:
+        ok, candidate = capture.read()
+        if ok and candidate is not None:
+            frame = candidate
+            break
+        time.sleep(0.1)
+    capture.release()
+    if frame is not None:
+        print(
+            f"PASS: quadro lido de {node}. "
+            f"Formato (altura, largura, canais): {frame.shape}."
+        )
+    else:
+        print(
+            f"FAIL: {node} abriu, mas nenhum quadro chegou em 3 "
+            "segundos. A camera pode estar ocupada ou travada."
+        )
+        all_ok = False
+
+    return 0 if all_ok else 1
 
 
 def _fit(image, max_h=700):
@@ -286,8 +408,16 @@ def main():
         action="store_true",
         help="usa a folha-modelo impressa com marcadores ArUco",
     )
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="valida a camera local porta por porta e sai, sem abrir janela",
+    )
     parser.add_argument("--save-dir", default="captures")
     args = parser.parse_args()
+    if args.check:
+        parsed = parse_source(args.source)
+        sys.exit(run_check(parsed if isinstance(parsed, int) else 0))
     run(
         source=args.source,
         save_dir=args.save_dir,
