@@ -167,6 +167,15 @@ detector clássico em cada frame e grava os cantos encontrados (TL, TR,
 BR, BL) em `labels.json`, com imagens de revisão em `overlays/` para um
 humano conferir os rótulos antes de eles virarem treino.
 
+O detector sem marcadores tem um portão de textura: o interior do
+quadrilátero candidato precisa parecer papel, medido por fração de
+branco, densidade de bordas internas e variância do Laplaciano.
+Retângulos grandes de mesa, caixa ou tela, que só têm o formato, são
+recusados. A limitação conhecida fica com a folha totalmente em branco
+e lisa: por dentro, ela mede igual a qualquer outro retângulo branco.
+Nesse caso a detecção entra marcada como baixa confiança e exige o
+dobro de confirmações seguidas antes de travar.
+
 Sem webcam por perto, dá para validar o pipeline inteiro com uma cena
 sintética (folha inclinada, desenhada por código):
 
