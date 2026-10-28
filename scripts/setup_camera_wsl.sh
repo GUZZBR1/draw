@@ -32,6 +32,8 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+echo "Draw — setup da camera no WSL (script v3: detecta 'Device busy' e tenta bind --force sozinho)"
+
 say()  { printf '\n==> %s\n' "$*"; }
 warn() { printf 'AVISO: %s\n' "$*" >&2; }
 die()  { printf 'ERRO: %s\n' "$*" >&2; exit 1; }
@@ -185,6 +187,10 @@ else
       warn "O Windows esta usando a camera agora (app de Camera, navegador, Teams/Zoom, Windows Hello...)."
       warn "Tentando de novo com bind --force, que desliga a camera do Windows a forca."
       bind_usbipd 1
+      if [ "$DRY_RUN" != "1" ]; then
+        echo "Estado da camera apos o bind --force (o esperado e 'Shared (forced)'):"
+        "$USBIPD" list 2>/dev/null | tr -d '\r' | grep "^$BUSID" || true
+      fi
       say "Anexando de novo (attach, apos --force)..."
       try_attach \
         || die "Mesmo com --force o attach falhou. Feche qualquer programa usando a camera no Windows e rode o script de novo."
