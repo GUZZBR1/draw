@@ -51,6 +51,11 @@ from . import config
 class Stroke:
     points: list
     closed: bool = False
+    # Opcionais, preenchidos só pela etapa de rastreamento temporal
+    # (etapa 5 do Senado). Sem eles, a exportação em escala real
+    # omite data-id/data-order em vez de fingir uma sequência.
+    id: object = None
+    order: object = None
 
     @property
     def length(self):
