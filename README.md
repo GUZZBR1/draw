@@ -75,12 +75,14 @@ futuro vivem no Linux, a solução é separar **captura** de **processamento**:
   customizado — caminho pesado e frágil). Enquanto anexada ao WSL, a
   câmera fica indisponível para o Windows.
 
-  A v5 do script corrige a leitura desse log e vai um nível abaixo. O
+  A v6 do script corrige a leitura desse log e vai um nível abaixo. O
   provedor certo dos eventos é `usbipd-win`. Quando o veto nomeia uma
   função de uma câmera composta, como a função `MI_02`, o script extrai
   esse identificador do texto e identifica a função com `Get-PnpDevice`
-  antes de agir. Se a função for de áudio, ele desabilita só ela e tenta
-  o attach de novo, sem tocar na função de vídeo. Se a função for de
+  antes de agir. Se a função for de áudio, ele para os serviços de
+  áudio do Windows e tenta o attach. Se ainda falhar, ele desabilita
+  só essa função, sem tocar na função de vídeo, e confere o status. O
+  attach final só é tentado se a desabilitação tiver pegado. Se a função for de
   vídeo, ele para o serviço FrameServer. Se a classe for outra, ele
   imprime a identificação e para, porque não há ação segura conhecida
   para ela.

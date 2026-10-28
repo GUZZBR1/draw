@@ -11,7 +11,8 @@
 # Se o attach falhar com Device busy, o script le o log de eventos do Windows.
 # Esse log nomeia a funcao do dispositivo que vetou a remocao.
 # O script identifica essa funcao com Get-PnpDevice antes de agir.
-# Funcao de audio aberta vira Disable-PnpDevice dessa funcao.
+# Funcao de audio aberta faz o script parar os servicos de audio do Windows e tentar o attach.
+# Se o attach ainda falhar, ele desabilita a funcao e confere o status dela.
 # Funcao de video aberta vira parada do servico FrameServer.
 # Depois ele tenta o attach uma ultima vez.
 #
@@ -31,7 +32,7 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-echo "Draw. Setup da camera no WSL. Script v5."
+echo "Draw. Setup da camera no WSL. Script v6."
 
 say()  { printf '\n==> %s\n' "$*"; }
 warn() { printf 'AVISO: %s\n' "$*" >&2; }
@@ -213,6 +214,38 @@ stop_frameserver() {
     "Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile','-Command','Stop-Service -Name FrameServer -Force -ErrorAction SilentlyContinue') -Verb RunAs -Wait"
 }
 
+stop_audio_services() {
+  run powershell.exe -NoProfile -Command \
+    "Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile','-Command','Stop-Service -Name Audiosrv -Force -ErrorAction SilentlyContinue') -Verb RunAs -Wait"
+  run powershell.exe -NoProfile -Command \
+    "Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile','-Command','Stop-Service -Name AudioEndpointBuilder -Force -ErrorAction SilentlyContinue') -Verb RunAs -Wait"
+}
+
+verify_audio_services_stopped() {
+  local ps_cmd="Get-Service -Name Audiosrv, AudioEndpointBuilder -ErrorAction SilentlyContinue | ForEach-Object { \"\$(\$_.Name) \$(\$_.Status)\" }"
+  local out
+  out="$(powershell.exe -NoProfile -Command "$ps_cmd" 2>/dev/null | tr -d '\r')"
+  echo "Status dos servicos de audio depois da tentativa de parar:"
+  printf '%s\n' "$out"
+  printf '%s\n' "$out" | grep -qE '^Audiosrv[[:space:]]+Stopped' \
+    && printf '%s\n' "$out" | grep -qE '^AudioEndpointBuilder[[:space:]]+Stopped'
+}
+
+verify_function_disabled() {
+  local ps_cmd="\$d = Get-PnpDevice -InstanceId '$VETO_INSTANCE*' -ErrorAction SilentlyContinue; if (\$d) { \$d | Select-Object Status, Problem | Format-List }"
+  local out status problem
+  out="$(powershell.exe -NoProfile -Command "$ps_cmd" 2>/dev/null | tr -d '\r')"
+  echo "Status dessa funcao depois da tentativa de desabilitar:"
+  printf '%s\n' "$out"
+  [ -n "$out" ] || return 1
+  status="$(printf '%s\n' "$out" | sed -n 's/^Status[[:space:]]*:[[:space:]]*//p' | head -1)"
+  problem="$(printf '%s\n' "$out" | sed -n 's/^Problem[[:space:]]*:[[:space:]]*//p' | head -1)"
+  if [ -n "$status" ] && [ "$status" != "OK" ]; then
+    return 0
+  fi
+  printf '%s' "$problem" | grep -qi 'CM_PROB_DISABLED'
+}
+
 identify_vetoed_function() {
   local ps_cmd="\$d = Get-PnpDevice -InstanceId '$VETO_INSTANCE*' -ErrorAction SilentlyContinue; if (\$d) { \$d | Select-Object Status, Class, FriendlyName | Format-List }"
   PNP_OUT="$(powershell.exe -NoProfile -Command "$ps_cmd" 2>/dev/null | tr -d '\r')"
@@ -242,10 +275,24 @@ act_on_vetoed_function() {
   elif [ "$upper_class" = "AUDIO" ] || [ "$upper_class" = "MEDIA" ] \
        || printf '%s' "$PNP_NAME" | grep -qiE 'microphone|microfone|audio'; then
     echo "A funcao vetada e de audio. Classe $PNP_CLASS. Nome $PNP_NAME."
+    say "Parando os servicos de audio do Windows. A confirmacao de administrador vai abrir duas vezes."
+    stop_audio_services
+    verify_audio_services_stopped \
+      || die "A parada dos servicos de audio nao pegou. Os status impressos acima sao a prova disso. Rode o script de novo e aceite as confirmacoes de administrador."
+    say "Tentando o attach com os servicos de audio parados."
+    if try_attach; then
+      return 0
+    fi
+    attach_is_busy || return 1
     say "Desabilitando so essa funcao no Windows. A funcao de video fica intacta."
     local disable_cmd="Disable-PnpDevice -InstanceId \"$VETO_INSTANCE\" -Confirm:\$false"
     run powershell.exe -NoProfile -Command \
       "Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile','-Command','$disable_cmd') -Verb RunAs -Wait"
+    verify_function_disabled \
+      || die "A funcao continua ativa depois da desabilitacao. O status impresso acima e a prova disso. Desabilite essa funcao no Gerenciador de Dispositivos do Windows e rode o script de novo."
+    say "Ultima tentativa de attach depois de desabilitar a funcao vetada."
+    try_attach
+    return $?
   else
     warn "A funcao vetada tem classe $PNP_CLASS e nome $PNP_NAME."
     warn "O script nao conhece uma acao segura para essa classe. A evidencia impressa acima decide o proximo passo."
