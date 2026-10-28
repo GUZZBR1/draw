@@ -28,16 +28,21 @@ Pré-requisitos: Python 3.10+ e uma webcam.
 ```bash
 pip install -r requirements.txt
 
-# 1. Gerar e imprimir a folha-modelo (100% do tamanho, A4)
-python template/generate_template.py
-
-# 2. Rodar (aponte a webcam para a folha sobre a mesa)
+# Rodar com qualquer folha sobre a mesa
 python main.py
 
 # Outras fontes de vídeo: outro índice de webcam ou um stream de rede
 python main.py --source 1
 python main.py --source http://192.168.0.10:8080/video
 ```
+
+O fluxo padrão usa uma folha solta ou uma página de caderno sob a webcam.
+Ele dispensa impressão. O Draw encontra os cantos da folha, retifica a
+imagem e mostra o canvas digital.
+
+Modo opcional com folha-modelo: gere e imprima a folha com
+`python template/generate_template.py`, coloque a folha impressa sob a
+webcam e rode `python main.py --markers`.
 
 ## Rodando no WSL (Windows)
 
