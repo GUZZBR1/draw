@@ -3,3 +3,6 @@ __pycache__/
 captures/
 template/paper_template.png
 *.pyc
+.DS_Store
+.idea/
+.vscode/
