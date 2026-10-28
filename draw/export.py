@@ -47,8 +47,22 @@ de rastreamento temporal existir, os traços poderão carregar
 emite como ``data-id``/``data-order``; sem eles, os atributos
 são omitidos.
 
-DXF: deliberadamente fora desta etapa. Entra depois, com a
-escala já validada aqui.
+DXF (etapa 6 do Senado): escritor mínimo, ASCII, versão R2000
+(``AC1015``), escrito à mão, sem dependência nova. Usa a mesma
+escala uniforme daqui (A4 efetivo 210,00 x 296,47 mm), um
+``LWPOLYLINE`` por traço na layer ``DRAW_STROKES``, ``$INSUNITS
+= 4`` (mm) e ``$MEASUREMENT = 1``. Duas diferenças em relação ao
+SVG, ambas obrigatórias para CAD e ambas testadas:
+
+- Inversão de y: o Draw usa y para baixo (origem no canto
+  superior esquerdo da folha); o CAD usa y para cima. Sem
+  inverter, o DXF sai espelhado verticalmente. Aqui
+  ``y_dxf = altura_efetiva_mm - y_mm``.
+- Sem entidade CIRCLE: um traço fechado não é um círculo. Sem
+  ajuste de círculo, traço fechado vira ``LWPOLYLINE`` com flag
+  de fechado (70 = 1), nunca CIRCLE. Curvas saem como polilinhas
+  pelos pontos suavizados (facetação documentada, não spline).
+  Traços com menos de 2 pontos são ignorados, como no SVG.
 """
 
 import json
@@ -266,3 +280,68 @@ def export_strokes_scaled(strokes, base_path, scale=None, paper="A4",
         encoding="utf-8",
     )
     return svg_path, json_path
+
+
+def px_to_dxf(point, scale):
+    """Converte um ponto do canvas (px) para coordenadas DXF (mm).
+
+    O eixo y é invertido em relação ao SVG/JSON: o CAD mede y
+    para cima a partir da borda inferior da folha, enquanto o
+    Draw mede y para baixo a partir da borda superior.
+    """
+    x_mm, _y_mm = px_to_mm(point, scale)
+    _x, y_px = point
+    return (x_mm, scale.effective_height_mm - float(y_px) * scale.mm_per_px)
+
+
+def strokes_to_dxf(strokes, scale=None, paper="A4"):
+    """Serializa traços em DXF ASCII R2000, em milímetros.
+
+    Um ``LWPOLYLINE`` por traço, na layer ``DRAW_STROKES``; a
+    flag 70 é 1 para traço fechado e 0 para aberto, e o ponto
+    inicial NÃO é repetido no fim de um traço fechado (a flag
+    já fecha a polilinha). A ordem das entidades é a ordem da
+    lista recebida: para uma sessão, passe os traços em ordem
+    de sequência (``tracker.ordered``); para um snapshot, a
+    ordem atual por centroide. Sem dependência nova: o texto
+    é montado à mão, par por par (código de grupo, valor).
+    """
+    if scale is None:
+        scale = sheet_scale(paper=paper)
+    lines = [
+        "0", "SECTION", "2", "HEADER",
+        "9", "$ACADVER", "1", "AC1015",
+        "9", "$INSUNITS", "70", "4",
+        "9", "$MEASUREMENT", "70", "1",
+        "0", "ENDSEC",
+        "0", "SECTION", "2", "ENTITIES",
+    ]
+    for stroke in strokes:
+        if len(stroke.points) < 2:
+            continue
+        vertices = [px_to_dxf(p, scale) for p in stroke.points]
+        closed = bool(getattr(stroke, "closed", False))
+        lines += [
+            "0", "LWPOLYLINE",
+            "100", "AcDbEntity",
+            "8", "DRAW_STROKES",
+            "100", "AcDbPolyline",
+            "90", str(len(vertices)),
+            "70", "1" if closed else "0",
+        ]
+        for x, y in vertices:
+            lines += ["10", f"{x:.3f}", "20", f"{y:.3f}"]
+    lines += ["0", "ENDSEC", "0", "EOF"]
+    return "\n".join(lines) + "\n"
+
+
+def export_strokes_dxf(strokes, base_path, scale=None, paper="A4"):
+    """Escreve base_path.dxf (mm, R2000) e devolve o caminho."""
+    if scale is None:
+        scale = sheet_scale(paper=paper)
+    base = Path(base_path)
+    dxf_path = base.with_suffix(".dxf")
+    dxf_path.write_text(
+        strokes_to_dxf(strokes, scale=scale), encoding="utf-8"
+    )
+    return dxf_path

@@ -349,3 +349,33 @@ def export_session(tracker, base_path, scale=None, paper="A4",
         encoding="utf-8",
     )
     return svg_path, json_path
+
+
+def session_to_dxf(tracker, scale=None, paper="A4",
+                   include_erased=True):
+    """Sessão em DXF (mm), com entidades na ordem da sequência.
+
+    Reutiliza ``export.strokes_to_dxf`` sobre os traços
+    ordenados do tracker (não a ordem por centroide do
+    snapshot). A inversão de y e a escala uniforme são as do
+    módulo de exportação; traço fechado vira LWPOLYLINE com
+    flag de fechado, nunca CIRCLE.
+    """
+    if scale is None:
+        scale = export_module.sheet_scale(paper=paper)
+    strokes = tracker.ordered
+    if not include_erased:
+        strokes = [t for t in strokes if t.status == "stable"]
+    return export_module.strokes_to_dxf(strokes, scale=scale)
+
+
+def export_session_dxf(tracker, base_path, scale=None, paper="A4"):
+    """Escreve base_path.dxf (mm, ordem da sessão) e devolve o caminho."""
+    if scale is None:
+        scale = export_module.sheet_scale(paper=paper)
+    base = Path(base_path)
+    dxf_path = base.with_suffix(".dxf")
+    dxf_path.write_text(
+        session_to_dxf(tracker, scale=scale), encoding="utf-8"
+    )
+    return dxf_path
