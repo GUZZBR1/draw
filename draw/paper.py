@@ -1,16 +1,23 @@
 """Detecção da folha e correção de perspectiva (homografia).
 
-A webcam vê a folha inclinada. O modo padrão encontra o contorno externo
-da folha e usa os quatro cantos dela para montar a vista de cima. O modo
-com marcadores usa os centros dos quatro ArUco da folha-modelo. Os dois
-caminhos entregam a folha retificada no mesmo espaço definido em
-config.py.
+A webcam vê a folha inclinada. O modo padrão procura o contorno da folha
+na árvore de contornos da cena e usa os quatro cantos dela para montar a
+vista de cima. O modo com marcadores usa os centros dos quatro ArUco da
+folha-modelo. Os dois caminhos entregam a folha retificada no mesmo
+espaço definido em config.py.
 """
 
 import cv2
 import numpy as np
 
 from . import config
+
+
+# A folha nem sempre fecha como quadrilátero num epsilon só. Cantos
+# arredondados e a lombada de um caderno pedem aproximações mais grossas.
+_SHEET_EPSILON_LADDER = (0.01, 0.015, 0.02, 0.025, 0.03, 0.04, 0.05)
+_SHEET_MAX_CANDIDATES = 8
+_SHEET_MIN_AREA_RATIO = 0.12
 
 
 def _make_detector():
@@ -45,16 +52,18 @@ def _aspect_ratio(corners):
 
 def _sheet_candidate(contour, scale, small_frame_area):
     perimeter = cv2.arcLength(contour, True)
-    approx = cv2.approxPolyDP(contour, 0.02 * perimeter, True)
-    if len(approx) != 4 or not cv2.isContourConvex(approx):
-        return None
-    if cv2.contourArea(approx) < small_frame_area * 0.12:
-        return None
+    for epsilon in _SHEET_EPSILON_LADDER:
+        approx = cv2.approxPolyDP(contour, epsilon * perimeter, True)
+        if len(approx) != 4 or not cv2.isContourConvex(approx):
+            continue
+        if cv2.contourArea(approx) < small_frame_area * _SHEET_MIN_AREA_RATIO:
+            continue
 
-    corners = _order_corners(approx.reshape(4, 2))
-    if not 0.4 <= _aspect_ratio(corners) <= 2.5:
-        return None
-    return (corners / scale).astype(np.float32)
+        corners = _order_corners(approx.reshape(4, 2))
+        if not 0.4 <= _aspect_ratio(corners) <= 2.5:
+            continue
+        return (corners / scale).astype(np.float32)
+    return None
 
 
 def _refine_corners(frame, corners):
@@ -102,12 +111,20 @@ def detect_sheet(frame):
     edges = cv2.Canny(blurred, 30, 100)
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
     closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=2)
+    # RETR_TREE: o contorno da folha pode ser interno na hierarquia, como
+    # a volta de um caderno dentro de um borrão maior fundido na cena.
     contours, _ = cv2.findContours(
-        closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        closed, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE
     )
 
     small_frame_area = float(small.shape[0] * small.shape[1])
-    for contour in sorted(contours, key=cv2.contourArea, reverse=True):
+    min_area = small_frame_area * _SHEET_MIN_AREA_RATIO
+    candidates = [
+        contour
+        for contour in sorted(contours, key=cv2.contourArea, reverse=True)
+        if cv2.contourArea(contour) >= min_area
+    ][:_SHEET_MAX_CANDIDATES]
+    for contour in candidates:
         corners = _sheet_candidate(contour, scale, small_frame_area)
         if corners is not None:
             return _refine_corners(frame, corners)
