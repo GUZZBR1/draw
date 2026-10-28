@@ -12,7 +12,8 @@ enxerga webcams USB do Windows por padrao, mas enxerga streams de rede.
 Assim todo o processamento (e o ML futuro) fica no Linux. A camera so
 envia os frames. Ela pode ser um celular, outro computador ou uma camera IP.
 
-Teclas: s = salvar o canvas como PNG, q/Esc = sair.
+Teclas: s = salvar o canvas como PNG, f = capturar um frame cru,
+g = ligar ou desligar a captura automatica de frames, q/Esc = sair.
 """
 
 import argparse
@@ -233,7 +234,37 @@ def run(source=0, save_dir="captures", markers_mode=False):
         print("Draw v0 rodando. Mostre a folha-modelo para a camera.")
     else:
         print("Draw v0 rodando. Mostre uma folha para a camera.")
-    print("Teclas: s = salvar canvas, q/Esc = sair.")
+    print(
+        "Teclas: s = salvar canvas, f = capturar frame, "
+        "g = captura automatica (desligada), q/Esc = sair."
+    )
+
+    frames_path = save_path / "frames"
+    frames_saved = 0
+    auto_capture = False
+    loop_frames = 0
+
+    def save_raw_frame(img):
+        nonlocal frames_saved
+        frames_path.mkdir(parents=True, exist_ok=True)
+        out = frames_path / f"frame_{int(time.time() * 1000)}.png"
+        cv2.imwrite(str(out), img)
+        frames_saved += 1
+        print(f"Frame salvo em {out} (total: {frames_saved}).")
+
+    def handle_capture_key(key, img):
+        nonlocal auto_capture
+        if key == ord("f"):
+            save_raw_frame(img)
+        elif key == ord("g"):
+            auto_capture = not auto_capture
+            if auto_capture:
+                print(
+                    "Captura automatica ligada: um frame a cada "
+                    f"10 quadros vai para {frames_path}."
+                )
+            else:
+                print("Captura automatica desligada.")
 
     current_corners = None
     pending_corners = None
@@ -254,6 +285,10 @@ def run(source=0, save_dir="captures", markers_mode=False):
                 break
             continue
         falhas_seguidas = 0
+
+        loop_frames += 1
+        if auto_capture and loop_frames % 10 == 0:
+            save_raw_frame(frame)
 
         if markers_mode:
             warped, markers = paper_module.warp_paper(frame)
@@ -383,11 +418,13 @@ def run(source=0, save_dir="captures", markers_mode=False):
                 out = save_path / f"canvas_{int(time.time())}.png"
                 cv2.imwrite(str(out), canvas)
                 print(f"Canvas salvo em {out}")
+            handle_capture_key(key, frame)
             if key in (ord("q"), 27):
                 break
             continue
 
         key = cv2.waitKey(1) & 0xFF
+        handle_capture_key(key, frame)
         if key in (ord("q"), 27):
             break
 

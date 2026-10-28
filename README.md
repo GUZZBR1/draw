@@ -107,6 +107,14 @@ seguinte. Rode ele antes de mexer em qualquer outra coisa.
 
 Teclas dentro do app: `s` salva um PNG em `captures/` · `q` ou `Esc` sai.
 
+Para montar dados da trilha neural, o app captura frames crus da câmera:
+a tecla `f` salva o frame atual em `captures/frames/` e a tecla `g` liga
+ou desliga a captura automática, um frame a cada 10 quadros. Depois,
+`python tools/label_frames.py captures/frames dataset/rotulos` roda o
+detector clássico em cada frame e grava os cantos encontrados (TL, TR,
+BR, BL) em `labels.json`, com imagens de revisão em `overlays/` para um
+humano conferir os rótulos antes de eles virarem treino.
+
 Sem webcam por perto, dá para validar o pipeline inteiro com uma cena
 sintética (folha inclinada, desenhada por código):
 
