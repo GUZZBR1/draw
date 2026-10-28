@@ -34,7 +34,47 @@ python template/generate_template.py
 
 # 2. Rodar (aponte a webcam para a folha sobre a mesa)
 python main.py
+
+# Outras fontes de vídeo: outro índice de webcam ou um stream de rede
+python main.py --source 1
+python main.py --source http://192.168.0.10:8080/video
 ```
+
+## Rodando no WSL (Windows)
+
+O WSL2 **não enxerga a webcam do Windows por padrão**: não existe nenhum
+`/dev/video*` dentro dele, então `python main.py` falha com
+"Camera index out of range / nb_devices is 0". Isso não é um bug do Draw —
+é o WSL sem acesso ao hardware de câmera. Como todo o processamento e o ML
+futuro vivem no Linux, a solução é separar **captura** de **processamento**:
+
+- **Recomendado — câmera via rede:** qualquer câmera que transmita MJPEG
+  pela rede vira fonte do Draw, sem instalar nada no Windows. A opção mais
+  simples é um celular sobre a mesa com um app de IP camera (ex.: IP Webcam
+  no Android), que transmite em `http://<ip-do-celular>:8080/video`:
+  `python main.py --source http://<ip-do-celular>:8080/video`
+  De quebra, o celular num suporte acima da folha enxerga o papel melhor
+  que a webcam do notebook.
+- **Webcam do Windows via usbipd — um comando só:** para usar a webcam do
+  notebook ou uma webcam USB dentro do WSL, rode (de dentro do WSL):
+  `./scripts/setup_camera_wsl.sh`
+  O script confere o driver `uvcvideo`, instala o que falta (ferramentas
+  USB no WSL e o usbipd-win no Windows), acha sua câmera, compartilha e
+  anexa ela ao WSL, e confirma que `/dev/video*` apareceu. Ele é
+  idempotente — depois de reiniciar o WSL, rode o mesmo comando de novo.
+  Se o `attach` falhar com "Device busy", o script limpa registros antigos
+  de attach nos dois lados e tenta de novo com `bind --force`. Se ainda
+  falhar, ele lê o log de eventos do Windows. Esse log nomeia o componente
+  que bloqueou a remoção da câmera. O script para esse componente uma vez
+  e faz uma última tentativa de attach. Se mesmo assim falhar, ele imprime
+  o texto completo do bloqueio. Esse texto é o diagnóstico.
+  A única interação que sobra é clicar **Sim** na confirmação de
+  administrador do Windows (UAC) na primeira vez: nenhum script pode
+  passar por ela, por design de segurança do Windows. Depois é só
+  `python main.py`. Atenção: se o kernel do WSL não tiver o módulo
+  `uvcvideo`, o script avisa e para (a alternativa seria um kernel
+  customizado — caminho pesado e frágil). Enquanto anexada ao WSL, a
+  câmera fica indisponível para o Windows.
 
 Teclas dentro do app: `s` salva um PNG em `captures/` · `v` salva
 traços vetoriais em `captures/` (SVG + JSON) · `q` ou `Esc` sai.
@@ -97,6 +137,7 @@ o traço foi desenhado. Rastrear a ordem temporal, frame a frame,
 ## Roadmap
 
 - [x] v0.1 — captura: folha retificada + canvas digital em tempo real
+- [x] v0.1.1 — fonte de vídeo flexível (`--source` índice ou URL) para rodar no WSL com câmera via rede
 - [x] v0.2 — traço vetorial: ordem, caminho e suavização dos traços
 - [ ] v0.3 — reprodução dos traços no Paint via controle do mouse
 - [ ] v1 — interpretação: formas, letras e diagramas a partir dos traços

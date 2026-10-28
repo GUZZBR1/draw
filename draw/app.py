@@ -1,7 +1,16 @@
-"""Loop principal: webcam -> folha retificada -> canvas digital ao vivo.
+"""Loop principal: camera -> folha retificada -> canvas digital ao vivo.
 
-Uso: python main.py [--camera 0] [--save-dir captures]
-Teclas: s = salvar o canvas como PNG, v = salvar traços vetoriais
+Uso:
+  python main.py                                  # webcam local (indice 0)
+  python main.py --source 1                       # outra webcam local
+  python main.py --source http://192.168.0.10:8080/video   # camera via rede
+
+A fonte via rede (MJPEG/RTSP) e o caminho recomendado no WSL: o WSL nao
+enxerga webcams USB do Windows por padrao, mas enxerga streams de rede.
+Assim todo o processamento (e o ML futuro) fica no Linux, e a camera —
+celular, outro computador ou uma camera IP — so envia os frames.
+
+Teclas: s = salvar o canvas como PNG, v = salvar tracos vetoriais
 (SVG + JSON), q/Esc = sair.
 """
 
@@ -16,6 +25,50 @@ from . import paper as paper_module
 from . import strokes as strokes_module
 
 
+def parse_source(value):
+    """'0'/'1' viram indice de webcam local; qualquer outra coisa e URL/arquivo."""
+    if value is None:
+        return 0
+    if isinstance(value, int):
+        return value
+    text = str(value).strip()
+    return int(text) if text.isdigit() else text
+
+
+def is_wsl():
+    """Detecta WSL pelo nome do kernel em /proc (ex.: '...-microsoft-standard-WSL2')."""
+    try:
+        return "microsoft" in Path("/proc/sys/kernel/osrelease").read_text().lower()
+    except OSError:
+        return False
+
+
+def _open_capture(source):
+    capture = cv2.VideoCapture(source)
+    if capture.isOpened():
+        return capture
+    hint = (
+        f"Nao consegui abrir a fonte de video: {source!r}. "
+    )
+    if isinstance(source, int):
+        hint += "Nenhuma webcam local respondeu nesse indice. "
+        if is_wsl():
+            hint += (
+                "Voce esta no WSL: por padrao ele nao enxerga a webcam do "
+                "Windows (nenhum /dev/video* existe ai). Use uma camera via "
+                "rede: python main.py --source http://<ip-da-camera>:8080/video "
+                "— veja a secao 'Rodando no WSL' do README."
+            )
+        else:
+            hint += "Confira se a webcam esta conectada e livre."
+    else:
+        hint += (
+            "Confira se a URL esta certa, se a camera esta transmitindo e "
+            "se este computador alcanca o endereco dela na rede."
+        )
+    raise RuntimeError(hint)
+
+
 def _fit(image, max_h=700):
     h, w = image.shape[:2]
     if h <= max_h:
@@ -24,15 +77,10 @@ def _fit(image, max_h=700):
     return cv2.resize(image, (int(w * scale), max_h))
 
 
-def run(camera_index=0, save_dir="captures"):
-    capture = cv2.VideoCapture(camera_index)
-    if not capture.isOpened():
-        raise RuntimeError(
-            f"Nao consegui abrir a webcam {camera_index}. "
-            "Confira se ela esta conectada e livre."
-        )
+def run(source=0, save_dir="captures"):
+    capture = _open_capture(parse_source(source))
     save_path = Path(save_dir)
-    print("Draw v0 rodando. Mostre a folha-modelo para a webcam.")
+    print("Draw v0 rodando. Mostre a folha-modelo para a camera.")
     print("Teclas: s = salvar canvas, v = salvar tracos vetoriais, "
           "q/Esc = sair.")
 
@@ -93,10 +141,15 @@ def run(camera_index=0, save_dir="captures"):
 
 def main():
     parser = argparse.ArgumentParser(description="Draw v0 — papel -> digital")
-    parser.add_argument("--camera", type=int, default=0)
+    parser.add_argument(
+        "--source",
+        default="0",
+        help="indice da webcam local (0, 1...) ou URL do stream "
+        "(ex.: http://192.168.0.10:8080/video). Padrao: 0",
+    )
     parser.add_argument("--save-dir", default="captures")
     args = parser.parse_args()
-    run(camera_index=args.camera, save_dir=args.save_dir)
+    run(source=args.source, save_dir=args.save_dir)
 
 
 if __name__ == "__main__":
