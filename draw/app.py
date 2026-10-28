@@ -29,6 +29,7 @@ import cv2
 import numpy as np
 
 from . import capture as capture_module
+from . import diagnose as diagnose_module
 from . import ink as ink_module
 from . import paper as paper_module
 from . import strokes as strokes_module
@@ -455,6 +456,35 @@ def main():
         help="lista as webcams locais que abrem e sai, sem abrir janela",
     )
     parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="com --list-cameras, acrescenta backend e props negociadas",
+    )
+    parser.add_argument(
+        "--test-source",
+        default=None,
+        metavar="FONTE",
+        help="sonda uma fonte (indice, /dev/videoN, arquivo ou URL) "
+        "e sai, sem abrir janela e sem acao no sistema",
+    )
+    parser.add_argument(
+        "--test-all",
+        action="store_true",
+        help="sonda as webcams locais que abrem e sai, sem abrir janela",
+    )
+    parser.add_argument(
+        "--include-urls",
+        nargs="*",
+        default=[],
+        help="com --test-all, sonda tambem estas URLs explicitamente",
+    )
+    parser.add_argument(
+        "--report",
+        choices=["text", "json"],
+        default="text",
+        help="formato do relatorio de --test-source/--test-all",
+    )
+    parser.add_argument(
         "--width", type=int, default=None,
         help="largura pedida para webcam local (padrao: 1280)",
     )
@@ -481,9 +511,63 @@ def main():
     )
     parser.add_argument("--save-dir", default="captures")
     args = parser.parse_args()
+    if args.test_source is not None or args.test_all or args.include_urls:
+        reports = []
+        if args.test_source is not None:
+            reports.append(diagnose_module.probe_source(args.test_source))
+        if args.test_all:
+            reports.extend(diagnose_module.probe_all(
+                include_urls=args.include_urls
+            ))
+        elif args.include_urls:
+            reports.extend(diagnose_module.probe_all(
+                include_urls=args.include_urls,
+                list_fn=lambda: [],
+            ))
+        if args.report == "json":
+            import json
+
+            print(json.dumps(
+                [report.to_dict() for report in reports],
+                indent=2, default=str,
+            ))
+        else:
+            for report in reports:
+                print(diagnose_module.format_report(report))
+        if not reports:
+            sys.exit(2)
+        sys.exit(0 if all(report.ok for report in reports) else 1)
     if args.list_cameras:
         results = capture_module.list_cameras()
-        print(capture_module.format_camera_list(results))
+        if args.verbose:
+            probed = {}
+            for item in results:
+                if item["opened"]:
+                    probed[item["index"]] = diagnose_module.probe_source(
+                        item["index"], read_frames=1
+                    )
+            lines = []
+            for item in results:
+                status = "ok" if item["opened"] else "nao abriu"
+                node = f" ({item['node']})" if item.get("node") else ""
+                detail = ""
+                report = probed.get(item["index"])
+                if report is not None:
+                    props = []
+                    if report.width and report.height:
+                        props.append(f"{report.width}x{report.height}")
+                    if report.fps:
+                        props.append(f"@{report.fps}fps")
+                    if report.fourcc:
+                        props.append(str(report.fourcc))
+                    if report.backend_used:
+                        props.append(str(report.backend_used))
+                    if props:
+                        detail = f" [{', '.join(props)}]"
+                lines.append(f"  {item['index']}{node}: {status}{detail}")
+            print("\n".join(lines))
+        else:
+            print(capture_module.format_camera_list(results))
         sys.exit(0 if any(item["opened"] for item in results) else 1)
     if args.check:
         parsed = parse_source(args.source)
