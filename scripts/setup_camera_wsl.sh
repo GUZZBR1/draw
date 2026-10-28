@@ -1,22 +1,18 @@
 #!/usr/bin/env bash
-# Draw — conecta a webcam do Windows ao WSL em um comando só.
+# Draw. Conecta a webcam do Windows ao WSL em um comando so.
 #
-# Uso (de dentro do WSL, na raiz do projeto):
-#   ./scripts/setup_camera_wsl.sh              # detecta a camera sozinho
-#   ./scripts/setup_camera_wsl.sh --busid 1-4  # usa esse BUSID do usbipd
+# Uso, de dentro do WSL e na raiz do projeto:
+#   ./scripts/setup_camera_wsl.sh
+#   ./scripts/setup_camera_wsl.sh --busid 1-4
 #
-# O que ele faz, na ordem:
-#   1. Confere se voce esta no WSL e se o kernel tem o driver uvcvideo
-#   2. Instala as ferramentas USB no WSL (apt) e o usbipd-win no Windows
-#      (winget), se faltarem
-#   3. Acha a sua camera na lista do usbipd
-#   4. Compartilha (bind) — abre UMA janela de confirmacao de administrador
-#      do Windows (UAC); e a unica parte que nenhum script pode fazer por
-#      voce, por design de seguranca do Windows
-#   5. Anexa (attach) a camera ao WSL e confere /dev/video*
+# O script confere o WSL e o driver uvcvideo. Instala o que falta.
+# Acha a camera na lista do usbipd. Limpa registros antigos de attach.
+# Compartilha e anexa a camera. Depois confere /dev/video*.
+# Se o attach falhar com Device busy, o script le o log de eventos do Windows.
+# Esse log nomeia o componente que vetou a remocao do dispositivo.
+# O script para esse componente uma vez e tenta o attach de novo.
 #
-# O script e idempotente: pode rodar de novo em toda sessao (apos reiniciar
-# o WSL, so o attach precisa ser refeito — e e o que ele faz sozinho).
+# Rodar de novo e seguro. Apos reiniciar o WSL, so o attach precisa ser refeito.
 # DRAW_DRY_RUN=1 mostra os comandos sem executar nada.
 
 set -uo pipefail
@@ -32,7 +28,7 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-echo "Draw — setup da camera no WSL (script v3: detecta 'Device busy' e tenta bind --force sozinho)"
+echo "Draw. Setup da camera no WSL. Script v4."
 
 say()  { printf '\n==> %s\n' "$*"; }
 warn() { printf 'AVISO: %s\n' "$*" >&2; }
@@ -155,7 +151,7 @@ bind_usbipd() { # $1 = 1 para --force (arranca a camera do Windows a forca)
   if [ "${1:-0}" = "1" ]; then
     args="@('bind','--force','--busid','$BUSID')"
   fi
-  say "Compartilhando (bind) — vai abrir a confirmacao de administrador do Windows; clique em Sim."
+  say "Compartilhando (bind). Vai abrir a confirmacao de administrador do Windows. Clique em Sim."
   local win_usbipd
   win_usbipd="$(to_winpath "$USBIPD")"
   run powershell.exe -NoProfile -Command \
@@ -174,26 +170,121 @@ try_attach() {
   return $status
 }
 
+attach_is_busy() {
+  printf '%s' "$ATTACH_OUT" | grep -qi 'device busy'
+}
+
+clear_stale_state() {
+  say "Limpando registros antigos de attach dos dois lados."
+  if command -v usbip >/dev/null 2>&1; then
+    if [ "$DRY_RUN" = "1" ]; then
+      run sudo usbip port
+    else
+      local ports_out ports port
+      ports_out="$(sudo usbip port 2>/dev/null || true)"
+      echo "Portas usbip neste WSL agora:"
+      printf '%s\n' "$ports_out"
+      ports="$(printf '%s\n' "$ports_out" | sed -n 's/^Port \([0-9][0-9]*\): <Port in Use>.*/\1/p')"
+      for port in $ports; do
+        echo "Desanexando a porta usbip $port."
+        run sudo usbip detach -p "$port"
+      done
+    fi
+  else
+    echo "usbip nao esta no PATH deste WSL. A limpeza de portas foi pulada."
+  fi
+  echo "Reiniciando o servico usbipd no Windows. Clique em Sim na confirmacao de administrador."
+  run powershell.exe -NoProfile -Command \
+    "Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile','-Command','Restart-Service usbipd -Force') -Verb RunAs -Wait"
+}
+
+VETO_OUT=""
+handle_veto_and_retry() {
+  if [ "$DRY_RUN" = "1" ]; then
+    echo "[dry-run] A leitura do log de eventos foi pulada."
+    return 1
+  fi
+  say "Lendo o log de eventos do Windows. O servidor usbipd registra quem vetou a remocao."
+  local ps_cmd='$m = Get-WinEvent -FilterHashtable @{LogName = "Application"; ProviderName = "Usbipd"} -MaxEvents 50 -ErrorAction SilentlyContinue | Where-Object { $_.Message -match "CR_REMOVE_VETOED" } | Select-Object -First 1; if ($m) { $m.Message }'
+  VETO_OUT="$(powershell.exe -NoProfile -Command "$ps_cmd" 2>/dev/null | tr -d '\r')"
+  if [ -z "$VETO_OUT" ]; then
+    warn "Nenhum evento com CR_REMOVE_VETOED foi achado no log do Usbipd."
+    return 1
+  fi
+  echo "Texto completo do veto registrado pelo Windows:"
+  printf '%s\n' "$VETO_OUT"
+
+  if printf '%s' "$VETO_OUT" | grep -qiE 'USBPcap|UsbDk|TsUsbFlt|EUsbHubFilter' \
+     || printf '%s' "$LIST_OUT" | grep -qi 'incompatible'; then
+    die "Um filtro USB incompativel com o usbipd esta instalado no Windows. O texto acima nomeia o filtro. Desinstale no Windows o produto dono desse filtro e reinicie o computador. Depois rode o script de novo."
+  fi
+
+  if printf '%s' "$VETO_OUT" | grep -qi 'FrameServer'; then
+    say "O veto nomeia o FrameServer. Parando esse servico no Windows."
+    run powershell.exe -NoProfile -Command \
+      "Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile','-Command','Stop-Service -Name FrameServer -Force -ErrorAction SilentlyContinue') -Verb RunAs -Wait"
+  else
+    local names target="" name lower svchost_seen=""
+    names="$(printf '%s' "$VETO_OUT" | grep -oiE '[A-Za-z0-9_.-]+\.exe' | awk '!seen[tolower($0)]++')"
+    while IFS= read -r name; do
+      [ -z "$name" ] && continue
+      lower="$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')"
+      if [ "$lower" = "svchost.exe" ]; then
+        svchost_seen=1
+      else
+        target="$name"
+        break
+      fi
+    done <<EOF
+$names
+EOF
+    if [ -n "$target" ]; then
+      local proc_name
+      proc_name="$(printf '%s' "$target" | sed 's/\.[eE][xX][eE]$//')"
+      say "O veto nomeia o processo $target. Parando esse processo no Windows."
+      run powershell.exe -NoProfile -Command \
+        "Stop-Process -Name '$proc_name' -Force -ErrorAction SilentlyContinue"
+    elif [ -n "$svchost_seen" ]; then
+      warn "O veto nomeia o svchost.exe. Esse processo hospeda servicos do Windows e nao deve ser encerrado."
+      warn "O texto do veto impresso acima e a evidencia para agir. Ele nomeia o servico ou o driver que vetou a remocao."
+      return 1
+    else
+      warn "O texto do veto nao nomeou um alvo que o script saiba parar."
+      return 1
+    fi
+  fi
+
+  say "Ultima tentativa de attach depois de parar o componente do veto."
+  try_attach
+}
+
 if [ "$STATE" = "Attached" ]; then
   say "A camera ja esta anexada ao WSL. Nada a fazer aqui."
 else
+  clear_stale_state
   case "$STATE" in
     Shared*) : ;;  # ja compartilhada (normal ou forcada)
     *) bind_usbipd 0 ;;
   esac
   say "Anexando a camera ao WSL (attach)..."
   if ! try_attach; then
-    if printf '%s' "$ATTACH_OUT" | grep -qiE 'device busy|--force'; then
-      warn "O Windows esta usando a camera agora (app de Camera, navegador, Teams/Zoom, Windows Hello...)."
-      warn "Tentando de novo com bind --force, que desliga a camera do Windows a forca."
+    if attach_is_busy; then
+      warn "O Windows recusou o attach com Device busy."
+      warn "Tentando de novo com bind --force."
       bind_usbipd 1
       if [ "$DRY_RUN" != "1" ]; then
         echo "Estado da camera apos o bind --force (o esperado e 'Shared (forced)'):"
         "$USBIPD" list 2>/dev/null | tr -d '\r' | grep "^$BUSID" || true
       fi
       say "Anexando de novo (attach, apos --force)..."
-      try_attach \
-        || die "Mesmo com --force o attach falhou. Feche qualquer programa usando a camera no Windows e rode o script de novo."
+      if ! try_attach; then
+        if attach_is_busy; then
+          handle_veto_and_retry \
+            || die "O attach falhou de novo. Me mande o texto completo do veto impresso acima nesta conversa. Ele nomeia o componente que bloqueia a camera."
+        else
+          die "O attach falhou (saida acima). Rode o script de novo; se persistir, me mostre a saida."
+        fi
+      fi
     else
       die "O attach falhou (saida acima). Rode o script de novo; se persistir, me mostre a saida."
     fi
@@ -218,7 +309,7 @@ if ls /dev/video* >/dev/null 2>&1; then
   command -v lsusb >/dev/null 2>&1 && lsusb | grep -iE 'camera|webcam|uvc' || true
   FIRST_VIDEO="$(ls /dev/video* | head -1)"
   if [ ! -r "$FIRST_VIDEO" ]; then
-    warn "$FIRST_VIDEO sem permissao de leitura. Rode: sudo usermod -aG video $USER — e reinicie o WSL (wsl --shutdown no PowerShell)."
+    warn "$FIRST_VIDEO sem permissao de leitura. Rode: sudo usermod -aG video $USER. Depois reinicie o WSL com wsl --shutdown no PowerShell."
   fi
   say "Camera conectada ao WSL. Agora e so: python main.py"
 else

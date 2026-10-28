@@ -61,8 +61,12 @@ futuro vivem no Linux, a solução é separar **captura** de **processamento**:
   USB no WSL e o usbipd-win no Windows), acha sua câmera, compartilha e
   anexa ela ao WSL, e confirma que `/dev/video*` apareceu. Ele é
   idempotente — depois de reiniciar o WSL, rode o mesmo comando de novo.
-  Se o Windows estiver usando a câmera no momento do `attach`
-  ("Device busy"), o script tenta de novo sozinho com `bind --force`.
+  Se o `attach` falhar com "Device busy", o script limpa registros antigos
+  de attach nos dois lados e tenta de novo com `bind --force`. Se ainda
+  falhar, ele lê o log de eventos do Windows. Esse log nomeia o componente
+  que bloqueou a remoção da câmera. O script para esse componente uma vez
+  e faz uma última tentativa de attach. Se mesmo assim falhar, ele imprime
+  o texto completo do bloqueio. Esse texto é o diagnóstico.
   A única interação que sobra é clicar **Sim** na confirmação de
   administrador do Windows (UAC) na primeira vez: nenhum script pode
   passar por ela, por design de segurança do Windows. Depois é só
