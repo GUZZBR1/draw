@@ -9,8 +9,11 @@
 # Acha a camera na lista do usbipd. Limpa registros antigos de attach.
 # Compartilha e anexa a camera. Depois confere /dev/video*.
 # Se o attach falhar com Device busy, o script le o log de eventos do Windows.
-# Esse log nomeia o componente que vetou a remocao do dispositivo.
-# O script para esse componente uma vez e tenta o attach de novo.
+# Esse log nomeia a funcao do dispositivo que vetou a remocao.
+# O script identifica essa funcao com Get-PnpDevice antes de agir.
+# Funcao de audio aberta vira Disable-PnpDevice dessa funcao.
+# Funcao de video aberta vira parada do servico FrameServer.
+# Depois ele tenta o attach uma ultima vez.
 #
 # Rodar de novo e seguro. Apos reiniciar o WSL, so o attach precisa ser refeito.
 # DRAW_DRY_RUN=1 mostra os comandos sem executar nada.
@@ -28,7 +31,7 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-echo "Draw. Setup da camera no WSL. Script v4."
+echo "Draw. Setup da camera no WSL. Script v5."
 
 say()  { printf '\n==> %s\n' "$*"; }
 warn() { printf 'AVISO: %s\n' "$*" >&2; }
@@ -199,16 +202,69 @@ clear_stale_state() {
 }
 
 VETO_OUT=""
+VETO_INSTANCE=""
+PNP_OUT=""
+PNP_CLASS=""
+PNP_NAME=""
+
+stop_frameserver() {
+  say "Parando o servico FrameServer no Windows."
+  run powershell.exe -NoProfile -Command \
+    "Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile','-Command','Stop-Service -Name FrameServer -Force -ErrorAction SilentlyContinue') -Verb RunAs -Wait"
+}
+
+identify_vetoed_function() {
+  local ps_cmd="\$d = Get-PnpDevice -InstanceId '$VETO_INSTANCE*' -ErrorAction SilentlyContinue; if (\$d) { \$d | Select-Object Status, Class, FriendlyName | Format-List }"
+  PNP_OUT="$(powershell.exe -NoProfile -Command "$ps_cmd" 2>/dev/null | tr -d '\r')"
+  if [ -z "$PNP_OUT" ]; then
+    return 1
+  fi
+  echo "Identificacao dessa funcao no Windows:"
+  printf '%s\n' "$PNP_OUT"
+  PNP_CLASS="$(printf '%s\n' "$PNP_OUT" | sed -n 's/^Class[[:space:]]*:[[:space:]]*//p' | head -1)"
+  PNP_NAME="$(printf '%s\n' "$PNP_OUT" | sed -n 's/^FriendlyName[[:space:]]*:[[:space:]]*//p' | head -1)"
+  if [ -z "$PNP_CLASS" ]; then
+    PNP_CLASS="$(printf '%s\n' "$PNP_OUT" | grep -oiE '(^|[[:space:]])(Audio|MEDIA|Camera|Image)([[:space:]]|$)' | head -1 | tr -d '[:space:]')"
+  fi
+  if [ -z "$PNP_NAME" ] && [ -n "$PNP_CLASS" ]; then
+    PNP_NAME="$(printf '%s\n' "$PNP_OUT" | awk -v c="$PNP_CLASS" 'toupper($2) == toupper(c) { $1 = ""; $2 = ""; sub(/^ +/, ""); sub(/ [^ ]+$/, ""); print; exit }')"
+  fi
+  [ -n "$PNP_CLASS" ]
+}
+
+act_on_vetoed_function() {
+  local upper_class
+  upper_class="$(printf '%s' "$PNP_CLASS" | tr '[:lower:]' '[:upper:]')"
+  # A guarda vem antes do ramo de audio. Classe de video nunca e desabilitada.
+  if [ "$upper_class" = "CAMERA" ] || [ "$upper_class" = "IMAGE" ]; then
+    echo "A funcao vetada e de video. Classe $PNP_CLASS. Nome $PNP_NAME."
+    stop_frameserver
+  elif [ "$upper_class" = "AUDIO" ] || [ "$upper_class" = "MEDIA" ] \
+       || printf '%s' "$PNP_NAME" | grep -qiE 'microphone|microfone|audio'; then
+    echo "A funcao vetada e de audio. Classe $PNP_CLASS. Nome $PNP_NAME."
+    say "Desabilitando so essa funcao no Windows. A funcao de video fica intacta."
+    local disable_cmd="Disable-PnpDevice -InstanceId \"$VETO_INSTANCE\" -Confirm:\$false"
+    run powershell.exe -NoProfile -Command \
+      "Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile','-Command','$disable_cmd') -Verb RunAs -Wait"
+  else
+    warn "A funcao vetada tem classe $PNP_CLASS e nome $PNP_NAME."
+    warn "O script nao conhece uma acao segura para essa classe. A evidencia impressa acima decide o proximo passo."
+    return 1
+  fi
+  say "Ultima tentativa de attach depois de agir sobre a funcao vetada."
+  try_attach
+}
+
 handle_veto_and_retry() {
   if [ "$DRY_RUN" = "1" ]; then
     echo "[dry-run] A leitura do log de eventos foi pulada."
     return 1
   fi
-  say "Lendo o log de eventos do Windows. O servidor usbipd registra quem vetou a remocao."
-  local ps_cmd='$m = Get-WinEvent -FilterHashtable @{LogName = "Application"; ProviderName = "Usbipd"} -MaxEvents 50 -ErrorAction SilentlyContinue | Where-Object { $_.Message -match "CR_REMOVE_VETOED" } | Select-Object -First 1; if ($m) { $m.Message }'
+  say "Lendo o log de eventos do Windows. O servidor usbipd registra a funcao que vetou a remocao."
+  local ps_cmd='$m = Get-WinEvent -FilterHashtable @{LogName = "Application"; ProviderName = "usbipd-win"} -MaxEvents 50 -ErrorAction SilentlyContinue | Where-Object { $_.Message -match "CR_REMOVE_VETOED" } | Select-Object -First 1; if ($m) { $m.Message }'
   VETO_OUT="$(powershell.exe -NoProfile -Command "$ps_cmd" 2>/dev/null | tr -d '\r')"
   if [ -z "$VETO_OUT" ]; then
-    warn "Nenhum evento com CR_REMOVE_VETOED foi achado no log do Usbipd."
+    warn "Nenhum evento com CR_REMOVE_VETOED foi achado no log do usbipd-win."
     return 1
   fi
   echo "Texto completo do veto registrado pelo Windows:"
@@ -219,10 +275,20 @@ handle_veto_and_retry() {
     die "Um filtro USB incompativel com o usbipd esta instalado no Windows. O texto acima nomeia o filtro. Desinstale no Windows o produto dono desse filtro e reinicie o computador. Depois rode o script de novo."
   fi
 
+  VETO_INSTANCE="$(printf '%s' "$VETO_OUT" | grep -oE 'USB\\VID_[^[:space:]]+' | grep '&MI_' | head -1)"
+  if [ -n "$VETO_INSTANCE" ]; then
+    echo "Funcao vetada: $VETO_INSTANCE"
+    if identify_vetoed_function; then
+      act_on_vetoed_function
+      return $?
+    fi
+    warn "O Get-PnpDevice nao achou essa funcao no Windows."
+    warn "O texto do veto impresso acima e a evidencia que resta."
+    return 1
+  fi
+
   if printf '%s' "$VETO_OUT" | grep -qi 'FrameServer'; then
-    say "O veto nomeia o FrameServer. Parando esse servico no Windows."
-    run powershell.exe -NoProfile -Command \
-      "Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile','-Command','Stop-Service -Name FrameServer -Force -ErrorAction SilentlyContinue') -Verb RunAs -Wait"
+    stop_frameserver
   else
     local names target="" name lower svchost_seen=""
     names="$(printf '%s' "$VETO_OUT" | grep -oiE '[A-Za-z0-9_.-]+\.exe' | awk '!seen[tolower($0)]++')"
