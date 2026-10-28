@@ -1,0 +1,1 @@
+{"baseline":{"max_corner_error_px":12.0,"min_detection_rate":1.0,"min_ink_recall":0.9},"cases":[],"dataset":"draw-real-examples","manifest_version":1,"splits":{"dev":"pode calibrar limiares","test":"held-out: so mede, nunca calibra"}}

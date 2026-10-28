@@ -3,3 +3,12 @@ __pycache__/
 captures/
 template/paper_template.png
 *.pyc
+# Dataset real: fotos fora do git por padrão (internal-only até a
+# decisão de licença do backlog item 10). Vão para o git só o
+# manifesto, os truth.json e os overlays regeneráveis não.
+dataset/raw/*
+!dataset/raw/.gitkeep
+dataset/cases/*/photo.jpg
+dataset/cases/*/photo.png
+dataset/cases/*/photo.jpeg
+dataset/cases/*/overlays/
