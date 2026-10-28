@@ -77,8 +77,10 @@ Critério de aceite:
 - O workflow falha se qualquer um deles falhar.
 - README documenta como rodar os testes localmente.
 
-Estado: parcialmente feito nesta branch, com workflow e testes
-básicos de pipeline. Falta confirmar o primeiro run verde no GitHub.
+Estado: feito na branch chore/tudo-pendente, com workflow em
+.github/workflows/ci.yml rodando selftest, pytest completo e
+verificação geométrica. Falta confirmar o primeiro run verde no
+GitHub, que o próprio PR desta branch deve disparar.
 
 ### 6. Calibração para iluminação real
 
