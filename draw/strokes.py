@@ -23,6 +23,14 @@ Limites conhecidos:
 
 - Traços muito curtos, abaixo de `min_length`, são descartados
   como ruído.
+- O thinning não gera um esqueleto limpo de 1 px: em trechos
+  diagonais ele deixa corridas de 2 px de largura, e muitos pixels
+  dessas corridas têm grau 3 sem serem junção nenhuma. Por isso o
+  rastreador de ciclos não quebra em grau >= 3 (senão um círculo
+  vira centenas de fragmentos descartados); o rastreador de pontas
+  continua quebrando em junções, então um X continua virando
+  4 segmentos. Curvas abertas ainda podem se partir num esporão
+  do thinning; isso é documentado, não mascarado.
 - O afinamento depende de `cv2.ximgproc`, que vem com
   `opencv-contrib-python`, já listado em requirements.txt. Sem ele,
   o módulo usa contornos aproximados como fallback.
@@ -133,7 +141,14 @@ def _trace_skeleton(skeleton):
     visited_edges = set()
     segments = []
 
-    def walk(start):
+    def walk(start, stop_at_junction):
+        # stop_at_junction=True (caminhos a partir de pontas): para na
+        # primeira junção, então um X vira 4 segmentos. False (ciclos):
+        # NÃO para em grau >= 3, porque o thinning deixa corridas de
+        # 2 px em diagonais e esses pixels "junção" são falsos; parar
+        # neles fragmentava um círculo em centenas de pedaços de 2 px,
+        # todos descartados pelo min_length. A continuidade de direção
+        # (maior produto escalar) guia o caminho pelo anel.
         path = [start]
         prev = None
         cur = start
@@ -155,7 +170,7 @@ def _trace_skeleton(skeleton):
             prev, cur = cur, nxt
             if cur == start:
                 break
-            if degree(cur) >= 3:
+            if stop_at_junction and degree(cur) >= 3:
                 break
             if degree(cur) == 1:
                 break
@@ -169,7 +184,7 @@ def _trace_skeleton(skeleton):
             for n in _neighbors(start, pixels)
         ):
             continue
-        path = walk(start)
+        path = walk(start, stop_at_junction=True)
         if len(path) >= 2:
             segments.append(path)
 
@@ -187,7 +202,7 @@ def _trace_skeleton(skeleton):
             for n in _neighbors(start, pixels)
         ):
             continue
-        path = walk(start)
+        path = walk(start, stop_at_junction=False)
         if len(path) >= 2:
             segments.append(path)
     return segments
