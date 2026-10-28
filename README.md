@@ -54,11 +54,20 @@ futuro vivem no Linux, a solução é separar **captura** de **processamento**:
   `python main.py --source http://<ip-do-celular>:8080/video`
   De quebra, o celular num suporte acima da folha enxerga o papel melhor
   que a webcam do notebook.
-- **Avançado — usbipd-win:** com uma webcam USB externa, dá para anexar o
-  dispositivo ao WSL com o usbipd-win. Atenção: o kernel padrão do WSL pode
-  não ter o módulo `uvcvideo` (confira com `modinfo uvcvideo`); sem ele, só
-  recompilando um kernel customizado — caminho pesado e frágil. Enquanto
-  anexada ao WSL, a câmera fica indisponível para o Windows.
+- **Webcam do Windows via usbipd — um comando só:** para usar a webcam do
+  notebook ou uma webcam USB dentro do WSL, rode (de dentro do WSL):
+  `./scripts/setup_camera_wsl.sh`
+  O script confere o driver `uvcvideo`, instala o que falta (ferramentas
+  USB no WSL e o usbipd-win no Windows), acha sua câmera, compartilha e
+  anexa ela ao WSL, e confirma que `/dev/video*` apareceu. Ele é
+  idempotente — depois de reiniciar o WSL, rode o mesmo comando de novo.
+  A única interação que sobra é clicar **Sim** na confirmação de
+  administrador do Windows (UAC) na primeira vez: nenhum script pode
+  passar por ela, por design de segurança do Windows. Depois é só
+  `python main.py`. Atenção: se o kernel do WSL não tiver o módulo
+  `uvcvideo`, o script avisa e para (a alternativa seria um kernel
+  customizado — caminho pesado e frágil). Enquanto anexada ao WSL, a
+  câmera fica indisponível para o Windows.
 
 Teclas dentro do app: `s` salva um PNG em `captures/` · `q` ou `Esc` sai.
 
