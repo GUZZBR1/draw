@@ -84,7 +84,14 @@ sintética (folha inclinada, desenhada por código):
 
 ```bash
 python tests/selftest.py
+python -m pytest tests/ -q
+python verification/run_verification.py
 ```
+
+O CI do GitHub Actions roda esses três passos em todo push para a main
+e em todo pull request. A verificação geométrica cobre 108 sondas em
+12 posições da folha, e o modo `--sabotage` dela deve falhar, para
+provar que o verificador não ficou cego.
 
 ## Estrutura
 
