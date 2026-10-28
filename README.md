@@ -61,6 +61,8 @@ futuro vivem no Linux, a solução é separar **captura** de **processamento**:
   USB no WSL e o usbipd-win no Windows), acha sua câmera, compartilha e
   anexa ela ao WSL, e confirma que `/dev/video*` apareceu. Ele é
   idempotente — depois de reiniciar o WSL, rode o mesmo comando de novo.
+  Se o Windows estiver usando a câmera no momento do `attach`
+  ("Device busy"), o script tenta de novo sozinho com `bind --force`.
   A única interação que sobra é clicar **Sim** na confirmação de
   administrador do Windows (UAC) na primeira vez: nenhum script pode
   passar por ela, por design de segurança do Windows. Depois é só

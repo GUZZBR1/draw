@@ -148,17 +148,50 @@ echo "BUSID=$BUSID estado=$STATE"
 
 # --- 4/5. Bind (se preciso) + attach -----------------------------------------
 
+bind_usbipd() { # $1 = 1 para --force (arranca a camera do Windows a forca)
+  local args="@('bind','--busid','$BUSID')"
+  if [ "${1:-0}" = "1" ]; then
+    args="@('bind','--force','--busid','$BUSID')"
+  fi
+  say "Compartilhando (bind) — vai abrir a confirmacao de administrador do Windows; clique em Sim."
+  local win_usbipd
+  win_usbipd="$(to_winpath "$USBIPD")"
+  run powershell.exe -NoProfile -Command \
+    "Start-Process -FilePath '$win_usbipd' -ArgumentList $args -Verb RunAs -Wait"
+}
+
+ATTACH_OUT=""
+try_attach() {
+  if [ "$DRY_RUN" = "1" ]; then
+    run "$USBIPD" attach --wsl --busid "$BUSID"
+    return 0
+  fi
+  ATTACH_OUT="$("$USBIPD" attach --wsl --busid "$BUSID" 2>&1)"
+  local status=$?
+  [ -n "$ATTACH_OUT" ] && printf '%s\n' "$ATTACH_OUT"
+  return $status
+}
+
 if [ "$STATE" = "Attached" ]; then
   say "A camera ja esta anexada ao WSL. Nada a fazer aqui."
 else
-  if [ "$STATE" != "Shared" ]; then
-    say "Compartilhando (bind) — vai abrir a confirmacao de administrador do Windows; clique em Sim."
-    WIN_USBIPD="$(to_winpath "$USBIPD")"
-    PS_CMD="Start-Process -FilePath '$WIN_USBIPD' -ArgumentList @('bind','--busid','$BUSID') -Verb RunAs -Wait"
-    run powershell.exe -NoProfile -Command "$PS_CMD"
-  fi
+  case "$STATE" in
+    Shared*) : ;;  # ja compartilhada (normal ou forcada)
+    *) bind_usbipd 0 ;;
+  esac
   say "Anexando a camera ao WSL (attach)..."
-  run "$USBIPD" attach --wsl --busid "$BUSID"
+  if ! try_attach; then
+    if printf '%s' "$ATTACH_OUT" | grep -qiE 'device busy|--force'; then
+      warn "O Windows esta usando a camera agora (app de Camera, navegador, Teams/Zoom, Windows Hello...)."
+      warn "Tentando de novo com bind --force, que desliga a camera do Windows a forca."
+      bind_usbipd 1
+      say "Anexando de novo (attach, apos --force)..."
+      try_attach \
+        || die "Mesmo com --force o attach falhou. Feche qualquer programa usando a camera no Windows e rode o script de novo."
+    else
+      die "O attach falhou (saida acima). Rode o script de novo; se persistir, me mostre a saida."
+    fi
+  fi
 fi
 
 # --- Verificacao --------------------------------------------------------------
