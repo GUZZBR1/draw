@@ -34,8 +34,58 @@ python main.py
 
 # Outras fontes de vídeo: outro índice de webcam ou um stream de rede
 python main.py --source 1
+python main.py --source /dev/video2
 python main.py --source http://192.168.0.10:8080/video
 ```
+
+## Câmeras: listar, selecionar e diagnosticar
+
+A captura vive em `draw/capture.py`, separada do pipeline de visão.
+O pipeline continua recebendo só frames, seja a fonte uma webcam USB,
+uma câmera IP/MJPEG, um arquivo ou um índice alternativo.
+
+```bash
+# Lista as webcams locais que abrem, sem abrir janela (sai 1 se nenhuma abrir)
+python main.py --list-cameras
+
+# Escolhe a fonte sem editar código: índice, porta V4L2 ou stream
+python main.py --source 1
+python main.py --source /dev/video2
+python main.py --source rtsp://camera:554/stream
+
+# Tamanho e FPS só valem para webcam local; o padrão é MJPG 1280x720
+python main.py --source 1 --width 640 --height 480 --fps 30
+
+# Força um backend (Linux: v4l2; Windows: msmf, dshow; qualquer SO: any, ffmpeg)
+python main.py --source 1 --backend v4l2
+```
+
+Comportamento quando algo dá errado, sem travar indefinidamente:
+
+- Abertura com timeout e tentativas por backend, na ordem do SO.
+  No Linux é V4L2 e depois o genérico; no Windows é MSMF, DShow e
+  depois o genérico. Um backend pedido com `--backend` é o único tentado.
+- Erro com a causa e a ação: porta inexistente, falta de permissão no
+  grupo `video`, dispositivo ocupado por outro programa, ou stream de
+  rede fora do ar. O erro de abertura reutiliza o diagnóstico por
+  porta do `--check`, não o reinventa.
+- Se os quadros pararem no meio do uso, o app tenta reabrir a mesma
+  fonte (padrão: 3 tentativas; `--reconnect-attempts 0` desliga a
+  reconexão). Se voltar, continua; se não voltar, encerra limpo
+  avisando que foi desconexão.
+
+Plataformas, resumido: Linux usa V4L2 e `/dev/video*`; Windows usa
+MSMF/DShow direto; WSL2 continua sendo um caso separado, descrito na
+seção abaixo — o `--check` e o script de setup já cuidam de
+`uvcvideo`, `usbipd`, grupo `video` e interop com PowerShell, e a
+câmera via rede continua sendo a rota que não depende de passthrough
+USB. Nem toda câmera USB é compatível com passthrough; se o attach
+falhar, use a rota via rede ou a ponte de captura do Windows.
+
+Os testes dessa camada, em `tests/test_capture.py`, usam só mocks:
+parsing de fontes, listagem, ordem de backends, cada tipo de erro e
+reconexão que volta ou que desiste. Nenhum deles exige câmera física,
+então o CI roda todos sem hardware.
 
 O fluxo padrão usa uma folha solta ou uma página de caderno sob a webcam.
 Ele dispensa impressão. O Draw encontra os cantos da folha, retifica a
@@ -134,10 +184,12 @@ draw/
   strokes.py                traço vetorial: afinamento, rastreamento,
                             suavização, SVG e JSON
   app.py                    loop da webcam e janelas
+  capture.py                fontes, backends, listagem, erros e reconexao
 template/
   generate_template.py      gera a folha-modelo imprimível (PNG)
 tests/
   selftest.py               teste do pipeline sem webcam
+  test_capture.py           captura com mocks, sem camera fisica
 ```
 
 ## Como funciona (resumo técnico)
