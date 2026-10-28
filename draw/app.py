@@ -44,6 +44,15 @@ def is_wsl():
 def _open_capture(source):
     capture = cv2.VideoCapture(source)
     if capture.isOpened():
+        if isinstance(source, int):
+            # MJPG comprimido e 720p: o formato cru padrao (YUYV em 1080p)
+            # estoura a banda do USB virtual do usbip no WSL e a entrega de
+            # quadros trava com timeout de select() no V4L2.
+            capture.set(
+                cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG")
+            )
+            capture.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+            capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
         return capture
     hint = (
         f"Nao consegui abrir a fonte de video: {source!r}. "
@@ -81,10 +90,19 @@ def run(source=0, save_dir="captures"):
     print("Draw v0 rodando. Mostre a folha-modelo para a camera.")
     print("Teclas: s = salvar canvas, q/Esc = sair.")
 
+    falhas_seguidas = 0
     while True:
         ok, frame = capture.read()
         if not ok:
-            break
+            falhas_seguidas += 1
+            if falhas_seguidas >= 15:
+                print(
+                    "A camera abriu, mas parou de entregar quadros. "
+                    "Feche outros programas usando a camera e tente de novo."
+                )
+                break
+            continue
+        falhas_seguidas = 0
 
         warped, markers = paper_module.warp_paper(frame)
 
