@@ -20,6 +20,7 @@ a captura confiável do papel para o digital.
 - Apagar com a borracha funciona naturalmente: a tinta sumiu do papel, ela
   some do canvas
 - Salva o canvas como PNG com a tecla `s`
+- Salva os traços vetoriais como SVG e JSON com a tecla `v`
 
 ## Como rodar
 
@@ -35,7 +36,8 @@ python template/generate_template.py
 python main.py
 ```
 
-Teclas dentro do app: `s` salva um PNG em `captures/` · `q` ou `Esc` sai.
+Teclas dentro do app: `s` salva um PNG em `captures/` · `v` salva
+traços vetoriais em `captures/` (SVG + JSON) · `q` ou `Esc` sai.
 
 Sem webcam por perto, dá para validar o pipeline inteiro com uma cena
 sintética (folha inclinada, desenhada por código):
@@ -52,6 +54,8 @@ draw/
   config.py                 tamanho da folha, marcadores, posições
   paper.py                  detecção dos marcadores + homografia (perspectiva)
   ink.py                    extração da tinta e renderização do canvas digital
+  strokes.py                traço vetorial: afinamento, rastreamento,
+                            suavização, SVG e JSON
   app.py                    loop da webcam e janelas
 template/
   generate_template.py      gera a folha-modelo imprimível (PNG)
@@ -75,10 +79,25 @@ simulação — descritas em [VISION.md](VISION.md). A geometria da v0 é
 visão computacional clássica (OpenCV) de propósito: é o caminho mais
 rápido, confiável e em tempo real para derrubar a primeira barreira.
 
+## v0.2 — traço vetorial
+
+A máscara de tinta vira traços com `draw/strokes.py`: afinamento da
+tinta para um esqueleto de 1 pixel, rastreamento do esqueleto em
+caminhos ordenados, suavização por média móvel e exportação em SVG
+e JSON, com largura, altura, pontos, comprimento e marca de traço
+fechado.
+
+Dois limites são intencionais e documentados no módulo. Junções
+dividem traços: um X vira 4 segmentos que se encontram no centro.
+E a ordem dos traços é determinística, por centroide, de cima para
+baixo e da esquerda para a direita, e não a ordem temporal em que
+o traço foi desenhado. Rastrear a ordem temporal, frame a frame,
+é trabalho futuro.
+
 ## Roadmap
 
 - [x] v0.1 — captura: folha retificada + canvas digital em tempo real
-- [ ] v0.2 — traço vetorial: ordem, caminho e suavização dos traços
+- [x] v0.2 — traço vetorial: ordem, caminho e suavização dos traços
 - [ ] v0.3 — reprodução dos traços no Paint via controle do mouse
 - [ ] v1 — interpretação: formas, letras e diagramas a partir dos traços
 - [ ] v2 — integração com um primeiro sistema alvo (CAD / simulador)

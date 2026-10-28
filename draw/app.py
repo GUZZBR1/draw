@@ -1,7 +1,8 @@
 """Loop principal: webcam -> folha retificada -> canvas digital ao vivo.
 
 Uso: python main.py [--camera 0] [--save-dir captures]
-Teclas: s = salvar o canvas como PNG, q/Esc = sair.
+Teclas: s = salvar o canvas como PNG, v = salvar traços vetoriais
+(SVG + JSON), q/Esc = sair.
 """
 
 import argparse
@@ -12,6 +13,7 @@ import cv2
 
 from . import ink as ink_module
 from . import paper as paper_module
+from . import strokes as strokes_module
 
 
 def _fit(image, max_h=700):
@@ -31,7 +33,8 @@ def run(camera_index=0, save_dir="captures"):
         )
     save_path = Path(save_dir)
     print("Draw v0 rodando. Mostre a folha-modelo para a webcam.")
-    print("Teclas: s = salvar canvas, q/Esc = sair.")
+    print("Teclas: s = salvar canvas, v = salvar tracos vetoriais, "
+          "q/Esc = sair.")
 
     while True:
         ok, frame = capture.read()
@@ -67,6 +70,15 @@ def run(camera_index=0, save_dir="captures"):
                 out = save_path / f"canvas_{int(time.time())}.png"
                 cv2.imwrite(str(out), canvas)
                 print(f"Canvas salvo em {out}")
+            if key == ord("v"):
+                save_path.mkdir(parents=True, exist_ok=True)
+                base = save_path / f"strokes_{int(time.time())}"
+                strokes = strokes_module.extract_strokes(ink_mask)
+                svg_path, json_path = strokes_module.export_strokes(
+                    strokes, base
+                )
+                print(f"{len(strokes)} tracos salvos em {svg_path} "
+                      f"e {json_path}")
             if key in (ord("q"), 27):
                 break
             continue
