@@ -124,6 +124,73 @@ def build_nested_scene():
     return scene, ground_truth_ink, dst
 
 
+def build_negative_scenes():
+    # Cenas sem papel nenhum. Cada uma oferece um quadrilatero grande e
+    # convexo, do tipo que o detector geometrico aceitava so pelo
+    # formato. O portao de textura precisa recusar todas.
+    scenes = {}
+
+    mat = np.full((1200, 1600, 3), 60, dtype=np.uint8)
+    mat_quad = np.array(
+        [(320, 160), (1300, 140), (1360, 980), (260, 1000)],
+        dtype=np.int32,
+    )
+    cv2.fillPoly(mat, [mat_quad], (150, 150, 150))
+    scenes["tapete de mesa"] = mat
+
+    box = np.full((1200, 1600, 3), 60, dtype=np.uint8)
+    box_quad = np.array(
+        [(430, 280), (1210, 250), (1250, 880), (390, 910)],
+        dtype=np.int32,
+    )
+    cv2.fillPoly(box, [box_quad], (70, 130, 180))
+    cv2.line(box, (450, 590), (1240, 570), (55, 105, 150), 6)
+    cv2.line(box, (830, 260), (840, 900), (55, 105, 150), 6)
+    scenes["caixa de papelao"] = box
+
+    monitor = np.full((1200, 1600, 3), 60, dtype=np.uint8)
+    cv2.rectangle(monitor, (400, 140), (1240, 880), (15, 15, 15), -1)
+    cv2.rectangle(monitor, (440, 180), (1200, 820), (200, 190, 170), -1)
+    cv2.rectangle(monitor, (480, 240), (900, 320), (170, 160, 140), -1)
+    cv2.rectangle(monitor, (480, 380), (1120, 430), (180, 170, 150), -1)
+    scenes["monitor"] = monitor
+
+    tray = np.full((1200, 1600, 3), 60, dtype=np.uint8)
+    tray_quad = np.array(
+        [(470, 220), (1220, 260), (1170, 920), (430, 850)],
+        dtype=np.int32,
+    )
+    cv2.fillPoly(tray, [tray_quad], (242, 242, 240))
+    scenes["bandeja branca"] = tray
+
+    return scenes
+
+
+def build_blank_sheet_scene():
+    # Folha branca, lisa e sem tinta nenhuma. Geometria perfeita de
+    # folha, textura de bandeja: o veredito esperado e blank_maybe.
+    sheet = np.full(
+        (config.PAPER_H, config.PAPER_W, 3), 248, dtype=np.uint8
+    )
+    scene = np.full((1200, 1600, 3), 60, dtype=np.uint8)
+    src = np.array(
+        [(0, 0), (config.PAPER_W, 0), (config.PAPER_W, config.PAPER_H),
+         (0, config.PAPER_H)],
+        dtype=np.float32,
+    )
+    dst = np.array(
+        [(430, 130), (1150, 210), (1080, 1120), (330, 1040)],
+        dtype=np.float32,
+    )
+    matrix = cv2.getPerspectiveTransform(src, dst)
+    placed = cv2.warpPerspective(sheet, matrix, (1600, 1200))
+    mask = cv2.warpPerspective(
+        np.full(sheet.shape[:2], 255, dtype=np.uint8), matrix, (1600, 1200)
+    )
+    scene[mask > 0] = placed[mask > 0]
+    return scene
+
+
 def nested_main():
     scene, ground_truth_ink, ground_truth_corners = build_nested_scene()
 
@@ -150,6 +217,33 @@ def nested_main():
     assert recall >= 0.90, f"recall baixo demais: {recall:.2%}"
 
     print("SELFTEST FOLHA ANINHADA OK. Contorno interno encontrado.")
+
+
+def texture_gate_main():
+    scenes = build_negative_scenes()
+    for name in ("tapete de mesa", "caixa de papelao", "monitor"):
+        corners = paper.detect_sheet(scenes[name])
+        assert corners is None, f"cena sem papel virou folha: {name}"
+        print(f"negativo recusado pelo portao: {name}")
+
+    _, tray_verdict = paper.detect_sheet_with_confidence(
+        scenes["bandeja branca"]
+    )
+    assert tray_verdict != "paper", (
+        f"bandeja branca nao pode ter veredito de papel: {tray_verdict}"
+    )
+    print(f"bandeja branca: veredito {tray_verdict}, nao e papel")
+
+    blank_scene = build_blank_sheet_scene()
+    corners, verdict = paper.detect_sheet_with_confidence(blank_scene)
+    assert corners is not None, "folha em branco nao retornou candidato"
+    assert verdict == "blank_maybe", f"folha em branco: veredito {verdict}"
+    print("folha branca e lisa: veredito blank_maybe")
+
+    print(
+        "SELFTEST PORTAO DE TEXTURA OK. "
+        "Formato sem textura nao vira folha."
+    )
 
 
 def markerless_main():
@@ -206,4 +300,5 @@ def main():
 if __name__ == "__main__":
     markerless_main()
     nested_main()
+    texture_gate_main()
     main()

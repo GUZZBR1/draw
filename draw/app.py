@@ -267,6 +267,7 @@ def run(source=0, save_dir="captures", markers_mode=False):
                 print("Captura automatica desligada.")
 
     current_corners = None
+    current_verdict = None
     pending_corners = None
     pending_hits = 0
     frames_since_seen = 0
@@ -299,28 +300,45 @@ def run(source=0, save_dir="captures", markers_mode=False):
                 or sheet_missed
                 or frame_number % _SHEET_DETECT_INTERVAL == 0
             )
-            detected_corners = (
-                paper_module.detect_sheet(frame) if should_detect else None
-            )
+            if should_detect:
+                detected_corners, detected_verdict = (
+                    paper_module.detect_sheet_with_confidence(frame)
+                )
+            else:
+                detected_corners, detected_verdict = None, None
             if detected_corners is not None:
-                if current_corners is None:
+                if (
+                    current_corners is None
+                    and detected_verdict == "paper"
+                ):
                     current_corners = detected_corners.copy()
+                    current_verdict = detected_verdict
                     pending_corners = None
                     pending_hits = 0
                     frames_since_seen = 0
                     sheet_missed = False
                 elif (
-                    _corner_distance(current_corners, detected_corners)
+                    current_corners is not None
+                    and _corner_distance(current_corners, detected_corners)
                     <= _SHEET_NEAR_LIMIT_PX
                 ):
                     current_corners = _blend_corners(
                         current_corners, detected_corners
                     )
+                    current_verdict = detected_verdict
                     pending_corners = None
                     pending_hits = 0
                     frames_since_seen = 0
                     sheet_missed = False
                 else:
+                    # Salto de posicao ou candidato ainda sem trava.
+                    # Candidato blank_maybe (branco e liso, sem textura
+                    # de papel) exige o dobro de confirmacoes seguidas.
+                    confirmations_needed = (
+                        2 * _SHEET_JUMP_CONFIRMATIONS
+                        if detected_verdict == "blank_maybe"
+                        else _SHEET_JUMP_CONFIRMATIONS
+                    )
                     if (
                         pending_corners is not None
                         and _corner_distance(
@@ -336,8 +354,9 @@ def run(source=0, save_dir="captures", markers_mode=False):
                         pending_corners = detected_corners.copy()
                         pending_hits = 1
 
-                    if pending_hits >= _SHEET_JUMP_CONFIRMATIONS:
+                    if pending_hits >= confirmations_needed:
                         current_corners = pending_corners.copy()
+                        current_verdict = detected_verdict
                         pending_corners = None
                         pending_hits = 0
                         frames_since_seen = 0
@@ -357,6 +376,7 @@ def run(source=0, save_dir="captures", markers_mode=False):
                 and frames_since_seen > _SHEET_LOST_FRAME_LIMIT
             ):
                 current_corners = None
+                current_verdict = None
                 pending_corners = None
                 pending_hits = 0
                 frames_since_seen = 0
@@ -397,13 +417,19 @@ def run(source=0, save_dir="captures", markers_mode=False):
             cv2.imshow("Draw - camera", _fit(status, 700))
         else:
             if not markers_mode:
+                if current_verdict == "blank_maybe":
+                    status_text = "Folha detectada (baixa confianca)"
+                    status_color = (0, 255, 255)
+                else:
+                    status_text = "Folha detectada"
+                    status_color = (0, 255, 0)
                 cv2.putText(
                     status,
-                    "Folha detectada",
+                    status_text,
                     (20, 40),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.8,
-                    (0, 255, 0),
+                    status_color,
                     2,
                 )
             ink_mask = ink_module.extract_ink(warped)

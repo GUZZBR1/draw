@@ -2,8 +2,10 @@
 
 A webcam vê a folha inclinada. O modo padrão procura o contorno da folha
 na árvore de contornos da cena e usa os quatro cantos dela para montar a
-vista de cima. O modo com marcadores usa os centros dos quatro ArUco da
-folha-modelo. Os dois caminhos entregam a folha retificada no mesmo
+vista de cima. Um portão de textura examina o interior do candidato
+antes de aceitar a folha: formato sozinho não basta. O modo com
+marcadores usa os centros dos quatro ArUco da folha-modelo. Os dois
+caminhos entregam a folha retificada no mesmo
 espaço definido em config.py.
 """
 
@@ -18,6 +20,28 @@ from . import config
 _SHEET_EPSILON_LADDER = (0.01, 0.015, 0.02, 0.025, 0.03, 0.04, 0.05)
 _SHEET_MAX_CANDIDATES = 8
 _SHEET_MIN_AREA_RATIO = 0.12
+
+# Portão de textura: a geometria sozinha aceitava qualquer quadrilátero
+# grande. Na auditoria de textura, 60% das cenas sem papel ganharam uma
+# folha. O portão mede o interior do candidato antes de aceitar: fração
+# de branco, densidade de bordas internas e variância do Laplaciano.
+#
+# A regra original da auditoria foi calibrada em papel pautado, onde a
+# densidade de bordas internas passa de 0,03 com folga. A folha com
+# tinta esparsa, caso principal do produto e das cenas deste
+# repositório, mede densidade de bordas perto de 0,006, abaixo desse
+# limiar, mas variância do Laplaciano entre 523 e 783. Por isso o ramo
+# extra: Laplaciano a partir de 200 também afirma papel. O pior falso
+# positivo medido na auditoria ficou em 27,0, longe dessa faixa.
+#
+# Os limiares abaixo são calibrações de laboratório, feitas sobre cenas
+# sintéticas e um frame real. Eles precisam ser refeitos com as
+# capturas reais da mesa do usuário.
+_TEXTURE_MIN_WHITE_FRACTION = 0.5
+_TEXTURE_MIN_EDGE_DENSITY = 0.03
+_TEXTURE_MIN_LAPLACIAN_VARIANCE = 30.0
+_TEXTURE_HIGH_LAPLACIAN_VARIANCE = 200.0
+_TEXTURE_INTERIOR_SHRINK = 0.86
 
 
 def _make_detector():
@@ -86,14 +110,78 @@ def _refine_corners(frame, corners):
     return refined.reshape(4, 2).astype(np.float32)
 
 
+def _texture_features(frame, corners):
+    """Mede o interior de um quadrilátero candidato.
+
+    Retorna (fração de branco, densidade de bordas, variância do
+    Laplaciano). O interior é encolhido para 86% em torno do centroide
+    e erodido com núcleo 9x9, para a borda do candidato não contaminar
+    as medidas. Branco é saturação abaixo de 60 e valor acima de 180
+    no HSV. A variância é a do Laplaciano CV_32F sobre o cinza. As
+    bordas internas são Canny 30/100 sobre o cinza, contadas só dentro
+    do interior encolhido.
+    """
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    center = corners.mean(axis=0)
+    shrunk = center + (corners - center) * _TEXTURE_INTERIOR_SHRINK
+    mask = np.zeros(frame.shape[:2], dtype=np.uint8)
+    cv2.fillPoly(mask, [shrunk.astype(np.int32)], 255)
+    eroded = cv2.erode(mask, np.ones((9, 9), np.uint8))
+    selected = eroded > 0
+
+    saturation = hsv[:, :, 1][selected]
+    value = hsv[:, :, 2][selected]
+    white_fraction = float(np.mean((saturation < 60) & (value > 180)))
+    laplacian = cv2.Laplacian(gray, cv2.CV_32F)
+    laplacian_variance = float(np.var(laplacian[selected]))
+    edges = cv2.Canny(gray, 30, 100)
+    edge_density = float(np.mean(edges[selected] > 0))
+    return white_fraction, edge_density, laplacian_variance
+
+
+def _texture_verdict(frame, corners):
+    """Veredito do portão de textura para um candidato.
+
+    "paper" quando o interior parece papel. "blank_maybe" quando o
+    candidato é branco o bastante, mas liso demais para afirmar papel.
+    None quando nem branco o bastante ele é.
+    """
+    white_fraction, edge_density, laplacian_variance = _texture_features(
+        frame, corners
+    )
+    if white_fraction < _TEXTURE_MIN_WHITE_FRACTION:
+        return None
+    textured = laplacian_variance >= _TEXTURE_MIN_LAPLACIAN_VARIANCE and (
+        edge_density >= _TEXTURE_MIN_EDGE_DENSITY
+        or laplacian_variance >= _TEXTURE_HIGH_LAPLACIAN_VARIANCE
+    )
+    return "paper" if textured else "blank_maybe"
+
+
 def detect_sheet(frame):
     """Encontra os cantos de uma folha sem marcadores.
 
     Retorna um array float32 com os cantos TL, TR, BR e BL. Retorna None
-    quando nenhum quadrilátero grande e convexo aparece no frame.
+    quando nenhum quadrilátero grande e convexo passa no portão de
+    textura como papel. Candidato branco e liso demais não conta como
+    folha aqui: ele aparece em detect_sheet_with_confidence com o
+    veredito blank_maybe.
+    """
+    corners, verdict = detect_sheet_with_confidence(frame)
+    return corners if verdict == "paper" else None
+
+
+def detect_sheet_with_confidence(frame):
+    """Encontra os cantos de uma folha sem marcadores, com veredito.
+
+    Retorna (cantos, veredito). O veredito é "paper" quando o interior
+    do candidato passa no portão de textura. É "blank_maybe" quando um
+    candidato branco o bastante aparece, mas liso demais para afirmar
+    papel. É None, com cantos None, quando não há candidato.
     """
     if frame is None or frame.size == 0:
-        return None
+        return None, None
 
     frame_h, frame_w = frame.shape[:2]
     scale = min(1.0, 960.0 / max(frame_w, frame_h))
@@ -124,11 +212,21 @@ def detect_sheet(frame):
         for contour in sorted(contours, key=cv2.contourArea, reverse=True)
         if cv2.contourArea(contour) >= min_area
     ][:_SHEET_MAX_CANDIDATES]
+    # Um candidato que falha no portão não encerra a busca: um contorno
+    # seguinte ainda pode ser a folha.
+    blank_corners = None
     for contour in candidates:
         corners = _sheet_candidate(contour, scale, small_frame_area)
-        if corners is not None:
-            return _refine_corners(frame, corners)
-    return None
+        if corners is None:
+            continue
+        verdict = _texture_verdict(frame, corners)
+        if verdict == "paper":
+            return _refine_corners(frame, corners), "paper"
+        if verdict == "blank_maybe" and blank_corners is None:
+            blank_corners = corners
+    if blank_corners is not None:
+        return _refine_corners(frame, blank_corners), "blank_maybe"
+    return None, None
 
 
 def detect_markers(frame):
