@@ -88,6 +88,13 @@ futuro vivem no Linux, a solução é separar **captura** de **processamento**:
   imprime a identificação e para, porque não há ação segura conhecida
   para ela.
 
+- **Rota reserva: ponte de captura no Windows:** se a rota do usbipd
+  falhar na sua máquina, um único `ffmpeg.exe` no Windows pode ler a
+  webcam e servir o vídeo como stream MJPEG para o Draw no WSL, que
+  consome com `--source http://<ip-do-windows>:8080/video`. Nada mais
+  é instalado no Windows. O passo a passo está em
+  [bridge/README.md](bridge/README.md).
+
 Teclas dentro do app: `s` salva um PNG em `captures/` · `v` salva
 traços vetoriais em `captures/` (SVG + JSON) · `q` ou `Esc` sai.
 
