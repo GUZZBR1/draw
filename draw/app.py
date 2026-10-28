@@ -32,6 +32,7 @@ from . import capture as capture_module
 from . import diagnose as diagnose_module
 from . import ink as ink_module
 from . import paper as paper_module
+from . import sequence as sequence_module
 from . import strokes as strokes_module
 
 
@@ -179,7 +180,7 @@ def _fit(image, max_h=700):
 
 def run(source=0, save_dir="captures", markers_mode=False, width=None,
         height=None, fps=None, backend=None, reconnect_attempts=3,
-        open_timeout_ms=3000):
+        open_timeout_ms=3000, session_mode=False):
     parsed = parse_source(source)
     capture = capture_module.ReconnectingCapture(
         parsed, attempts=reconnect_attempts, width=width, height=height,
@@ -198,6 +199,19 @@ def run(source=0, save_dir="captures", markers_mode=False, width=None,
         "f = capturar frame, "
         "g = captura automatica (desligada), q/Esc = sair."
     )
+    # Modo sessão (etapa 5 do Senado): rastreia a ordem temporal
+    # dos traços enquanto o desenho acontece. Desligado por padrão;
+    # a tecla v continua exportando o snapshot por centroide, e a
+    # tecla o exporta a sessão ordenada, só neste modo.
+    tracker = (
+        sequence_module.SequenceTracker() if session_mode else None
+    )
+    session_counter = 0
+    if session_mode:
+        print(
+            "Modo sessao ligado: a ordem dos tracos e registrada "
+            "enquanto eles aparecem (tecla o = salvar sessao ordenada)."
+        )
 
     frames_path = save_path / "frames"
     frames_saved = 0
@@ -398,6 +412,21 @@ def run(source=0, save_dir="captures", markers_mode=False, width=None,
                     2,
                 )
             ink_mask = ink_module.extract_ink(warped)
+            if tracker is not None:
+                # Amostragem reduzida: uma amostra a cada 5 quadros
+                # retificados, não a cada quadro — o thinning e o
+                # rastreamento a cada quadro são custo sem ganho.
+                session_counter += 1
+                if session_counter % 5 == 1:
+                    tracker.update(
+                        strokes_module.extract_strokes(ink_mask),
+                        frame_index=loop_frames,
+                        timestamp_ms=int(time.time() * 1000),
+                        corners=(
+                            None if markers_mode else current_corners
+                        ),
+                        sheet_locked=True,
+                    )
             canvas = ink_module.render_canvas(ink_mask)
             cv2.imshow("Draw - camera", _fit(status, 700))
             cv2.imshow("Draw - papel (vista de cima)", _fit(warped, 700))
@@ -418,6 +447,14 @@ def run(source=0, save_dir="captures", markers_mode=False, width=None,
                 )
                 print(f"{len(strokes)} tracos salvos em {svg_path} "
                       f"e {json_path}")
+            if key == ord("o") and tracker is not None:
+                save_path.mkdir(parents=True, exist_ok=True)
+                base = save_path / f"session_{int(time.time())}"
+                svg_path, json_path = sequence_module.export_session(
+                    tracker, base
+                )
+                print(f"sessao com {len(tracker.ordered)} tracos "
+                      f"ordenados salva em {svg_path} e {json_path}")
             handle_capture_key(key, frame)
             if key in (ord("q"), 27):
                 break
@@ -509,6 +546,13 @@ def main():
         "--open-timeout-ms", type=int, default=3000,
         help="timeout de abertura da fonte, em milissegundos",
     )
+    parser.add_argument(
+        "--session",
+        action="store_true",
+        help="modo sessao: registra a ordem temporal dos tracos "
+        "enquanto eles aparecem (tecla o = salvar sessao ordenada); "
+        "sem ele, v continua exportando o snapshot por centroide",
+    )
     parser.add_argument("--save-dir", default="captures")
     args = parser.parse_args()
     if args.test_source is not None or args.test_all or args.include_urls:
@@ -586,6 +630,7 @@ def main():
         backend=backend,
         reconnect_attempts=args.reconnect_attempts,
         open_timeout_ms=args.open_timeout_ms,
+        session_mode=args.session,
     )
 
 
