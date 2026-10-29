@@ -1,8 +1,10 @@
 """Extração da tinta: separar o que foi desenhado do papel branco.
 
 Usa limiar adaptativo sobre a folha retificada — robusto a variações de
-iluminação ao longo da página. As áreas dos marcadores são apagadas da
-máscara para não virarem "tinta" no canvas.
+iluminação ao longo da página. No modo com marcadores, as áreas dos
+marcadores são apagadas da máscara para não virarem "tinta" no canvas.
+No modo sem marcadores não há marcador nenhum para apagar: apagar as
+mesmas áreas apagaria desenho de verdade perto dos cantos da página.
 
 Como a tinta é lida da folha a cada frame (e não acumulada), apagar com
 a borracha funciona naturalmente: sumiu do papel, some do canvas.
@@ -23,8 +25,14 @@ def _marker_mask(shape):
     return mask
 
 
-def extract_ink(warped):
-    """Retorna a máscara de tinta (255 = tinta) da folha retificada."""
+def extract_ink(warped, clear_markers=False):
+    """Retorna a máscara de tinta (255 = tinta) da folha retificada.
+
+    clear_markers apaga as áreas nominais dos marcadores ArUco dos
+    cantos. Só faz sentido no modo com marcadores, onde a folha-modelo
+    tem marcadores impressos de verdade; o chamador desse modo é quem
+    pede a limpeza. Sem o pedido, nenhum pixel é apagado por posição.
+    """
     gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
     gray = cv2.GaussianBlur(gray, (3, 3), 0)
     binary = cv2.adaptiveThreshold(
@@ -36,7 +44,8 @@ def extract_ink(warped):
         C=12,
     )
     ink = cv2.bitwise_not(binary)  # tinta escura vira branco (255)
-    ink[_marker_mask(warped.shape) > 0] = 0
+    if clear_markers:
+        ink[_marker_mask(warped.shape) > 0] = 0
     # Remove ruído pequeno (poeira, textura do papel).
     kernel = np.ones((2, 2), dtype=np.uint8)
     ink = cv2.morphologyEx(ink, cv2.MORPH_OPEN, kernel)

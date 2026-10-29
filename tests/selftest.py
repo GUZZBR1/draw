@@ -29,7 +29,7 @@ def build_scene():
     cv2.line(sheet, (280, 800), (570, 800), (0, 0, 0), 6)
     cv2.line(sheet, (320, 950), (530, 1080), (0, 0, 0), 6)
     cv2.line(sheet, (530, 950), (320, 1080), (0, 0, 0), 6)
-    ground_truth_ink = ink.extract_ink(sheet)
+    ground_truth_ink = ink.extract_ink(sheet, clear_markers=True)
 
     # Cola a folha inclinada sobre uma "mesa" escura.
     scene = np.full((1200, 1600, 3), 60, dtype=np.uint8)
@@ -281,7 +281,7 @@ def main():
     assert warped is not None, f"folha nao detectada (marcadores: {markers})"
     assert warped.shape[:2] == (config.PAPER_H, config.PAPER_W), warped.shape
 
-    recovered = ink.extract_ink(warped)
+    recovered = ink.extract_ink(warped, clear_markers=True)
     # Compara só a área útil central (longe das bordas e dos marcadores).
     region = (slice(200, 1100), slice(200, 650))
     truth_px = int((ground_truth_ink[region] > 0).sum())
