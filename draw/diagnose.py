@@ -109,10 +109,21 @@ def probe_source(source, read_frames=3, deadline=_DEFAULT_DEADLINE_S,
     start = clock()
     attempted = []
 
-    def recording_factory(parsed_source, candidate=None):
+    def recording_factory(parsed_source, candidate=None, params=None):
         attempted.append(candidate)
         factory = capture_factory or cv2.VideoCapture
-        return factory(parsed_source, candidate)
+        # Ponte de integracao com a main: open_capture() da main chama
+        # a fabrica com (fonte, backend, params de timeout). Fabricas
+        # antigas (incluindo as de teste do senado) aceitam so 2
+        # argumentos; nesse caso, tenta sem params em vez de deixar
+        # a sonda de rede falhar com TypeError. Fabricas novas e o
+        # cv2.VideoCapture real recebem os 3 argumentos.
+        if params is None:
+            return factory(parsed_source, candidate)
+        try:
+            return factory(parsed_source, candidate, params)
+        except TypeError:
+            return factory(parsed_source, candidate)
 
     open_kwargs = {}
     if open_timeout_ms is not None:
