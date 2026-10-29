@@ -2,9 +2,10 @@
 
 Uso:
   python main.py                                  # webcam local (indice 0)
-  python main.py --check                          # valida a camera e sai
+  python main.py --check                          # valida a fonte e sai
   python main.py --list-cameras                   # lista webcams que abrem
   python main.py --markers                        # folha-modelo impressa
+  python main.py --neural modelo.onnx             # detector neural primario
   python main.py --source 1                       # outra webcam local
   python main.py --source /dev/video2             # porta V4L2 especifica
   python main.py --source http://192.168.0.10:8080/video   # camera via rede
@@ -21,6 +22,7 @@ g = ligar ou desligar a captura automatica de frames, q/Esc = sair.
 """
 
 import argparse
+import csv
 import os
 import sys
 import time
@@ -32,6 +34,7 @@ import numpy as np
 from . import capture as capture_module
 from . import ink as ink_module
 from . import light as light_module
+from . import neural as neural_module
 from . import paper as paper_module
 from . import strokes as strokes_module
 
@@ -106,89 +109,77 @@ def _video_nodes():
     return capture_module.video_nodes()
 
 
-def run_check(source=0):
-    """Validacao da camera local, porta por porta. Retorna 0 ou 1."""
-    print(f"PASS: OpenCV disponivel. Versao {cv2.__version__}.")
-
-    nodes = _video_nodes()
-    if not nodes:
-        print("FAIL: nenhum /dev/video* existe neste sistema.")
-        if is_wsl():
-            print(
-                "  Correcao: anexe a camera com "
-                "bash scripts/setup_camera_wsl.sh. A alternativa e uma "
-                "camera via rede com --source."
-            )
-        else:
-            print("  Correcao: conecte uma webcam a este computador.")
-        return 1
-    print(f"PASS: dispositivos de video encontrados: {', '.join(nodes)}.")
-
-    all_ok = True
-    node = nodes[0]
-
-    access = os.access(node, os.R_OK | os.W_OK)
-    group_note = ""
-    try:
-        import grp
-
-        gid = os.stat(node).st_gid
+def _read_first_frame(capture, timeout_s):
+    """Tenta obter um frame até o prazo; capture.read() pode bloquear."""
+    deadline = time.monotonic() + max(0.0, timeout_s)
+    while True:
         try:
-            group_name = grp.getgrgid(gid).gr_name
-        except KeyError:
-            group_name = str(gid)
-        in_group = gid in os.getgroups()
-        group_note = (
-            f" Grupo dono de {node}: {group_name}. "
-            f"Este processo esta nesse grupo: {'sim' if in_group else 'nao'}."
-        )
-    except Exception:
-        group_note = ""
-    if access:
-        print(f"PASS: este processo le e escreve em {node}.{group_note}")
-    else:
-        print(
-            f"FAIL: este processo nao tem permissao de leitura e "
-            f"escrita em {node}.{group_note}"
-        )
-        print(
-            "  Correcao definitiva: sudo usermod -aG video $USER "
-            "(vale nas proximas sessoes)."
-        )
-        print('  Correcao nesta sessao: sg video -c "python3 main.py".')
-        all_ok = False
+            ok, frame = capture.read()
+        except Exception as error:
+            return None, error
+        if time.monotonic() > deadline:
+            return None, TimeoutError("nenhum frame recebido dentro do prazo")
+        if ok and frame is not None:
+            return frame, None
 
-    index = int(node[len("/dev/video"):])
-    capture = cv2.VideoCapture(index)
-    if not capture.isOpened():
-        print(
-            f"FAIL: nao consegui abrir {node}. Outro programa "
-            "provavelmente esta usando a camera."
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None, TimeoutError("nenhum frame recebido dentro do prazo")
+        time.sleep(min(0.05, remaining))
+
+
+def run_check(source=0, open_timeout_ms=3000, first_frame_timeout_s=5.0):
+    """Valida a fonte informada, lê um frame e sempre libera a captura."""
+    parsed = parse_source(source)
+    print(f"PASS: OpenCV disponivel. Versao {cv2.__version__}.")
+    print(f"Testando fonte: {parsed!r}.")
+
+    capture = None
+    try:
+        read_timeout_ms = max(1, int(first_frame_timeout_s * 1000))
+        capture = _open_capture(
+            parsed,
+            open_timeout_ms=open_timeout_ms,
+            read_timeout_ms=read_timeout_ms,
         )
+        if not capture.isOpened():
+            print(f"FAIL: a fonte {parsed!r} nao abriu.")
+            return 1
+
+        print(f"PASS: fonte {parsed!r} aberta.")
+        frame, read_error = _read_first_frame(capture, first_frame_timeout_s)
+        if read_error is not None:
+            if isinstance(read_error, TimeoutError):
+                print(
+                    f"FAIL: a fonte {parsed!r} abriu, mas nao entregou "
+                    f"um frame antes do prazo de {first_frame_timeout_s:g} "
+                    "segundos. O backend pode ultrapassar o prazo se "
+                    "capture.read() bloquear."
+                )
+            else:
+                print(f"FAIL: erro ao ler frame da fonte {parsed!r}: {read_error}")
+            return 1
+
+        height, width = frame.shape[:2]
+        try:
+            fps = float(capture.get(cv2.CAP_PROP_FPS))
+        except Exception:
+            fps = 0.0
+        fps_text = f"{fps:g} FPS" if fps > 0 else "FPS indisponivel"
+        print(f"PASS: primeiro frame recebido: {width}x{height}, {fps_text}.")
+        return 0
+    except capture_module.CaptureError as error:
+        print(f"FAIL: {error}")
         return 1
-    _configure_local_capture(capture)
-    frame = None
-    deadline = time.time() + 3.0
-    while time.time() < deadline:
-        ok, candidate = capture.read()
-        if ok and candidate is not None:
-            frame = candidate
-            break
-        time.sleep(0.1)
-    capture.release()
-    if frame is not None:
-        print(
-            f"PASS: quadro lido de {node}. "
-            f"Formato (altura, largura, canais): {frame.shape}."
-        )
-    else:
-        print(
-            f"FAIL: {node} abriu, mas nenhum quadro chegou em 3 "
-            "segundos. A camera pode estar ocupada ou travada."
-        )
-        all_ok = False
-
-    return 0 if all_ok else 1
+    except Exception as error:
+        print(f"FAIL: erro ao testar a fonte {parsed!r}: {error}")
+        return 1
+    finally:
+        if capture is not None:
+            try:
+                capture.release()
+            except Exception:
+                pass
 
 
 def _fit(image, max_h=700):
@@ -201,7 +192,27 @@ def _fit(image, max_h=700):
 
 def run(source=0, save_dir="captures", markers_mode=False, width=None,
         height=None, fps=None, backend=None, reconnect_attempts=3,
-        open_timeout_ms=3000, light_normalize="off"):
+        open_timeout_ms=3000, neural_model=None, capture_all_frames=False,
+        light_normalize="off"):
+    neural_detector = None
+    if neural_model is not None and not markers_mode:
+        neural_detector = neural_module.NeuralSheetDetector(neural_model)
+        neural_detector.load()
+        print(
+            f"Detector neural ativo: {neural_model}. "
+            "O classico cobre os frames em que o neural nao ve folha."
+        )
+
+    def detect_sheet(frame):
+        if neural_detector is not None:
+            corners, verdict = (
+                neural_detector.detect_sheet_with_confidence(frame)
+            )
+            if corners is not None:
+                return corners, verdict
+        return paper_module.detect_sheet_with_confidence(
+            _detection_frame(frame, light_normalize)
+        )
     parsed = parse_source(source)
     capture = capture_module.ReconnectingCapture(
         parsed, attempts=reconnect_attempts, width=width, height=height,
@@ -211,6 +222,24 @@ def run(source=0, save_dir="captures", markers_mode=False, width=None,
         open_timeout_ms=open_timeout_ms,
     ))
     save_path = Path(save_dir)
+    dataset_path = None
+    dataset_writer = None
+    dataset_manifest = None
+    if capture_all_frames:
+        session_name = (
+            f"session_{time.strftime('%Y%m%d_%H%M%S')}_"
+            f"{time.time_ns() % 1_000_000:06d}"
+        )
+        dataset_path = save_path / "training" / session_name
+        dataset_path.mkdir(parents=True, exist_ok=False)
+        dataset_manifest = (dataset_path / "frames.csv").open(
+            "w", newline="", encoding="utf-8", buffering=1
+        )
+        dataset_writer = csv.writer(dataset_manifest)
+        dataset_writer.writerow(
+            ["frame_index", "timestamp_ns", "filename", "width", "height"]
+        )
+        print(f"Salvando todos os frames em {dataset_path}.")
     if markers_mode:
         print("Draw v0 rodando. Mostre a folha-modelo para a camera.")
     else:
@@ -275,6 +304,21 @@ def run(source=0, save_dir="captures", markers_mode=False, width=None,
         falhas_seguidas = 0
 
         loop_frames += 1
+        if dataset_writer is not None:
+            frame_name = f"frame_{loop_frames:08d}.jpg"
+            frame_path = dataset_path / frame_name
+            if not cv2.imwrite(
+                str(frame_path), frame, [cv2.IMWRITE_JPEG_QUALITY, 95]
+            ):
+                print(f"Erro ao salvar frame: {frame_path}")
+                break
+            height_px, width_px = frame.shape[:2]
+            dataset_writer.writerow(
+                [loop_frames, time.time_ns(), frame_name, width_px, height_px]
+            )
+            dataset_manifest.flush()
+            if loop_frames % 100 == 0:
+                print(f"Frames salvos nesta sessao: {loop_frames}.")
         if auto_capture and loop_frames % 10 == 0:
             save_raw_frame(frame)
 
@@ -288,11 +332,7 @@ def run(source=0, save_dir="captures", markers_mode=False, width=None,
                 or frame_number % _SHEET_DETECT_INTERVAL == 0
             )
             if should_detect:
-                detected_corners, detected_verdict = (
-                    paper_module.detect_sheet_with_confidence(
-                        _detection_frame(frame, light_normalize)
-                    )
-                )
+                detected_corners, detected_verdict = detect_sheet(frame)
             else:
                 detected_corners, detected_verdict = None, None
             if detected_corners is not None:
@@ -456,6 +496,8 @@ def run(source=0, save_dir="captures", markers_mode=False, width=None,
             break
 
     capture.release()
+    if dataset_manifest is not None:
+        dataset_manifest.close()
     cv2.destroyAllWindows()
 
 
@@ -473,9 +515,19 @@ def main():
         help="usa a folha-modelo impressa com marcadores ArUco",
     )
     parser.add_argument(
+        "--neural",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="MODELO.onnx",
+        help="detector neural (ONNX) como primario, com o classico de "
+        "reserva. Sem caminho, usa a variavel de ambiente "
+        "DRAW_NEURAL_MODEL",
+    )
+    parser.add_argument(
         "--check",
         action="store_true",
-        help="valida a camera local porta por porta e sai, sem abrir janela",
+        help="valida a fonte escolhida com --source e sai, sem abrir janela",
     )
     parser.add_argument(
         "--list-cameras",
@@ -515,6 +567,11 @@ def main():
         "both (fundo + CLAHE, o melhor medido em sombra e luz baixa)",
     )
     parser.add_argument("--save-dir", default="captures")
+    parser.add_argument(
+        "--capture-all-frames",
+        action="store_true",
+        help="salva cada frame JPEG e seu timestamp para coleta de dados",
+    )
     args = parser.parse_args()
     if args.list_cameras:
         results = capture_module.list_cameras()
@@ -522,23 +579,39 @@ def main():
         sys.exit(0 if any(item["opened"] for item in results) else 1)
     if args.check:
         parsed = parse_source(args.source)
-        sys.exit(run_check(parsed if isinstance(parsed, int) else 0))
+        sys.exit(run_check(parsed, open_timeout_ms=args.open_timeout_ms))
+    neural_model = None
+    if args.neural is not None:
+        if args.markers:
+            parser.error("--neural nao combina com --markers")
+        neural_model = args.neural or os.environ.get("DRAW_NEURAL_MODEL")
+        if not neural_model:
+            parser.error(
+                "--neural sem caminho: passe o arquivo .onnx ou defina "
+                "a variavel DRAW_NEURAL_MODEL"
+            )
     try:
         backend = capture_module.backend_from_name(args.backend)
     except ValueError as error:
         parser.error(str(error))
-    run(
-        source=args.source,
-        save_dir=args.save_dir,
-        markers_mode=args.markers,
-        width=args.width,
-        height=args.height,
-        fps=args.fps,
-        backend=backend,
-        reconnect_attempts=args.reconnect_attempts,
-        open_timeout_ms=args.open_timeout_ms,
-        light_normalize=args.light_normalize,
-    )
+    try:
+        run(
+            source=args.source,
+            save_dir=args.save_dir,
+            markers_mode=args.markers,
+            width=args.width,
+            height=args.height,
+            fps=args.fps,
+            backend=backend,
+            reconnect_attempts=args.reconnect_attempts,
+            open_timeout_ms=args.open_timeout_ms,
+            neural_model=neural_model,
+            capture_all_frames=args.capture_all_frames,
+            light_normalize=args.light_normalize,
+        )
+    except (RuntimeError, FileNotFoundError) as error:
+        print(f"Erro: {error}")
+        sys.exit(2)
 
 
 if __name__ == "__main__":
