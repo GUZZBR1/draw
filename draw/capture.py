@@ -6,9 +6,10 @@ ou stream de rede. Ele nao abre janelas e nao depende de hardware real
 para ser testado: a fabrica de captura e injetavel.
 
 O que ja existia no upstream e continua valendo, sem ser duplicado
-aqui: o diagnostico porta a porta do `python main.py --check` e o
-script `scripts/setup_camera_wsl.sh` (uvcvideo, usbipd, grupo video).
-Este modulo reusa o diagnostico por porta e acrescenta o que faltava:
+aqui: o diagnostico da fonte selecionada em `python main.py --check` e
+o script `scripts/setup_camera_wsl.sh` (uvcvideo, usbipd, grupo video).
+Para fontes locais, este modulo tambem diagnostica a porta especifica.
+Ele acrescenta o que faltava:
 listagem sem travar, tentativas por backend, erros com acao especifica
 e reconexao quando a camera cai no meio do uso.
 """
@@ -172,8 +173,35 @@ def apply_local_settings(capture, width=None, height=None, fps=None):
         capture.set(cv2.CAP_PROP_FPS, fps)
 
 
+def _timeout_parameters(open_timeout_ms=None, read_timeout_ms=None):
+    """Build the open-only timeout params supported by this cv2 binding."""
+    params = []
+    missing = []
+    for name, value in (
+        ("CAP_PROP_OPEN_TIMEOUT_MSEC", open_timeout_ms),
+        ("CAP_PROP_READ_TIMEOUT_MSEC", read_timeout_ms),
+    ):
+        if value is None:
+            continue
+        prop = getattr(cv2, name, None)
+        if prop is None:
+            missing.append(name)
+        else:
+            params.extend((prop, int(value)))
+    return params, missing
+
+
+def _release_quietly(capture):
+    if capture is not None:
+        try:
+            capture.release()
+        except Exception:
+            pass
+
+
 def open_capture(source, width=None, height=None, fps=None, backend=None,
                  open_timeout_ms=DEFAULT_OPEN_TIMEOUT_MS,
+                 read_timeout_ms=None,
                  capture_factory=None, backends=None):
     """Abre uma fonte tentando os backends, sem esconder o erro.
 
@@ -192,27 +220,55 @@ def open_capture(source, width=None, height=None, fps=None, backend=None,
     else:
         candidates = [cv2.CAP_ANY]
 
+    local_source = isinstance(parsed, int)
+    timeout_params, missing_timeout_params = _timeout_parameters(
+        open_timeout_ms, read_timeout_ms
+    )
+    if not local_source and missing_timeout_params:
+        missing = ", ".join(missing_timeout_params)
+        raise CaptureError(
+            parsed,
+            "timeout_unsupported",
+            f"Nao abri a fonte {parsed!r}: esta build do OpenCV nao expoe "
+            f"{missing}. Nao foi tentada uma abertura sem timeout.",
+        )
+
     attempts = []
+    timeout_error = None
     for candidate in candidates:
+        capture = None
         try:
-            capture = factory(parsed, candidate)
-        except Exception:
+            if timeout_params:
+                try:
+                    capture = factory(parsed, candidate, timeout_params)
+                    opened = bool(capture.isOpened())
+                except Exception as error:
+                    timeout_error = error
+                    _release_quietly(capture)
+                    if not local_source:
+                        attempts.append(candidate)
+                        continue
+                    capture = factory(parsed, candidate)
+                    opened = bool(capture.isOpened())
+                else:
+                    if local_source and not opened:
+                        _release_quietly(capture)
+                        capture = factory(parsed, candidate)
+                        opened = bool(capture.isOpened())
+            else:
+                capture = factory(parsed, candidate)
+                opened = bool(capture.isOpened())
+        except Exception as error:
+            timeout_error = error if timeout_params else timeout_error
             attempts.append(candidate)
             continue
-        try:
-            if hasattr(cv2, "CAP_PROP_OPEN_TIMEOUT_MSEC"):
-                capture.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, open_timeout_ms)
-        except Exception:
-            pass
-        if capture.isOpened():
+
+        if opened:
             if isinstance(parsed, int):
                 apply_local_settings(capture, width=width, height=height, fps=fps)
             return capture
         attempts.append(candidate)
-        try:
-            capture.release()
-        except Exception:
-            pass
+        _release_quietly(capture)
 
     if isinstance(parsed, int):
         kind, hint = diagnose_local(parsed)
@@ -225,6 +281,14 @@ def open_capture(source, width=None, height=None, fps=None, backend=None,
     else:
         kind = "not_found"
         hint = "Confira se o arquivo existe e se o caminho esta certo."
+    if not local_source:
+        hint += (
+            " A abertura foi tentada com parametros de timeout e nao foi "
+            "tentada novamente sem eles; esta build ou backend do OpenCV "
+            "pode nao suportar esses parametros."
+        )
+        if timeout_error is not None:
+            hint += f" Detalhe: {timeout_error}"
     raise CaptureError(
         parsed, kind,
         f"Nao consegui abrir a fonte de video: {parsed!r}. {hint}",
@@ -236,8 +300,9 @@ def list_cameras(max_index=DEFAULT_MAX_PROBE_INDEX, open_timeout_ms=1000,
                  capture_factory=None, nodes=None):
     """Enumera webcams locais sem travar indefinidamente.
 
-    Tenta cada indice com timeout de abertura curto e solta a captura
-    logo em seguida. Nao le frames aqui: abrir ja basta para listar,
+    Tenta cada indice com parametro de timeout de abertura e solta a captura
+    logo em seguida. Backends locais que rejeitam o parametro usam a
+    abertura anterior sem parametros. Nao le frames aqui: abrir ja basta para listar,
     e ler poderia travar numa camera ocupada. Retorna uma lista de
     dicionarios com index, node e opened, incluindo indices vindos de
     /dev/video* que estejam acima de max_index.
@@ -249,23 +314,28 @@ def list_cameras(max_index=DEFAULT_MAX_PROBE_INDEX, open_timeout_ms=1000,
         if suffix.isdigit():
             indices.add(int(suffix))
     backend = backends_for_platform()[0]
+    timeout_params, _ = _timeout_parameters(open_timeout_ms=open_timeout_ms)
     results = []
     for index in sorted(indices):
         capture = None
         opened = False
         try:
-            capture = factory(index, backend)
-            if hasattr(cv2, "CAP_PROP_OPEN_TIMEOUT_MSEC"):
-                capture.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, open_timeout_ms)
+            if timeout_params:
+                try:
+                    capture = factory(index, backend, timeout_params)
+                    opened = bool(capture.isOpened())
+                except Exception:
+                    capture = factory(index, backend)
+                if not opened and capture is not None:
+                    _release_quietly(capture)
+                    capture = factory(index, backend)
+            else:
+                capture = factory(index, backend)
             opened = bool(capture.isOpened())
         except Exception:
             opened = False
         finally:
-            if capture is not None:
-                try:
-                    capture.release()
-                except Exception:
-                    pass
+            _release_quietly(capture)
         results.append({
             "index": index,
             "node": f"/dev/video{index}" if sys.platform.startswith("linux") else None,

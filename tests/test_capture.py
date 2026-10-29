@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 
 import cv2
+import numpy as np
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -25,6 +26,7 @@ class FakeCapture:
         self._frames = list(frames)
         self.settings = {}
         self.released = False
+        self.fps = 30.0
 
     def isOpened(self):
         return self._opened and not self.released
@@ -37,6 +39,9 @@ class FakeCapture:
         if self._frames:
             return True, self._frames.pop(0)
         return False, None
+
+    def get(self, prop):
+        return self.fps if prop == cv2.CAP_PROP_FPS else 0.0
 
     def release(self):
         self.released = True
@@ -98,23 +103,26 @@ def test_list_cameras_includes_video_node_above_max_index():
 
 def test_open_capture_tries_backends_and_applies_local_settings():
     attempts = []
+    params_by_backend = []
 
-    def factory(source, backend=None):
+    def factory(source, backend=None, params=None):
         attempts.append(backend)
+        params_by_backend.append(params)
         return FakeCapture(source, backend, opened=(backend == cv2.CAP_ANY))
 
     capture = capture_module.open_capture(
         0, capture_factory=factory, backends=[cv2.CAP_V4L2, cv2.CAP_ANY]
     )
     assert capture.isOpened()
-    assert attempts == [cv2.CAP_V4L2, cv2.CAP_ANY]
+    assert attempts == [cv2.CAP_V4L2, cv2.CAP_V4L2, cv2.CAP_ANY]
     assert capture.settings[cv2.CAP_PROP_FRAME_WIDTH] == 1280
     assert capture.settings[cv2.CAP_PROP_FRAME_HEIGHT] == 720
-    assert capture.settings[cv2.CAP_PROP_OPEN_TIMEOUT_MSEC] == 3000
+    expected = [cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 3000]
+    assert params_by_backend == [expected, None, expected]
 
 
 def test_open_capture_custom_size_and_specific_backend():
-    def factory(source, backend=None):
+    def factory(source, backend=None, params=None):
         return FakeCapture(source, backend, opened=True)
 
     capture = capture_module.open_capture(
@@ -128,14 +136,78 @@ def test_open_capture_custom_size_and_specific_backend():
 
 
 def test_open_capture_url_does_not_apply_local_settings():
-    def factory(source, backend=None):
+    attempts = []
+
+    def factory(source, backend=None, params=None):
+        attempts.append((source, backend, params))
         return FakeCapture(source, backend, opened=True)
 
     capture = capture_module.open_capture(
-        "http://192.168.0.10:8080/video", capture_factory=factory
+        "http://192.168.0.10:8080/video", read_timeout_ms=5000,
+        capture_factory=factory,
     )
     assert capture.isOpened()
     assert cv2.CAP_PROP_FRAME_WIDTH not in capture.settings
+    assert attempts == [
+        (
+            "http://192.168.0.10:8080/video",
+            cv2.CAP_ANY,
+            [
+                cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 3000,
+                cv2.CAP_PROP_READ_TIMEOUT_MSEC, 5000,
+            ],
+        )
+    ]
+
+
+def test_open_capture_local_falls_back_when_timeout_params_are_rejected():
+    calls = []
+
+    def factory(source, backend=None, params=None):
+        calls.append((source, backend, params))
+        if params is not None:
+            raise TypeError("local backend rejects open params")
+        return FakeCapture(source, backend, opened=True)
+
+    capture = capture_module.open_capture(0, capture_factory=factory)
+
+    assert capture.isOpened()
+    assert calls == [
+        (0, cv2.CAP_V4L2, [cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 3000]),
+        (0, cv2.CAP_V4L2, None),
+    ]
+
+
+def test_open_capture_network_does_not_fallback_without_timeout_params():
+    source = "http://camera.local/video"
+    calls = []
+
+    def factory(value, backend=None, params=None):
+        calls.append((value, backend, params))
+        raise TypeError("backend rejects open params")
+
+    with pytest.raises(capture_module.CaptureError) as excinfo:
+        capture_module.open_capture(source, capture_factory=factory)
+
+    assert calls == [
+        (source, cv2.CAP_ANY, [cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 3000])
+    ]
+    assert excinfo.value.kind == "network"
+    assert "nao foi tentada novamente sem eles" in str(excinfo.value)
+
+
+def test_open_capture_network_fails_closed_when_timeout_binding_is_missing(monkeypatch):
+    monkeypatch.delattr(cv2, "CAP_PROP_OPEN_TIMEOUT_MSEC")
+    calls = []
+
+    with pytest.raises(capture_module.CaptureError) as excinfo:
+        capture_module.open_capture(
+            "http://camera.local/video",
+            capture_factory=lambda *args: calls.append(args),
+        )
+
+    assert excinfo.value.kind == "timeout_unsupported"
+    assert calls == []
 
 
 def test_open_capture_local_missing_node_reports_not_found(monkeypatch):
@@ -228,3 +300,108 @@ def test_app_list_cameras_cli_exits_with_status(monkeypatch, capsys):
         app_module.main()
     assert excinfo.value.code == 0
     assert "1 (/dev/video1): ok" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        (1, 1),
+        ("http://camera.local/video", "http://camera.local/video"),
+        ("recording.mp4", "recording.mp4"),
+    ],
+)
+def test_run_check_opens_exact_source_without_requiring_video_nodes(
+    monkeypatch, capsys, source, expected
+):
+    capture = FakeCapture(expected, frames=[np.zeros((480, 640, 3), dtype=np.uint8)])
+    opened = []
+
+    def open_source(selected, **kwargs):
+        opened.append((selected, kwargs))
+        return capture
+
+    monkeypatch.setattr(app_module, "_video_nodes", lambda: pytest.fail("must not enumerate"))
+    monkeypatch.setattr(app_module, "_open_capture", open_source)
+
+    assert app_module.run_check(source, open_timeout_ms=1700) == 0
+
+    assert opened == [
+        (expected, {"open_timeout_ms": 1700, "read_timeout_ms": 5000})
+    ]
+    assert capture.released
+    output = capsys.readouterr().out
+    assert f"Testando fonte: {expected!r}" in output
+    assert "640x480, 30 FPS" in output
+
+
+def test_run_check_cli_preserves_url_source(monkeypatch):
+    source = "http://camera.local/video"
+    checked = []
+    monkeypatch.setattr(sys, "argv", ["main.py", "--check", "--source", source])
+    monkeypatch.setattr(
+        app_module, "run_check",
+        lambda value, open_timeout_ms: checked.append((value, open_timeout_ms)) or 0,
+    )
+
+    with pytest.raises(SystemExit) as excinfo:
+        app_module.main()
+
+    assert excinfo.value.code == 0
+    assert checked == [(source, 3000)]
+
+
+def test_run_check_reports_open_failure(monkeypatch, capsys):
+    source = "http://camera.local/video"
+
+    def fail_open(selected, **kwargs):
+        raise capture_module.CaptureError(selected, "network", "stream indisponivel")
+
+    monkeypatch.setattr(app_module, "_open_capture", fail_open)
+
+    assert app_module.run_check(source) == 1
+    output = capsys.readouterr().out
+    assert "FAIL:" in output
+    assert source in output
+
+
+def test_run_check_times_out_and_releases_capture(monkeypatch, capsys):
+    capture = FakeCapture("camera.mp4")
+    monkeypatch.setattr(app_module, "_open_capture", lambda source, **kwargs: capture)
+
+    assert app_module.run_check(
+        "camera.mp4", first_frame_timeout_s=0.02
+    ) == 1
+
+    assert capture.released
+    assert "nao entregou um frame antes do prazo de 0.02 segundos" in capsys.readouterr().out
+
+
+def test_run_check_releases_capture_when_read_raises(monkeypatch, capsys):
+    class BrokenCapture(FakeCapture):
+        def read(self):
+            raise RuntimeError("read failed")
+
+    capture = BrokenCapture("camera.mp4")
+    monkeypatch.setattr(app_module, "_open_capture", lambda source, **kwargs: capture)
+
+    assert app_module.run_check(
+        "camera.mp4", first_frame_timeout_s=0.2
+    ) == 1
+
+    assert capture.released
+    assert "read failed" in capsys.readouterr().out
+
+
+def test_run_check_treats_fps_query_exception_as_unavailable(monkeypatch, capsys):
+    class BrokenFpsCapture(FakeCapture):
+        def get(self, prop):
+            raise RuntimeError("fps query unsupported")
+
+    capture = BrokenFpsCapture(
+        "camera.mp4", frames=[np.zeros((480, 640, 3), dtype=np.uint8)]
+    )
+    monkeypatch.setattr(app_module, "_open_capture", lambda source, **kwargs: capture)
+
+    assert app_module.run_check("camera.mp4", first_frame_timeout_s=0.02) == 0
+    assert capture.released
+    assert "FPS indisponivel" in capsys.readouterr().out

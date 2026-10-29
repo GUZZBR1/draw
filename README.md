@@ -61,9 +61,15 @@ python main.py --source 1 --width 640 --height 480 --fps 30
 python main.py --source 1 --backend v4l2
 ```
 
-Comportamento quando algo dá errado, sem travar indefinidamente:
+Comportamento quando algo dá errado:
 
-- Abertura com timeout e tentativas por backend, na ordem do SO.
+- A abertura passa os timeouts do OpenCV no construtor da captura e tenta
+  backends na ordem do SO. O suporte aos timeouts depende da versão do
+  OpenCV e do backend: FFmpeg e GStreamer são os backends documentados.
+  Para URL/arquivo, se o backend rejeitar esses parâmetros, o Draw falha
+  com diagnóstico e não tenta uma abertura de rede sem limite. Para
+  webcam local, ele preserva a tentativa antiga sem parâmetros se o
+  backend não os aceitar.
   No Linux é V4L2 e depois o genérico; no Windows é MSMF, DShow e
   depois o genérico. Um backend pedido com `--backend` é o único tentado.
 - Erro com a causa e a ação: porta inexistente, falta de permissão no
@@ -77,11 +83,12 @@ Comportamento quando algo dá errado, sem travar indefinidamente:
 
 Plataformas, resumido: Linux usa V4L2 e `/dev/video*`; Windows usa
 MSMF/DShow direto; WSL2 continua sendo um caso separado, descrito na
-seção abaixo — o `--check` e o script de setup já cuidam de
-`uvcvideo`, `usbipd`, grupo `video` e interop com PowerShell, e a
-câmera via rede continua sendo a rota que não depende de passthrough
-USB. Nem toda câmera USB é compatível com passthrough; se o attach
-falhar, use a rota via rede ou a ponte de captura do Windows.
+seção abaixo — para uma fonte local, `--check` diagnostica a porta
+selecionada e o script de setup cuida de `uvcvideo`, `usbipd`, grupo
+`video` e interop com PowerShell. Uma URL de rede também pode ser
+validada sem dispositivo `/dev/video*`. Nem toda câmera USB é compatível
+com passthrough; se o attach falhar, use a rota via rede ou a ponte de
+captura do Windows.
 
 Os testes dessa camada, em `tests/test_capture.py`, usam só mocks:
 parsing de fontes, listagem, ordem de backends, cada tipo de erro e
@@ -107,6 +114,8 @@ Se algo falhar, rode o diagnóstico antes de mexer em outra coisa:
 
 ```bash
 python main.py --check
+python main.py --check --source 1
+python main.py --check --source http://192.168.0.10:8080/video
 ```
 
 ### Linux puro com câmera USB
@@ -120,7 +129,15 @@ python main.py
 python main.py --check
 ```
 
-O comando com `--check` valida o OpenCV, a existência de `/dev/video*`, a permissão do processo sobre o dispositivo e a leitura de um quadro real. Cada falha sai nomeada, com a correção na linha seguinte.
+`--check` valida exatamente a fonte selecionada por `--source`, passa
+timeouts de abertura e leitura no construtor, tenta receber um frame por
+até 5 segundos e informa dimensões e FPS quando disponíveis. URLs e
+arquivos não dependem de `/dev/video*`. Em fontes locais, a falha
+identifica a porta e a permissão aplicável. O limite de leitura depende
+do backend: se `capture.read()` bloquear e o backend não aplicar o
+timeout, a chamada nativa pode ultrapassar os 5 segundos. Para URL ou
+arquivo sem suporte aos parâmetros, o diagnóstico falha sem tentar uma
+abertura sem timeout.
 
 ## Uso
 
@@ -134,8 +151,9 @@ python main.py --source 1
 # Câmera via rede, por um stream MJPEG
 python main.py --source http://192.168.0.10:8080/video
 
-# Valida a câmera e sai, sem abrir janela
+# Valida a fonte selecionada e sai, sem abrir janela
 python main.py --check
+python main.py --check --source http://192.168.0.10:8080/video
 
 # Modo opcional com a folha-modelo impressa
 python template/generate_template.py
@@ -264,7 +282,7 @@ Feito:
 - Captura em tempo real: folha retificada, tinta extraída e canvas digital ao vivo
 - Fonte de vídeo flexível, por índice local ou por URL de stream
 - Câmera do Windows anexada ao WSL pelo script de instalação
-- Diagnóstico de câmera porta por porta com `--check`
+- Diagnóstico da fonte selecionada com `--check --source`
 - Detecção sem marcadores como modo padrão
 - Portão de textura com veredito de baixa confiança para folha lisa
 - Captura de frames crus e rotulador do professor clássico
