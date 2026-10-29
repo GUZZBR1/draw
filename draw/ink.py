@@ -1,19 +1,43 @@
 """Extração da tinta: separar o que foi desenhado do papel branco.
 
-Usa limiar adaptativo sobre a folha retificada — robusto a variações de
-iluminação ao longo da página. No modo com marcadores, as áreas dos
-marcadores são apagadas da máscara para não virarem "tinta" no canvas.
-No modo sem marcadores não há marcador nenhum para apagar: apagar as
-mesmas áreas apagaria desenho de verdade perto dos cantos da página.
+A separação tem duas camadas, medidas no replay do vídeo de desenho
+(~/workspace/draw-lab/stroke-fix-2026-10-29/REPORT.md). A primeira é o
+limiar adaptativo de sempre sobre a folha retificada, robusto a
+variações de iluminação ao longo da página. A segunda é um veto de
+fundo separável: um pixel só é tinta se estiver escuro o bastante
+contra a mediana da sua linha inteira e da sua coluna inteira. A
+pauta impressa ocupa a linha toda, então a mediana da linha já é o
+brilho da pauta e ela não passa no veto; a lombada do caderno e as
+bordas da folha ocupam a coluna toda e caem pelo mesmo caminho. O
+traço de caneta fica dezenas de níveis abaixo das duas medianas e
+passa. Um portão de cor (saturação ou preto absoluto) foi medido e
+reprovado neste material: o traço real é cinza de baixa saturação,
+igual ao papel nesses canais, e o portão apagava o desenho.
 
-Como a tinta é lida da folha a cada frame (e não acumulada), apagar com
-a borracha funciona naturalmente: sumiu do papel, some do canvas.
+A tinta do canvas não é mais lida de um frame só: o InkAccumulator
+junta as observações de uma janela de frames no espaço do papel. Um
+pixel entra no canvas quando a fração de tinta entre as amostras
+visíveis da janela passa de um limiar de entrada e sai quando cai
+abaixo de um limiar de saída menor (histerese). Pixel coberto pela
+mão é desconhecido: não conta como tinta nem como papel limpo, o
+que preserva o que já foi desenhado embaixo da mão e também
+preserva a borracha (apagou e ficou visível como papel limpo por
+amostras bastantes, sai do canvas).
+
+No modo com marcadores, as áreas dos marcadores são apagadas da
+máscara para não virarem "tinta" no canvas. No modo sem marcadores
+não há marcador nenhum para apagar: apagar as mesmas áreas
+apagaria desenho de verdade perto dos cantos da página.
 """
+
+from collections import deque
 
 import cv2
 import numpy as np
 
 from . import config
+
+_VETO_DELTA = 6.0
 
 
 def _marker_mask(shape):
@@ -25,6 +49,24 @@ def _marker_mask(shape):
     return mask
 
 
+def _separable_veto(gray):
+    """True onde o pixel é escuro contra a linha e a coluna inteiras.
+
+    A mediana de uma linha da folha retificada é o brilho típico
+    daquela linha (papel, ou pauta onde a linha é pautada); a da
+    coluna idem (papel, ou lombada e bordas onde a coluna as cruza).
+    Estruturas que ocupam a linha ou a coluna inteira têm delta
+    perto de zero contra a própria mediana e são vetadas; o traço,
+    local e bem mais escuro, passa.
+    """
+    gray_f = gray.astype(np.float32)
+    bg_row = np.median(gray_f, axis=1, keepdims=True)
+    bg_col = np.median(gray_f, axis=0, keepdims=True)
+    return (gray_f <= bg_row - _VETO_DELTA) & (
+        gray_f <= bg_col - _VETO_DELTA
+    )
+
+
 def extract_ink(warped, clear_markers=False):
     """Retorna a máscara de tinta (255 = tinta) da folha retificada.
 
@@ -32,11 +74,16 @@ def extract_ink(warped, clear_markers=False):
     cantos. Só faz sentido no modo com marcadores, onde a folha-modelo
     tem marcadores impressos de verdade; o chamador desse modo é quem
     pede a limpeza. Sem o pedido, nenhum pixel é apagado por posição.
+
+    O veto de fundo separável vale só no caminho sem marcadores, que
+    é onde mora o papel pautado de caderno. A folha-modelo impressa
+    não tem pauta: nela o veto não derruba artefato nenhum e só custa
+    recall (medido no selftest: 96,03% sem o veto, 93,84% com ele).
     """
     gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
-    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+    blurred = cv2.GaussianBlur(gray, (3, 3), 0)
     binary = cv2.adaptiveThreshold(
-        gray,
+        blurred,
         255,
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
         cv2.THRESH_BINARY,
@@ -49,6 +96,8 @@ def extract_ink(warped, clear_markers=False):
     # Remove ruído pequeno (poeira, textura do papel).
     kernel = np.ones((2, 2), dtype=np.uint8)
     ink = cv2.morphologyEx(ink, cv2.MORPH_OPEN, kernel)
+    if not clear_markers:
+        ink[~_separable_veto(gray)] = 0
     return ink
 
 
@@ -59,3 +108,85 @@ def render_canvas(ink_mask):
     )
     canvas[ink_mask > 0] = (0, 0, 0)
     return canvas
+
+
+class InkAccumulator:
+    """Canvas acumulativo no espaço do papel, com histerese temporal.
+
+    Cada update recebe a observação de tinta de um frame (a máscara
+    de extract_ink) e a máscara do que está visível nesse frame
+    (False sob a mão; None quando não há máscara de mão, caso em que
+    tudo conta como visível). A evidência de tinta é a observação
+    dilatada de tolerance pixels, para absorver o jitter residual do
+    warp entre frames vizinhos; evidência só conta onde o pixel está
+    visível. Sobre a janela das últimas window amostras, cada pixel
+    tem uma fração de tinta: votos de tinta dividido por votos
+    visíveis. O pixel entra no canvas quando a fração passa de
+    enter e sai quando cai a exit ou abaixo, julgado apenas onde a
+    janela já viu o pixel ao menos min_visible vezes. Pixel sem
+    julgamento suficiente congela no estado atual: é o que faz a
+    região sob a mão não ganhar nem perder tinta.
+
+    Os parâmetros foram medidos no replay do vídeo de desenho: a
+    presença por pixel do traço real fica perto de 0,55 e a do
+    artefato de pauta abaixo de 0,3, então enter=0,45 separa os
+    dois; exit=0,20 segura o traço através da cintilação sem segurar
+    o artefato, cuja fração desaba quando a luz muda.
+    """
+
+    def __init__(
+        self,
+        shape=(config.PAPER_H, config.PAPER_W),
+        window=15,
+        enter=0.45,
+        exit=0.20,
+        tolerance=1,
+        min_visible=4,
+    ):
+        self._window = window
+        self._enter = enter
+        self._exit = exit
+        self._min_visible = min_visible
+        size = 2 * tolerance + 1
+        self._kernel = np.ones((size, size), dtype=np.uint8)
+        self._shape = shape
+        self.reset()
+
+    def reset(self):
+        """Esquece a janela e esvazia o canvas (folha nova, sessão nova)."""
+        self._ink_votes = deque()
+        self._vis_votes = deque()
+        self._ink_counts = np.zeros(self._shape, dtype=np.int16)
+        self._vis_counts = np.zeros(self._shape, dtype=np.int16)
+        self.state = np.zeros(self._shape, dtype=bool)
+
+    def update(self, ink_mask, visible_mask=None):
+        """Alimenta uma observação e retorna o canvas (255 = tinta)."""
+        ink = ink_mask > 0
+        if visible_mask is None:
+            visible = np.ones(ink.shape, dtype=bool)
+        elif visible_mask.dtype == bool:
+            visible = visible_mask
+        else:
+            visible = visible_mask > 0
+        evidence = (
+            cv2.dilate(ink.astype(np.uint8), self._kernel).astype(bool)
+            & visible
+        )
+        if len(self._ink_votes) == self._window:
+            self._ink_counts -= self._ink_votes.popleft()
+            self._vis_counts -= self._vis_votes.popleft()
+        self._ink_votes.append(evidence)
+        self._vis_votes.append(visible)
+        self._ink_counts += evidence
+        self._vis_counts += visible
+        judged = self._vis_counts >= self._min_visible
+        fraction = np.zeros(self._shape, dtype=np.float32)
+        fraction[judged] = self._ink_counts[judged] / np.maximum(
+            self._vis_counts[judged], 1
+        )
+        enter = judged & ~self.state & (fraction >= self._enter)
+        clear = judged & self.state & (fraction <= self._exit)
+        self.state[enter] = True
+        self.state[clear] = False
+        return (self.state * 255).astype(np.uint8)
