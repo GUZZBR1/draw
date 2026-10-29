@@ -27,6 +27,17 @@ Cada canto reajustado só é aceito se ficar a no máximo
 _FIT_MAX_DISPLACE_PX do vértice da aproximação; sem essa trava, uma
 aresta curta ou contaminada projeta cantos para longe demais.
 
+Aresta cuja cobertura de pontos é curta (a mão cobre a maior parte
+dela) não ganha reta ajustada: dentro de um quadro só, os pontos
+visíveis dela são a borda do braço, não a aresta, e a reta do
+fragmento projeta os cantos a centenas de pixels (o teto acima veta
+a correção e o canto congela no vértice da aproximação, que nesses
+quadros mora sobre a borda do quadro). Quem resolve é a memória de
+arestas do detector: a aresta coberta herda a última reta confiável
+dela mesma, e só sem herança vale a reta travada na direção do
+segmento. Os cantos vizinhos de uma aresta travada ou herdada não
+passam pelo teto: a projeção já nasce limitada.
+
 A sessão ONNX é preguiçosa e o onnxruntime só é importado no primeiro
 uso. Importar este módulo nunca quebra em ambiente sem a dependência;
 usar o detector sem ela levanta um erro explícito.
@@ -50,6 +61,9 @@ _STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 _MASK_THRESHOLD = 0.5
 _MIN_CONTOUR_AREA_RATIO = 0.01
 _FIT_MAX_DISPLACE_PX = 100.0
+_FIT_MIN_EDGE_COVERAGE = 0.5
+_MEMORY_MIN_MASK_IOU = 0.7
+_MEMORY_MASK_STRIDE = 4
 _ENV_MODEL_VAR = "DRAW_NEURAL_MODEL"
 
 
@@ -142,17 +156,72 @@ def _segment_distances(points, start, end):
     return np.linalg.norm(points - (start + np.outer(t, segment)), axis=1)
 
 
-def _refit_corners(contour, quad, frame_shape):
+def _edge_line(side, start, end, centroid, fallback=None):
+    """A reta de uma aresta: ajustada, herdada ou travada na direção.
+
+    Com cobertura boa (os pontos ocupam pelo menos
+    _FIT_MIN_EDGE_COVERAGE do comprimento do segmento), vale o
+    ajuste de Huber com poda por resíduo de sempre, e a reta é
+    confiável. Com cobertura curta, os pontos são um fragmento da
+    aresta (o resto está coberto, tipicamente pela mão) e nem a
+    direção ajustada nem o fragmento localizam a aresta: medido nos
+    quadros de escape do vídeo de teste, os pontos do fragmento são
+    a borda do braço sobre a folha, a dezenas de pixels da aresta
+    verdadeira, e a reta ajustada projeta os cantos a centenas de
+    pixels; o teto de deslocamento veta a correção e o canto fica
+    congelado no vértice da aproximação, que nesses quadros mora
+    sobre a borda do quadro porque a máscara corre por ela.
+
+    Sem cobertura, a ordem de preferência é: a reta herdada da
+    chamada anterior (a folha é rígida e a câmera é fixa; a última
+    reta confiável da mesma aresta é a melhor estimativa dela
+    coberta); na falta dela, a reta travada na direção do segmento
+    com o deslocamento mediano dos pontos, cuja projeção nasce
+    limitada. Retorna (reta, travada, confiavel).
+    """
+    segment = end - start
+    length = float(np.linalg.norm(segment))
+    if length < 1e-6:
+        return _fit_line(side), False, True
+    direction = segment / length
+    along = (side - start) @ direction
+    coverage = float(along.max() - along.min()) / length
+    if coverage >= _FIT_MIN_EDGE_COVERAGE:
+        line = _fit_line(side)
+        dir_fit, point_fit = line
+        normal = np.array([-dir_fit[1], dir_fit[0]])
+        residuals = np.abs((side - point_fit) @ normal)
+        keep = residuals <= max(3.0, float(np.percentile(residuals, 70)))
+        if keep.sum() >= 8:
+            line = _fit_line(side[keep])
+        return line, False, True
+    if fallback is not None:
+        return fallback, True, False
+    normal = np.array([-direction[1], direction[0]])
+    if float((centroid - start) @ normal) < 0:
+        normal = -normal
+    offset = float(np.median((side - start) @ normal))
+    return (direction, start + offset * normal), True, False
+
+
+def _refit_corners(contour, quad, frame_shape, fallback_lines=None):
     """Reajusta os cantos como interseções das retas das arestas.
 
     Cada ponto do contorno é atribuído à aresta mais próxima. Pontos
     colados nos vértices da aproximação ficam fora (são a virada de
     uma aresta para outra). Pontos sobre a borda do frame também
     ficam fora quando sobra ponto bastante sem eles: a máscara ali
-    foi cortada pelo quadro. O ajuste é Huber com uma poda por
-    resíduo. Um canto reajustado só substitui o vértice se ficar a
-    no máximo _FIT_MAX_DISPLACE_PX dele, e o quadrilátero final
-    precisa continuar convexo.
+    foi cortada pelo quadro. A reta de cada aresta sai de _edge_line
+    (ajustada; sem cobertura, herdada de fallback_lines ou travada
+    na direção do segmento). Um canto reajustado só substitui o
+    vértice se ficar a no máximo _FIT_MAX_DISPLACE_PX dele, exceto
+    quando uma das arestas do canto é travada: ali a projeção já
+    nasce limitada pela trava e o vértice de referência é justamente
+    o contaminado. O quadrilátero final precisa continuar convexo.
+
+    Retorna (quadrilatero, retas usadas, confiavel por aresta); as
+    retas voltam None quando alguma aresta tem ponto de menos e o
+    reajuste inteiro é abandonado.
     """
     frame_h, frame_w = frame_shape
     points = contour.reshape(-1, 2).astype(np.float64)
@@ -164,13 +233,16 @@ def _refit_corners(contour, quad, frame_shape):
         axis=1,
     )
     assignment = np.argmin(distances, axis=1)
+    centroid = quad.astype(np.float64).mean(axis=0)
     lines = []
+    locked = []
+    trusted = []
     for i in range(4):
         start = quad[i].astype(np.float64)
         end = quad[(i + 1) % 4].astype(np.float64)
         side = points[assignment == i]
         if len(side) < 8:
-            return quad
+            return quad, None, None
         near_vertex = (np.linalg.norm(side - start, axis=1) < 25) | (
             np.linalg.norm(side - end, axis=1) < 25
         )
@@ -185,26 +257,29 @@ def _refit_corners(contour, quad, frame_shape):
         if len(off_border) >= 8:
             side = off_border
         if len(side) < 8:
-            return quad
-        line = _fit_line(side)
-        direction, point = line
-        normal = np.array([-direction[1], direction[0]])
-        residuals = np.abs((side - point) @ normal)
-        keep = residuals <= max(3.0, float(np.percentile(residuals, 70)))
-        if keep.sum() >= 8:
-            line = _fit_line(side[keep])
+            return quad, None, None
+        fallback = None
+        if fallback_lines is not None:
+            fallback = fallback_lines[i]
+        line, is_locked, is_trusted = _edge_line(
+            side, start, end, centroid, fallback
+        )
         lines.append(line)
+        locked.append(is_locked)
+        trusted.append(is_trusted)
     refined = quad.copy()
     for i in range(4):
         corner = _intersect(lines[i - 1], lines[i])
         if corner is None:
             continue
-        if np.linalg.norm(corner - quad[i]) <= _FIT_MAX_DISPLACE_PX:
+        if locked[i - 1] or locked[i]:
+            refined[i] = corner
+        elif np.linalg.norm(corner - quad[i]) <= _FIT_MAX_DISPLACE_PX:
             refined[i] = corner
     refined = _order_corners(refined)
     if not cv2.isContourConvex(refined.reshape(4, 1, 2).astype(np.float32)):
-        return quad
-    return refined
+        return quad, lines, trusted
+    return refined, lines, trusted
 
 
 def _refine_inside(frame, corners):
@@ -239,6 +314,30 @@ def _refine_inside(frame, corners):
     return refined.astype(np.float32)
 
 
+def _fit_quad_impl(mask_bin, frame, fallback_lines):
+    """O ajuste completo sobre a máscara, com herança opcional.
+
+    Retorna (quadrilatero ou None, retas usadas ou None, confiavel
+    por aresta ou None). fallback_lines são as retas confiáveis da
+    chamada anterior, oferecidas às arestas sem cobertura.
+    """
+    contour = _largest_contour(mask_bin)
+    if contour is None:
+        return None, None, None
+    frame_area = float(mask_bin.shape[0] * mask_bin.shape[1])
+    if cv2.contourArea(contour) < frame_area * _MIN_CONTOUR_AREA_RATIO:
+        return None, None, None
+    quad = _approx_quad(contour)
+    if quad is None:
+        return _min_area_quad(contour).astype(np.float32), None, None
+    quad, lines, trusted = _refit_corners(
+        contour, quad, mask_bin.shape[:2], fallback_lines
+    )
+    if frame is not None:
+        quad = _refine_inside(frame, quad)
+    return quad.astype(np.float32), lines, trusted
+
+
 def fit_quad(mask_bin, frame=None):
     """Ajusta o quadrilátero da folha sobre a máscara binária.
 
@@ -247,21 +346,11 @@ def fit_quad(mask_bin, frame=None):
     Se a escada de epsilon não fecha, vale a reserva de
     _min_area_quad, sem reajuste nem refino. Com o frame, os cantos
     do caminho principal que estão dentro do quadro ganham refino
-    subpixel sobre a imagem.
+    subpixel sobre a imagem. Esta função não tem estado: a memória
+    de arestas entre chamadas mora no NeuralSheetDetector.
     """
-    contour = _largest_contour(mask_bin)
-    if contour is None:
-        return None
-    frame_area = float(mask_bin.shape[0] * mask_bin.shape[1])
-    if cv2.contourArea(contour) < frame_area * _MIN_CONTOUR_AREA_RATIO:
-        return None
-    quad = _approx_quad(contour)
-    if quad is None:
-        return _min_area_quad(contour).astype(np.float32)
-    quad = _refit_corners(contour, quad, mask_bin.shape[:2])
-    if frame is not None:
-        quad = _refine_inside(frame, quad)
-    return quad.astype(np.float32)
+    quad, _lines, _trusted = _fit_quad_impl(mask_bin, frame, None)
+    return quad
 
 
 class NeuralSheetDetector:
@@ -273,11 +362,22 @@ class NeuralSheetDetector:
     fecha; fora isso, (None, None, máscara). A máscara é uint8
     0/255 no tamanho do frame, limiarizada em 0,5 como na avaliação
     da fase 2.
+
+    O detector guarda as retas confiáveis das arestas entre chamadas
+    (a memória de arestas): quando uma aresta perde cobertura numa
+    chamada (a mão sobre ela), a reta herdada estima essa aresta até
+    ela voltar a ser visível. A herança só vale em cena contínua: a
+    máscara da chamada precisa ter IoU de pelo menos
+    _MEMORY_MIN_MASK_IOU com a da chamada anterior, medido nas
+    máscaras reduzidas por _MEMORY_MASK_STRIDE. Cena nova recomeça
+    sem herança.
     """
 
     def __init__(self, model_path):
         self.model_path = str(model_path)
         self._session = None
+        self._edge_lines = None
+        self._memory_mask = None
 
     def _get_session(self):
         if self._session is None:
@@ -287,6 +387,38 @@ class NeuralSheetDetector:
     def load(self):
         """Carrega a sessão agora, para erro de modelo falhar cedo."""
         self._get_session()
+
+    def _fallback_lines(self, mask):
+        """As retas herdáveis para esta máscara, ou None sem continuidade."""
+        if self._edge_lines is None or self._memory_mask is None:
+            return None
+        small = mask[::_MEMORY_MASK_STRIDE, ::_MEMORY_MASK_STRIDE] > 0
+        if small.shape != self._memory_mask.shape:
+            return None
+        inter = int((small & self._memory_mask).sum())
+        union = int((small | self._memory_mask).sum())
+        if union == 0 or inter / union < _MEMORY_MIN_MASK_IOU:
+            return None
+        return self._edge_lines
+
+    def _fit(self, mask, frame):
+        """fit_quad com a memória de arestas do detector."""
+        fallback = self._fallback_lines(mask)
+        corners, lines, trusted = _fit_quad_impl(mask, frame, fallback)
+        if lines is not None:
+            stored = (
+                list(self._edge_lines)
+                if self._edge_lines is not None
+                else [None, None, None, None]
+            )
+            for i in range(4):
+                if trusted[i]:
+                    stored[i] = lines[i]
+            self._edge_lines = stored
+        self._memory_mask = (
+            mask[::_MEMORY_MASK_STRIDE, ::_MEMORY_MASK_STRIDE] > 0
+        )
+        return corners
 
     def predict(self, frame):
         """Roda o modelo. Retorna (logit de presença, máscara 0/255)."""
@@ -320,7 +452,7 @@ class NeuralSheetDetector:
         presence, mask = self.predict(frame)
         if presence <= 0:
             return None, None, mask
-        corners = fit_quad(mask, frame)
+        corners = self._fit(mask, frame)
         if corners is None:
             return None, None, mask
         return corners, "paper", mask

@@ -35,8 +35,14 @@ from . import paper as paper_module
 _SHEET_NEAR_LIMIT_PX = 40.0
 _SHEET_BLEND_ALPHA = 0.3
 _SHEET_JUMP_CONFIRMATIONS = 3
-_SHEET_LOST_FRAME_LIMIT = 30
 _SHEET_DETECT_INTERVAL = 5
+# Perda da folha medida em tempo, nao em quadros: com a contagem em
+# quadros, o mesmo limite valia ~1 s a 30 fps e ~3 s numa sessao lenta,
+# e era esse o banner que ficava sobre a mesa vazia. O piso em quadros
+# impede a queda entre duas deteccoes agendadas quando o loop roda
+# devagar: a folha presente confirma de novo antes dos dois criterios.
+_SHEET_LOST_SECONDS = 0.5
+_SHEET_LOST_MIN_FRAMES = 10
 
 
 def _corner_distance(current, detected):
@@ -48,6 +54,116 @@ def _blend_corners(current, detected):
         (1.0 - _SHEET_BLEND_ALPHA) * current
         + _SHEET_BLEND_ALPHA * detected
     ).astype(np.float32)
+
+
+class _SheetTracker:
+    """Estabilizacao temporal do quadrilatero da folha.
+
+    Guarda o quadrilatero atual e decide, quadro a quadro, entre
+    misturar uma deteccao vizinha, exigir confirmacoes para um salto
+    de posicao e descartar a folha perdida. Deteccao perto mistura
+    com _SHEET_BLEND_ALPHA; salto precisa de
+    _SHEET_JUMP_CONFIRMATIONS deteccoes consistentes seguidas (o
+    dobro para o candidato blank_maybe). A perda dispara quando os
+    dois criterios de _SHEET_LOST_* passam: tempo sem confirmacao e
+    quadros sem confirmacao.
+    """
+
+    def __init__(self):
+        self.corners = None
+        self.verdict = None
+        self.missed = False
+        self._pending = None
+        self._pending_hits = 0
+        self._frames_since_seen = 0
+        self._last_seen_at = None
+
+    def should_detect(self, frame_number):
+        return (
+            self.corners is None
+            or self.missed
+            or frame_number % _SHEET_DETECT_INTERVAL == 0
+        )
+
+    def _confirm(self, corners, verdict, now):
+        self.corners = corners
+        self.verdict = verdict
+        self._pending = None
+        self._pending_hits = 0
+        self._frames_since_seen = 0
+        self._last_seen_at = now
+        self.missed = False
+
+    def update(self, detected, verdict, ran_detection, now):
+        """Alimenta o rastreador com o resultado do quadro.
+
+        detected e o quadrilatero detectado ou None; ran_detection
+        diz se a deteccao rodou neste quadro; now e um relogio
+        monotonico em segundos. Retorna "seen" quando uma deteccao
+        confirma a folha, "drop" quando a folha e descartada e None
+        nos demais quadros (so para diagnostico).
+        """
+        event = None
+        if detected is not None:
+            if self.corners is None and verdict == "paper":
+                self._confirm(detected.copy(), verdict, now)
+                event = "seen"
+            elif (
+                self.corners is not None
+                and _corner_distance(self.corners, detected)
+                <= _SHEET_NEAR_LIMIT_PX
+            ):
+                self._confirm(
+                    _blend_corners(self.corners, detected), verdict, now
+                )
+                event = "seen"
+            else:
+                # Salto de posicao ou candidato ainda sem trava.
+                # Candidato blank_maybe (branco e liso, sem textura
+                # de papel) exige o dobro de confirmacoes seguidas.
+                confirmations_needed = (
+                    2 * _SHEET_JUMP_CONFIRMATIONS
+                    if verdict == "blank_maybe"
+                    else _SHEET_JUMP_CONFIRMATIONS
+                )
+                if (
+                    self._pending is not None
+                    and _corner_distance(self._pending, detected)
+                    <= _SHEET_NEAR_LIMIT_PX
+                ):
+                    self._pending = _blend_corners(self._pending, detected)
+                    self._pending_hits += 1
+                else:
+                    self._pending = detected.copy()
+                    self._pending_hits = 1
+
+                if self._pending_hits >= confirmations_needed:
+                    self._confirm(self._pending.copy(), verdict, now)
+                    event = "seen"
+                else:
+                    self._frames_since_seen += 1
+                    self.missed = True
+        elif self.corners is not None:
+            if ran_detection:
+                self._pending = None
+                self._pending_hits = 0
+                self.missed = True
+            self._frames_since_seen += 1
+
+        if (
+            self.corners is not None
+            and self._frames_since_seen > _SHEET_LOST_MIN_FRAMES
+            and self._last_seen_at is not None
+            and now - self._last_seen_at > _SHEET_LOST_SECONDS
+        ):
+            self.corners = None
+            self.verdict = None
+            self._pending = None
+            self._pending_hits = 0
+            self._frames_since_seen = 0
+            self.missed = False
+            event = "drop"
+        return event
 
 
 def parse_source(value):
@@ -286,12 +402,7 @@ def run(source=0, save_dir="captures", markers_mode=False, neural_model=None):
             else:
                 print("Captura automatica desligada.")
 
-    current_corners = None
-    current_verdict = None
-    pending_corners = None
-    pending_hits = 0
-    frames_since_seen = 0
-    sheet_missed = False
+    tracker = _SheetTracker()
     frame_number = 0
     falhas_seguidas = 0
     while True:
@@ -315,95 +426,23 @@ def run(source=0, save_dir="captures", markers_mode=False, neural_model=None):
             warped, markers = paper_module.warp_paper(frame)
         else:
             markers = {}
-            should_detect = (
-                current_corners is None
-                or sheet_missed
-                or frame_number % _SHEET_DETECT_INTERVAL == 0
-            )
-            if should_detect:
+            if tracker.should_detect(frame_number):
                 detected_corners, detected_verdict = detect_sheet(frame)
+                ran_detection = True
             else:
                 detected_corners, detected_verdict = None, None
-            if detected_corners is not None:
-                if (
-                    current_corners is None
-                    and detected_verdict == "paper"
-                ):
-                    current_corners = detected_corners.copy()
-                    current_verdict = detected_verdict
-                    pending_corners = None
-                    pending_hits = 0
-                    frames_since_seen = 0
-                    sheet_missed = False
-                elif (
-                    current_corners is not None
-                    and _corner_distance(current_corners, detected_corners)
-                    <= _SHEET_NEAR_LIMIT_PX
-                ):
-                    current_corners = _blend_corners(
-                        current_corners, detected_corners
-                    )
-                    current_verdict = detected_verdict
-                    pending_corners = None
-                    pending_hits = 0
-                    frames_since_seen = 0
-                    sheet_missed = False
-                else:
-                    # Salto de posicao ou candidato ainda sem trava.
-                    # Candidato blank_maybe (branco e liso, sem textura
-                    # de papel) exige o dobro de confirmacoes seguidas.
-                    confirmations_needed = (
-                        2 * _SHEET_JUMP_CONFIRMATIONS
-                        if detected_verdict == "blank_maybe"
-                        else _SHEET_JUMP_CONFIRMATIONS
-                    )
-                    if (
-                        pending_corners is not None
-                        and _corner_distance(
-                            pending_corners, detected_corners
-                        )
-                        <= _SHEET_NEAR_LIMIT_PX
-                    ):
-                        pending_corners = _blend_corners(
-                            pending_corners, detected_corners
-                        )
-                        pending_hits += 1
-                    else:
-                        pending_corners = detected_corners.copy()
-                        pending_hits = 1
-
-                    if pending_hits >= confirmations_needed:
-                        current_corners = pending_corners.copy()
-                        current_verdict = detected_verdict
-                        pending_corners = None
-                        pending_hits = 0
-                        frames_since_seen = 0
-                        sheet_missed = False
-                    else:
-                        frames_since_seen += 1
-                        sheet_missed = True
-            elif current_corners is not None:
-                if should_detect:
-                    pending_corners = None
-                    pending_hits = 0
-                    sheet_missed = True
-                frames_since_seen += 1
-
-            if (
-                current_corners is not None
-                and frames_since_seen > _SHEET_LOST_FRAME_LIMIT
-            ):
-                current_corners = None
-                current_verdict = None
-                pending_corners = None
-                pending_hits = 0
-                frames_since_seen = 0
-                sheet_missed = False
+                ran_detection = False
+            tracker.update(
+                detected_corners,
+                detected_verdict,
+                ran_detection,
+                time.monotonic(),
+            )
 
             frame_number += 1
             warped = (
-                paper_module.warp_sheet(frame, current_corners)
-                if current_corners is not None
+                paper_module.warp_sheet(frame, tracker.corners)
+                if tracker.corners is not None
                 else None
             )
 
@@ -411,10 +450,10 @@ def run(source=0, save_dir="captures", markers_mode=False, neural_model=None):
         if markers_mode:
             for (x, y) in markers.values():
                 cv2.circle(status, (int(x), int(y)), 8, (0, 255, 0), -1)
-        elif current_corners is not None:
-            outline = current_corners.astype(np.int32).reshape((-1, 1, 2))
+        elif tracker.corners is not None:
+            outline = tracker.corners.astype(np.int32).reshape((-1, 1, 2))
             cv2.polylines(status, [outline], True, (0, 255, 0), 2)
-            for x, y in current_corners:
+            for x, y in tracker.corners:
                 cv2.circle(status, (int(x), int(y)), 8, (0, 255, 0), -1)
         if warped is None:
             if markers_mode:
@@ -435,7 +474,7 @@ def run(source=0, save_dir="captures", markers_mode=False, neural_model=None):
             cv2.imshow("Draw - camera", _fit(status, 700))
         else:
             if not markers_mode:
-                if current_verdict == "blank_maybe":
+                if tracker.verdict == "blank_maybe":
                     status_text = "Folha detectada (baixa confianca)"
                     status_color = (0, 255, 255)
                 else:
