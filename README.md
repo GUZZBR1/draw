@@ -1,15 +1,16 @@
 # Draw
 
-**Uma mesa digitalizadora sem mesa digitalizadora — e, no futuro, uma ponte
-entre o papel e os simuladores.**
+<p align="center">
+  <img src="docs/icon.svg" width="160" alt="Draw">
+</p>
 
-O Draw usa uma webcam comum apontada para a sua mesa: você desenha numa
-folha de papel e o sistema reproduz o desenho digitalmente, em tempo real.
+O Draw é uma mesa digitalizadora sem mesa digitalizadora.
+Uma webcam aponta para a mesa, a pessoa desenha numa folha de papel e o sistema reproduz o desenho no digital.
+A visão completa fica em [VISION.md](VISION.md).
 
-A visão completa — desenhar no papel e receber feedback imediato de
-sistemas como AutoCAD e NVIDIA Isaac Sim enquanto você desenha — está em
-[VISION.md](VISION.md). Este repositório começa pela primeira barreira:
-a captura confiável do papel para o digital.
+Estado atual: a captura funciona e roda em tempo real na mesa do autor. A detecção de folha ainda é frágil em uso contínuo. A trilha neural está em construção e ainda não substitui o detector clássico.
+
+## Início rápido
 
 ## v0 — o que já faz
 
@@ -60,9 +61,15 @@ python main.py --source 1 --width 640 --height 480 --fps 30
 python main.py --source 1 --backend v4l2
 ```
 
-Comportamento quando algo dá errado, sem travar indefinidamente:
+Comportamento quando algo dá errado:
 
-- Abertura com timeout e tentativas por backend, na ordem do SO.
+- A abertura passa os timeouts do OpenCV no construtor da captura e tenta
+  backends na ordem do SO. O suporte aos timeouts depende da versão do
+  OpenCV e do backend: FFmpeg e GStreamer são os backends documentados.
+  Para URL/arquivo, se o backend rejeitar esses parâmetros, o Draw falha
+  com diagnóstico e não tenta uma abertura de rede sem limite. Para
+  webcam local, ele preserva a tentativa antiga sem parâmetros se o
+  backend não os aceitar.
   No Linux é V4L2 e depois o genérico; no Windows é MSMF, DShow e
   depois o genérico. Um backend pedido com `--backend` é o único tentado.
 - Erro com a causa e a ação: porta inexistente, falta de permissão no
@@ -76,11 +83,12 @@ Comportamento quando algo dá errado, sem travar indefinidamente:
 
 Plataformas, resumido: Linux usa V4L2 e `/dev/video*`; Windows usa
 MSMF/DShow direto; WSL2 continua sendo um caso separado, descrito na
-seção abaixo — o `--check` e o script de setup já cuidam de
-`uvcvideo`, `usbipd`, grupo `video` e interop com PowerShell, e a
-câmera via rede continua sendo a rota que não depende de passthrough
-USB. Nem toda câmera USB é compatível com passthrough; se o attach
-falhar, use a rota via rede ou a ponte de captura do Windows.
+seção abaixo — para uma fonte local, `--check` diagnostica a porta
+selecionada e o script de setup cuida de `uvcvideo`, `usbipd`, grupo
+`video` e interop com PowerShell. Uma URL de rede também pode ser
+validada sem dispositivo `/dev/video*`. Nem toda câmera USB é compatível
+com passthrough; se o attach falhar, use a rota via rede ou a ponte de
+captura do Windows.
 
 Os testes dessa camada, em `tests/test_capture.py`, usam só mocks:
 parsing de fontes, listagem, ordem de backends, cada tipo de erro e
@@ -90,94 +98,121 @@ então o CI roda todos sem hardware.
 O fluxo padrão usa uma folha solta ou uma página de caderno sob a webcam.
 Ele dispensa impressão. O Draw encontra os cantos da folha, retifica a
 imagem e mostra o canvas digital.
+### Windows com WSL
+O WSL2 não enxerga a webcam do Windows por padrão. Nenhum `/dev/video*` existe dentro dele até a câmera ser anexada.
 
-Modo opcional com folha-modelo: gere e imprima a folha com
-`python template/generate_template.py`, coloque a folha impressa sob a
-webcam e rode `python main.py --markers`.
+O guia completo de instalação fica em [docs/SETUP_WINDOWS.md](docs/SETUP_WINDOWS.md). O caminho curto é um comando só, rodado de dentro do WSL:
 
-## Rodando no WSL (Windows)
+```bash
+bash scripts/setup_camera_wsl.sh
+python main.py
+```
 
-O WSL2 **não enxerga a webcam do Windows por padrão**: não existe nenhum
-`/dev/video*` dentro dele, então `python main.py` falha com
-"Camera index out of range / nb_devices is 0". Isso não é um bug do Draw —
-é o WSL sem acesso ao hardware de câmera. Como todo o processamento e o ML
-futuro vivem no Linux, a solução é separar **captura** de **processamento**:
+O script prepara o usbipd, anexa a câmera ao WSL e confere o resultado. Ele também corrige o grupo `video` do usuário e religa os serviços de áudio que ele mesmo parou.
 
-- **Recomendado — câmera via rede:** qualquer câmera que transmita MJPEG
-  pela rede vira fonte do Draw, sem instalar nada no Windows. A opção mais
-  simples é um celular sobre a mesa com um app de IP camera (ex.: IP Webcam
-  no Android), que transmite em `http://<ip-do-celular>:8080/video`:
-  `python main.py --source http://<ip-do-celular>:8080/video`
-  De quebra, o celular num suporte acima da folha enxerga o papel melhor
-  que a webcam do notebook.
-- **Webcam do Windows via usbipd — um comando só:** para usar a webcam do
-  notebook ou uma webcam USB dentro do WSL, rode (de dentro do WSL):
-  `./scripts/setup_camera_wsl.sh`
-  O script confere o driver `uvcvideo`, instala o que falta (ferramentas
-  USB no WSL e o usbipd-win no Windows), acha sua câmera, compartilha e
-  anexa ela ao WSL, e confirma que `/dev/video*` apareceu. Ele é
-  idempotente — depois de reiniciar o WSL, rode o mesmo comando de novo.
-  Se o `attach` falhar com "Device busy", o script limpa registros antigos
-  de attach nos dois lados e tenta de novo com `bind --force`. Se ainda
-  falhar, ele lê o log de eventos do Windows. Esse log nomeia o componente
-  que bloqueou a remoção da câmera. O script para esse componente uma vez
-  e faz uma última tentativa de attach. Se mesmo assim falhar, ele imprime
-  o texto completo do bloqueio. Esse texto é o diagnóstico.
-  A única interação que sobra é clicar **Sim** na confirmação de
-  administrador do Windows (UAC) na primeira vez: nenhum script pode
-  passar por ela, por design de segurança do Windows. Depois é só
-  `python main.py`. Atenção: se o kernel do WSL não tiver o módulo
-  `uvcvideo`, o script avisa e para (a alternativa seria um kernel
-  customizado — caminho pesado e frágil). Enquanto anexada ao WSL, a
-  câmera fica indisponível para o Windows.
+Se algo falhar, rode o diagnóstico antes de mexer em outra coisa:
 
-  A v6 do script corrige a leitura desse log e vai um nível abaixo. O
-  provedor certo dos eventos é `usbipd-win`. Quando o veto nomeia uma
-  função de uma câmera composta, como a função `MI_02`, o script extrai
-  esse identificador do texto e identifica a função com `Get-PnpDevice`
-  antes de agir. Se a função for de áudio, ele para os serviços de
-  áudio do Windows e tenta o attach. Se ainda falhar, ele desabilita
-  só essa função, sem tocar na função de vídeo, e confere o status. O
-  attach final só é tentado se a desabilitação tiver pegado. Se a função for de
-  vídeo, ele para o serviço FrameServer. Se a classe for outra, ele
-  imprime a identificação e para, porque não há ação segura conhecida
-  para ela.
+```bash
+python main.py --check
+python main.py --check --source 1
+python main.py --check --source http://192.168.0.10:8080/video
+```
 
-Quando a câmera se comportar mal, rode primeiro `python main.py --check`.
-Ele valida cada porta de entrada em ordem: o OpenCV, a existência de
-`/dev/video*`, a permissão do seu usuário sobre o dispositivo e a leitura
-de um quadro real. Cada falha sai nomeada, com a correção exata na linha
-seguinte. Rode ele antes de mexer em qualquer outra coisa.
+### Linux puro com câmera USB
 
-- **Rota reserva: ponte de captura no Windows:** se a rota do usbipd
-  falhar na sua máquina, um único `ffmpeg.exe` no Windows pode ler a
-  webcam e servir o vídeo como stream MJPEG para o Draw no WSL, que
-  consome com `--source http://<ip-do-windows>:8080/video`. Nada mais
-  é instalado no Windows. O passo a passo está em
-  [bridge/README.md](bridge/README.md).
+Conecte a webcam e rode:
 
 Teclas dentro do app: `s` salva um PNG em `captures/` · `v` salva
 traços vetoriais em `captures/` (SVG + JSON) · `q` ou `Esc` sai.
+```bash
+python main.py
+python main.py --check
+```
 
-Para montar dados da trilha neural, o app captura frames crus da câmera:
-a tecla `f` salva o frame atual em `captures/frames/` e a tecla `g` liga
-ou desliga a captura automática, um frame a cada 10 quadros. Depois,
-`python tools/label_frames.py captures/frames dataset/rotulos` roda o
-detector clássico em cada frame e grava os cantos encontrados (TL, TR,
-BR, BL) em `labels.json`, com imagens de revisão em `overlays/` para um
-humano conferir os rótulos antes de eles virarem treino.
+`--check` valida exatamente a fonte selecionada por `--source`, passa
+timeouts de abertura e leitura no construtor, tenta receber um frame por
+até 5 segundos e informa dimensões e FPS quando disponíveis. URLs e
+arquivos não dependem de `/dev/video*`. Em fontes locais, a falha
+identifica a porta e a permissão aplicável. O limite de leitura depende
+do backend: se `capture.read()` bloquear e o backend não aplicar o
+timeout, a chamada nativa pode ultrapassar os 5 segundos. Para URL ou
+arquivo sem suporte aos parâmetros, o diagnóstico falha sem tentar uma
+abertura sem timeout.
 
-O detector sem marcadores tem um portão de textura: o interior do
-quadrilátero candidato precisa parecer papel, medido por fração de
-branco, densidade de bordas internas e variância do Laplaciano.
-Retângulos grandes de mesa, caixa ou tela, que só têm o formato, são
-recusados. A limitação conhecida fica com a folha totalmente em branco
-e lisa: por dentro, ela mede igual a qualquer outro retângulo branco.
-Nesse caso a detecção entra marcada como baixa confiança e exige o
-dobro de confirmações seguidas antes de travar.
+## Uso
 
-Sem webcam por perto, dá para validar o pipeline inteiro com uma cena
-sintética (folha inclinada, desenhada por código):
+```bash
+# Modo padrão, sem marcadores, em qualquer folha ou página de caderno
+python main.py
+
+# Outra webcam local
+python main.py --source 1
+
+# Câmera via rede, por um stream MJPEG
+python main.py --source http://192.168.0.10:8080/video
+
+# Valida a fonte selecionada e sai, sem abrir janela
+python main.py --check
+python main.py --check --source http://192.168.0.10:8080/video
+
+# Modo opcional com a folha-modelo impressa
+python template/generate_template.py
+python main.py --markers
+```
+
+Teclas dentro do app:
+
+- `s` salva o canvas digital como PNG em `captures/`
+- `f` salva o frame cru atual em `captures/frames/`
+- `g` liga ou desliga a captura automática, um frame cru a cada 10 quadros
+- `q` ou `Esc` sai
+
+O modo padrão é o sem marcadores. Ele é o padrão desde a v0.2. O modo com marcadores continua disponível atrás da flag `--markers` e pede a folha-modelo impressa com quatro marcadores ArUco.
+
+## Como a detecção funciona hoje
+
+A detecção atual é visão computacional clássica, em OpenCV. Ela tem duas etapas.
+
+A primeira etapa propõe candidatos por geometria. O frame passa por Canny e pela árvore completa de contornos. Os maiores contornos viram candidatos quando fecham um quadrilátero convexo, com área de pelo menos 12% do frame e razão de aspecto entre 0,4 e 2,5. A aproximação do polígono usa uma escada de epsilons, porque cantos arredondados e a lombada de um caderno não fecham num epsilon só. Os cantos aceitos ganham refino subpixel. No loop do app, a detecção roda de forma espaçada e os cantos passam por estabilização temporal.
+
+A segunda etapa é um portão de textura. Ele mede o interior de cada candidato e devolve um de três vereditos:
+
+- `paper`: o interior parece papel
+- `blank_maybe`: o candidato é branco o bastante, mas liso demais para afirmar papel
+- rejeitado: o candidato nem branco o bastante é
+
+O portão mede três coisas no interior encolhido do candidato. Ele mede a fração de branco, a densidade de bordas internas e a variância do Laplaciano. Um candidato vira `paper` quando a fração de branco passa de 0,5, a variância do Laplaciano passa de 30 e uma das duas condições de textura vale: densidade de bordas de pelo menos 0,03 ou variância do Laplaciano de pelo menos 200. Um candidato reprovado não encerra a busca. O contorno seguinte ainda pode ser a folha.
+
+Um candidato `blank_maybe` recebe tratamento mais duro no app. Ele precisa do dobro de detecções consistentes para travar, 6 em vez de 3. Enquanto a trava vem desse veredito, a tela mostra o aviso de baixa confiança.
+
+A limitação conhecida é a folha totalmente em branco e lisa. Por dentro, ela mede igual a qualquer outro retângulo branco e liso, como uma bandeja branca. Nenhuma estatística de interior separa os dois casos. Quem separa é identidade de objeto, e identidade de objeto se aprende. Essa é uma das razões da trilha neural.
+
+O histórico explica o portão. A versão só geométrica aceitava qualquer quadrilátero convexo grande. Numa auditoria com 10 cenas sintéticas sem papel nenhum, ela disparou em 6. Tapete de mesa, caixa de papelão, monitor e bandeja branca viraram folha. O portão de textura cortou esses casos nas cenas medidas, sem modelo nenhum. Os limiares atuais são calibração de laboratório, feita sobre cenas sintéticas e um frame real. Eles precisam ser refeitos com capturas reais.
+
+Depois da detecção, o pipeline retifica a folha por homografia para a vista de cima. Um limiar adaptativo separa a tinta do papel nessa vista. O resultado aparece como canvas digital ao lado da câmera. Apagar com a borracha funciona de forma natural. A tinta some do papel e some do canvas no frame seguinte.
+
+## Trilha neural
+
+A direção do projeto é trocar a detecção artesanal por um modelo que reconheça papel como objeto. O plano usa o detector clássico como professor. O app captura frames crus da mesa com as teclas `f` e `g`. O rotulador roda o detector clássico nesses frames e grava os cantos, com imagens de revisão para conferência humana. Esses frames rotulados viram dataset de treino, junto de datasets reais de documentos. Todo o treinamento roda no Kaggle, em GPU ou TPU, e os frames reais do usuário ficam em datasets privados. A arquitetura alvo é segmentação de papel com um sinal de presença, para o sistema aprender também a dizer que não há papel na cena. Os modelos treinados só em dados sintéticos já falharam no frame real, com erro médio de centenas de pixels. O gap entre o sintético e a mesa real é o problema que essa trilha ataca agora.
+
+## Arquitetura
+
+A árvore do repositório, pasta por pasta:
+
+- `draw/`: o pacote principal. `app.py` tem o loop da webcam, as janelas e as validações de câmera. `paper.py` tem a detecção de folha, o portão de textura e a homografia. `ink.py` extrai a tinta e renderiza o canvas digital. `config.py` guarda o tamanho da folha retificada e os dados dos marcadores.
+- `template/`: o gerador da folha-modelo imprimível, usado só pelo modo `--markers`. O PNG gerado não entra no versionamento.
+- `bridge/`: a ponte de captura no Windows. Um `ffmpeg.exe` no Windows serve a webcam como stream MJPEG e o Draw consome pelo `--source`. É a rota reserva e nunca foi testada numa máquina real. O passo a passo fica em [bridge/README.md](bridge/README.md).
+- `scripts/`: os scripts de instalação. Hoje guarda `setup_camera_wsl.sh`, o instalador da câmera do WSL.
+- `tests/`: os testes sem webcam. Hoje guarda `selftest.py`, que valida detecção, homografia, extração de tinta e o portão de textura em cenas sintéticas.
+- `tools/`: as ferramentas de apoio. Hoje guarda `label_frames.py`, o rotulador da trilha neural.
+- `verification/`: o registro da verificação formal limitada da v0. Guarda a skill do projeto e o script que prova propriedades da homografia com sondas numéricas. É um registro histórico de uma etapa concluída, não uma etapa do pipeline.
+- `docs/`: a documentação de instalação. Guarda o guia do Windows com WSL em [docs/SETUP_WINDOWS.md](docs/SETUP_WINDOWS.md).
+- `main.py`: o ponto de entrada. Ele só chama o app.
+- `VISION.md`: o documento de visão do projeto.
+
+## Desenvolvimento
+
+Sem webcam por perto, o pipeline inteiro se valida com cenas sintéticas:
 
 ```bash
 python tests/selftest.py
@@ -207,23 +242,15 @@ template/
 tests/
   selftest.py               teste do pipeline sem webcam
   test_capture.py           captura com mocks, sem camera fisica
-```
 
-## Como funciona (resumo técnico)
+O selftest roda os casos com marcadores, sem marcadores, de folha aninhada e do portão de textura. Ele imprime o erro máximo de canto e o recall de tinta de cada caso. Todos precisam passar antes de qualquer publicação.
 
-1. Quatro marcadores ArUco impressos nos cantos da folha são detectados em
-   cada frame da webcam.
-2. Com os centros dos marcadores, uma homografia mapeia a folha inclinada
-   para uma imagem retangular perfeita (vista de cima).
-3. Sobre essa imagem, um limiar adaptativo separa a tinta escura do papel
-   branco, ignorando as áreas dos marcadores. O resultado é o canvas
-   digital.
+Para rotular frames capturados:
 
-A IA (redes neurais, transformers, LLM) entra nas próximas camadas —
-interpretação dos traços, integração com CAD/simuladores e feedback de
-simulação — descritas em [VISION.md](VISION.md). A geometria da v0 é
-visão computacional clássica (OpenCV) de propósito: é o caminho mais
-rápido, confiável e em tempo real para derrubar a primeira barreira.
+```bash
+python tools/label_frames.py captures/frames dataset/rotulos```
+
+A saída é um `labels.json` com os frames rotulados e os rejeitados. Cada frame rotulado ganha uma imagem de revisão na subpasta `overlays`. Os frames de origem nunca são modificados.
 
 ## v0.2 — traço vetorial
 
@@ -249,3 +276,27 @@ o traço foi desenhado. Rastrear a ordem temporal, frame a frame,
 - [ ] v1 — interpretação: formas, letras e diagramas a partir dos traços
 - [ ] v2 — integração com um primeiro sistema alvo (CAD / simulador)
 - [ ] v3 — feedback de simulação em tempo real
+
+Feito:
+
+- Captura em tempo real: folha retificada, tinta extraída e canvas digital ao vivo
+- Fonte de vídeo flexível, por índice local ou por URL de stream
+- Câmera do Windows anexada ao WSL pelo script de instalação
+- Diagnóstico da fonte selecionada com `--check --source`
+- Detecção sem marcadores como modo padrão
+- Portão de textura com veredito de baixa confiança para folha lisa
+- Captura de frames crus e rotulador do professor clássico
+
+Em andamento:
+
+- Teste da detecção em uso contínuo na mesa real
+- Reconhecimento de datasets reais de documentos para o treino de segmentação
+- Coleta de frames reais da mesa, com papel e sem papel
+
+Planejado:
+
+- Segmentação de papel treinada no Kaggle, com sinal de presença
+- Reprodução dos traços em aplicativos de desenho
+- Interpretação de formas, letras e diagramas
+- Integração com um primeiro sistema alvo, CAD ou simulador
+- Feedback de simulação em tempo real

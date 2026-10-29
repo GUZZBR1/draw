@@ -12,3 +12,6 @@ dataset/cases/*/photo.jpg
 dataset/cases/*/photo.png
 dataset/cases/*/photo.jpeg
 dataset/cases/*/overlays/
+.DS_Store
+.idea/
+.vscode/
