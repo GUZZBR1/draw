@@ -49,7 +49,18 @@ def _make_detector():
     return cv2.aruco.ArucoDetector(config.get_dictionary(), params)
 
 
-_DETECTOR = _make_detector()
+# O detector ArUco só é usado no modo com marcadores, mas era criado na
+# importação do módulo. cv2.aruco.ArucoDetector só existe no OpenCV 4.7
+# em diante: em 4.6 a importação inteira caía, inclusive para quem só
+# queria o modo sem marcadores. A criação é preguiçosa, no primeiro uso.
+_DETECTOR = None
+
+
+def _get_detector():
+    global _DETECTOR
+    if _DETECTOR is None:
+        _DETECTOR = _make_detector()
+    return _DETECTOR
 
 
 def _order_corners(points):
@@ -91,26 +102,50 @@ def _sheet_candidate(contour, scale, small_frame_area):
 
 
 def _refine_corners(frame, corners):
-    frame_h, frame_w = frame.shape[:2]
-    if (
-        np.any(corners < 11)
-        or np.any(corners[:, 0] > frame_w - 12)
-        or np.any(corners[:, 1] > frame_h - 12)
-    ):
-        return corners
-
+    # O refino costumava ser pulado quando qualquer canto estava a
+    # menos de 11 px da borda, porque a janela do cornerSubPix sairia
+    # do frame. Mas canto colado na borda é o caso comum em uso real:
+    # o caderno é cortado pela borda superior do quadro. Em vez de
+    # pular, o frame ganha uma margem de replicação maior que a janela
+    # (10 px): a janela de cada canto fica inteira sobre a imagem
+    # acolchoada e o resultado é deslocado de volta. Cantos longe da
+    # borda enxergam a mesma vizinhança de antes, então o refino deles
+    # não muda.
+    pad = 12
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    refined = corners.reshape(-1, 1, 2).astype(np.float32)
+    padded = cv2.copyMakeBorder(
+        gray, pad, pad, pad, pad, cv2.BORDER_REPLICATE
+    )
+    refined = (corners + pad).reshape(-1, 1, 2).astype(np.float32)
     criteria = (
         cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER,
         40,
         0.01,
     )
-    cv2.cornerSubPix(gray, refined, (10, 10), (-1, -1), criteria)
-    return refined.reshape(4, 2).astype(np.float32)
+    cv2.cornerSubPix(padded, refined, (10, 10), (-1, -1), criteria)
+    return (refined.reshape(4, 2) - pad).astype(np.float32)
 
 
-def _texture_features(frame, corners):
+def _texture_maps(frame):
+    """Mapas de textura do frame inteiro, calculados uma vez por frame.
+
+    Saturação, valor, Laplaciano e bordas não dependem do candidato:
+    quem muda de candidato para candidato é só a máscara do interior.
+    Antes, cada candidato pagava as conversões e os operadores de
+    frame inteiro de novo, e o caso mais caro era o sem papel, em que
+    todos os candidatos são medidos e nenhum passa.
+    """
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    return {
+        "saturation": hsv[:, :, 1],
+        "value": hsv[:, :, 2],
+        "laplacian": cv2.Laplacian(gray, cv2.CV_32F),
+        "edges": cv2.Canny(gray, 30, 100),
+    }
+
+
+def _texture_features(frame, corners, maps=None):
     """Mede o interior de um quadrilátero candidato.
 
     Retorna (fração de branco, densidade de bordas, variância do
@@ -119,10 +154,12 @@ def _texture_features(frame, corners):
     as medidas. Branco é saturação abaixo de 60 e valor acima de 180
     no HSV. A variância é a do Laplaciano CV_32F sobre o cinza. As
     bordas internas são Canny 30/100 sobre o cinza, contadas só dentro
-    do interior encolhido.
+    do interior encolhido. Os mapas de frame inteiro vêm de
+    _texture_maps, calculados uma vez e reusados entre candidatos;
+    sem mapas prontos, eles são calculados aqui.
     """
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    if maps is None:
+        maps = _texture_maps(frame)
     center = corners.mean(axis=0)
     shrunk = center + (corners - center) * _TEXTURE_INTERIOR_SHRINK
     mask = np.zeros(frame.shape[:2], dtype=np.uint8)
@@ -130,17 +167,15 @@ def _texture_features(frame, corners):
     eroded = cv2.erode(mask, np.ones((9, 9), np.uint8))
     selected = eroded > 0
 
-    saturation = hsv[:, :, 1][selected]
-    value = hsv[:, :, 2][selected]
+    saturation = maps["saturation"][selected]
+    value = maps["value"][selected]
     white_fraction = float(np.mean((saturation < 60) & (value > 180)))
-    laplacian = cv2.Laplacian(gray, cv2.CV_32F)
-    laplacian_variance = float(np.var(laplacian[selected]))
-    edges = cv2.Canny(gray, 30, 100)
-    edge_density = float(np.mean(edges[selected] > 0))
+    laplacian_variance = float(np.var(maps["laplacian"][selected]))
+    edge_density = float(np.mean(maps["edges"][selected] > 0))
     return white_fraction, edge_density, laplacian_variance
 
 
-def _texture_verdict(frame, corners):
+def _texture_verdict(frame, corners, maps=None):
     """Veredito do portão de textura para um candidato.
 
     "paper" quando o interior parece papel. "blank_maybe" quando o
@@ -148,7 +183,7 @@ def _texture_verdict(frame, corners):
     None quando nem branco o bastante ele é.
     """
     white_fraction, edge_density, laplacian_variance = _texture_features(
-        frame, corners
+        frame, corners, maps
     )
     if white_fraction < _TEXTURE_MIN_WHITE_FRACTION:
         return None
@@ -215,11 +250,14 @@ def detect_sheet_with_confidence(frame):
     # Um candidato que falha no portão não encerra a busca: um contorno
     # seguinte ainda pode ser a folha.
     blank_corners = None
+    texture_maps = None
     for contour in candidates:
         corners = _sheet_candidate(contour, scale, small_frame_area)
         if corners is None:
             continue
-        verdict = _texture_verdict(frame, corners)
+        if texture_maps is None:
+            texture_maps = _texture_maps(frame)
+        verdict = _texture_verdict(frame, corners, texture_maps)
         if verdict == "paper":
             return _refine_corners(frame, corners), "paper"
         if verdict == "blank_maybe" and blank_corners is None:
@@ -232,7 +270,7 @@ def detect_sheet_with_confidence(frame):
 def detect_markers(frame):
     """Retorna {id: centro (x, y)} dos marcadores encontrados no frame."""
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    corners, ids, _ = _DETECTOR.detectMarkers(gray)
+    corners, ids, _ = _get_detector().detectMarkers(gray)
     found = {}
     if ids is not None:
         for marker_corners, marker_id in zip(corners, ids.flatten()):

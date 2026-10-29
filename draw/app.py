@@ -396,7 +396,9 @@ def run(source=0, save_dir="captures", markers_mode=False, width=None,
                     status_color,
                     2,
                 )
-            ink_mask = ink_module.extract_ink(warped)
+            ink_mask = ink_module.extract_ink(
+                warped, clear_markers=markers_mode
+            )
             canvas = ink_module.render_canvas(ink_mask)
             cv2.imshow("Draw - camera", _fit(status, 700))
             cv2.imshow("Draw - papel (vista de cima)", _fit(warped, 700))
