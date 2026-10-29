@@ -14,7 +14,7 @@ Nenhum modelo entra no app sem passar por este relatório.
 
 Uso (a partir da raiz do repositório):
   python tools/eval_real_frames.py
-  python tools/eval_real_frames.py --model modelo.onnx   (futuro)
+  python tools/eval_real_frames.py --model modelo.onnx
 """
 
 import argparse
@@ -59,26 +59,24 @@ class ClassicalDetector:
 
 
 class OnnxDetector:
-    """Detector neural por ONNX. Estruturado, ainda não implementado.
+    """Detector neural por ONNX, via draw.neural.
 
-    O encaixe é este construtor: carregar a sessão do ONNX e, em
-    __call__, devolver (cantos, veredito, máscara) no mesmo contrato
-    do clássico. Cantos em float32[4,2] TL/TR/BR/BL nos pixels do
-    frame; veredito em {"paper", "blank_maybe", None} a partir do
-    canal de presença do modelo; máscara uint8 255=papel ou None.
+    Carrega o NeuralSheetDetector do pacote: presença pelo logit do
+    modelo, máscara limiarizada em 0,5 e quadrilátero ajustado sobre
+    a máscara. Devolve o mesmo trio (cantos, veredito, máscara) do
+    clássico. Erros de carga (arquivo ausente, onnxruntime faltando)
+    sobem como exceção e o main os reporta limpos.
     """
 
-    name = "onnx"
-
     def __init__(self, model_path):
-        raise NotImplementedError(
-            f"detector ONNX ainda nao implementado (modelo: {model_path}). "
-            "A interface esta pronta em OnnxDetector; falta carregar a "
-            "sessao e mapear as saidas do modelo para o contrato."
-        )
+        from draw.neural import NeuralSheetDetector
+
+        self._detector = NeuralSheetDetector(model_path)
+        self._detector.load()
+        self.name = f"onnx ({model_path})"
 
     def __call__(self, frame):
-        raise NotImplementedError
+        return self._detector(frame)
 
 
 def _mask_iou(predicted, truth):
@@ -166,14 +164,14 @@ def main():
     parser.add_argument(
         "--model",
         default=None,
-        help="ONNX de um detector neural (futuro; hoje só estruturado)",
+        help="ONNX de um detector neural (draw.neural)",
     )
     args = parser.parse_args()
 
     if args.model:
         try:
             detector = OnnxDetector(args.model)
-        except NotImplementedError as error:
+        except (RuntimeError, FileNotFoundError) as error:
             print(f"ERRO: {error}")
             return 2
     else:
