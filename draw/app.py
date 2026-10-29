@@ -4,6 +4,7 @@ Uso:
   python main.py                                  # webcam local (indice 0)
   python main.py --check                          # valida a camera e sai
   python main.py --markers                        # folha-modelo impressa
+  python main.py --neural modelo.onnx             # detector neural primario
   python main.py --source 1                       # outra webcam local
   python main.py --source http://192.168.0.10:8080/video   # camera via rede
 
@@ -27,6 +28,7 @@ import cv2
 import numpy as np
 
 from . import ink as ink_module
+from . import neural as neural_module
 from . import paper as paper_module
 
 
@@ -227,7 +229,25 @@ def _fit(image, max_h=700):
     return cv2.resize(image, (int(w * scale), max_h))
 
 
-def run(source=0, save_dir="captures", markers_mode=False):
+def run(source=0, save_dir="captures", markers_mode=False, neural_model=None):
+    neural_detector = None
+    if neural_model is not None and not markers_mode:
+        neural_detector = neural_module.NeuralSheetDetector(neural_model)
+        neural_detector.load()
+        print(
+            f"Detector neural ativo: {neural_model}. "
+            "O classico cobre os frames em que o neural nao ve folha."
+        )
+
+    def detect_sheet(frame):
+        if neural_detector is not None:
+            corners, verdict = (
+                neural_detector.detect_sheet_with_confidence(frame)
+            )
+            if corners is not None:
+                return corners, verdict
+        return paper_module.detect_sheet_with_confidence(frame)
+
     capture = _open_capture(parse_source(source))
     save_path = Path(save_dir)
     if markers_mode:
@@ -301,9 +321,7 @@ def run(source=0, save_dir="captures", markers_mode=False):
                 or frame_number % _SHEET_DETECT_INTERVAL == 0
             )
             if should_detect:
-                detected_corners, detected_verdict = (
-                    paper_module.detect_sheet_with_confidence(frame)
-                )
+                detected_corners, detected_verdict = detect_sheet(frame)
             else:
                 detected_corners, detected_verdict = None, None
             if detected_corners is not None:
@@ -474,6 +492,16 @@ def main():
         help="usa a folha-modelo impressa com marcadores ArUco",
     )
     parser.add_argument(
+        "--neural",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="MODELO.onnx",
+        help="detector neural (ONNX) como primario, com o classico de "
+        "reserva. Sem caminho, usa a variavel de ambiente "
+        "DRAW_NEURAL_MODEL",
+    )
+    parser.add_argument(
         "--check",
         action="store_true",
         help="valida a camera local porta por porta e sai, sem abrir janela",
@@ -483,11 +511,26 @@ def main():
     if args.check:
         parsed = parse_source(args.source)
         sys.exit(run_check(parsed if isinstance(parsed, int) else 0))
-    run(
-        source=args.source,
-        save_dir=args.save_dir,
-        markers_mode=args.markers,
-    )
+    neural_model = None
+    if args.neural is not None:
+        if args.markers:
+            parser.error("--neural nao combina com --markers")
+        neural_model = args.neural or os.environ.get("DRAW_NEURAL_MODEL")
+        if not neural_model:
+            parser.error(
+                "--neural sem caminho: passe o arquivo .onnx ou defina "
+                "a variavel DRAW_NEURAL_MODEL"
+            )
+    try:
+        run(
+            source=args.source,
+            save_dir=args.save_dir,
+            markers_mode=args.markers,
+            neural_model=neural_model,
+        )
+    except (RuntimeError, FileNotFoundError) as error:
+        print(f"Erro: {error}")
+        sys.exit(2)
 
 
 if __name__ == "__main__":
