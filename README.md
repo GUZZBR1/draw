@@ -1,5 +1,9 @@
 # Draw
 
+<p align="center">
+  <img src="docs/icon.svg" width="160" alt="Draw">
+</p>
+
 O Draw é uma mesa digitalizadora sem mesa digitalizadora.
 Uma webcam aponta para a mesa, a pessoa desenha numa folha de papel e o sistema reproduz o desenho no digital.
 A visão completa fica em [VISION.md](VISION.md).
