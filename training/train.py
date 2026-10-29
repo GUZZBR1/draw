@@ -295,6 +295,10 @@ def combined_loss(logits, target, class_weights, ce_weight=0.5, dice_weight=0.5)
         inter = (p * t).sum(dim=1)
         dice = dice + (1.0 - (2 * inter + 1e-6) / (p.sum(dim=1) + t.sum(dim=1) + 1e-6))
     dice = dice / NUM_CLASSES
+    # Correção do reteste no Kaggle: sem esta média, dice tem shape [batch]
+    # e loss.backward() falha com "grad can be implicitly created only
+    # for scalar outputs". A loss tem que ser escalar.
+    dice = dice.mean()
     return ce_weight * ce + dice_weight * dice
 
 
