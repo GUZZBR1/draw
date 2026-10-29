@@ -10,6 +10,13 @@ de epsilon do detector clássico, um reajuste de cada aresta como reta
 sobre os pontos do contorno e refino subpixel nos cantos dentro do
 quadro.
 
+Quando a escada de epsilon não fecha sobre o contorno, o
+quadrilátero é o retângulo de área mínima do contorno, sem reajuste
+nem refino: medido nos frames reais em que a escada falha, os dois
+passos degradam essa reserva (os números ficam em _min_area_quad). A
+reserva só existe onde antes o retorno era nenhum quadrilátero;
+onde a escada fecha, o caminho é o mesmo de sempre.
+
 O reajuste de arestas existe para o caso comum de uso: a página
 cortada pela borda do quadro. Ali o vértice da aproximação mora sobre
 a borda e não é o canto da página. A reta ajustada sobre os pontos
@@ -85,6 +92,25 @@ def _approx_quad(contour):
         if len(approx) == 4 and cv2.isContourConvex(approx):
             return _order_corners(approx.reshape(4, 2))
     return None
+
+
+def _min_area_quad(contour):
+    """Reserva do ajuste: o retângulo de área mínima do contorno.
+
+    Só é chamado quando a escada de epsilon não fecha. Os cantos
+    saem na mesma convenção TL/TR/BR/BL do caminho principal, e o
+    retângulo volta cru, sem o reajuste de arestas e sem o refino
+    subpixel. Medido: nos frames 24 e 26 das capturas reais, os
+    únicos em que a escada falha com o modelo v2, o IoU do
+    quadrilátero preenchido do frame 24 contra a máscara anotada
+    dele é 0,895 com o retângulo cru, 0,850 com o reajuste, 0,843
+    com reajuste e refino e 0,887 só com o refino. O reajuste foi
+    desenhado para os vértices da aproximação, que moram perto dos
+    cantos da folha; os vértices do retângulo mínimo moram fora
+    dela, e as retas ajustadas passam a seguir a borda visível da
+    máscara, que nesses frames é oclusão, não a aresta da página.
+    """
+    return _order_corners(cv2.boxPoints(cv2.minAreaRect(contour)))
 
 
 def _fit_line(points):
@@ -217,8 +243,11 @@ def fit_quad(mask_bin, frame=None):
     """Ajusta o quadrilátero da folha sobre a máscara binária.
 
     Retorna float32[4,2] TL/TR/BR/BL ou None quando a máscara não
-    sustenta um quadrilátero. Com o frame, os cantos dentro do quadro
-    ganham refino subpixel sobre a imagem.
+    tem contorno ou é pequena demais para sustentar um quadrilátero.
+    Se a escada de epsilon não fecha, vale a reserva de
+    _min_area_quad, sem reajuste nem refino. Com o frame, os cantos
+    do caminho principal que estão dentro do quadro ganham refino
+    subpixel sobre a imagem.
     """
     contour = _largest_contour(mask_bin)
     if contour is None:
@@ -228,7 +257,7 @@ def fit_quad(mask_bin, frame=None):
         return None
     quad = _approx_quad(contour)
     if quad is None:
-        return None
+        return _min_area_quad(contour).astype(np.float32)
     quad = _refit_corners(contour, quad, mask_bin.shape[:2])
     if frame is not None:
         quad = _refine_inside(frame, quad)
