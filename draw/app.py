@@ -6,6 +6,7 @@ Uso:
   python main.py --list-cameras                   # lista webcams que abrem
   python main.py --markers                        # folha-modelo impressa
   python main.py --neural modelo.onnx             # detector neural primario
+  python main.py --hand-model modelo.task         # mascara de mao no canvas
   python main.py --source 1                       # outra webcam local
   python main.py --source /dev/video2             # porta V4L2 especifica
   python main.py --source http://192.168.0.10:8080/video   # camera via rede
@@ -26,6 +27,7 @@ import csv
 import os
 import sys
 import time
+from collections import deque
 from pathlib import Path
 
 import cv2
@@ -33,6 +35,7 @@ import numpy as np
 
 from . import capture as capture_module
 from . import diagnose as diagnose_module
+from . import hand as hand_module
 from . import ink as ink_module
 from . import light as light_module
 from . import neural as neural_module
@@ -52,6 +55,13 @@ _SHEET_DETECT_INTERVAL = 5
 # devagar: a folha presente confirma de novo antes dos dois criterios.
 _SHEET_LOST_SECONDS = 0.5
 _SHEET_LOST_MIN_FRAMES = 10
+# A tinta e lida numa geometria estabilizada: a mediana dos ultimos
+# conjuntos de cantos do rastreador. O jitter de canto entre deteccoes
+# (media de ~5 px, com saltos de dezenas de pixels quando a mao cobre
+# um canto) desloca o traco de 1 a 3 px no espaco do papel e desfaz o
+# voto por pixel do canvas acumulativo; a mediana de 5 segura a
+# geometria no lugar por tempo bastante para a janela do acumulador.
+_INK_CORNER_HISTORY = 5
 
 
 def _corner_distance(current, detected):
@@ -311,7 +321,7 @@ def _fit(image, max_h=700):
 def run(source=0, save_dir="captures", markers_mode=False, width=None,
         height=None, fps=None, backend=None, reconnect_attempts=3,
         open_timeout_ms=3000, neural_model=None, capture_all_frames=False,
-        light_normalize="off", session_mode=False):
+        light_normalize="off", session_mode=False, hand_model=None):
     neural_detector = None
     if neural_model is not None and not markers_mode:
         neural_detector = neural_module.NeuralSheetDetector(neural_model)
@@ -319,6 +329,14 @@ def run(source=0, save_dir="captures", markers_mode=False, width=None,
         print(
             f"Detector neural ativo: {neural_model}. "
             "O classico cobre os frames em que o neural nao ve folha."
+        )
+
+    hand_masker = None
+    if hand_model is not None and not markers_mode:
+        hand_masker = hand_module.HandMasker(hand_model or None)
+        print(
+            "Mascara de mao solicitada: mao sobre a folha vira regiao "
+            "desconhecida no canvas acumulativo."
         )
 
     def detect_sheet(frame):
@@ -409,6 +427,10 @@ def run(source=0, save_dir="captures", markers_mode=False, width=None,
                 print("Captura automatica desligada.")
 
     tracker = _SheetTracker()
+    ink_accumulator = ink_module.InkAccumulator()
+    corner_history = deque(maxlen=_INK_CORNER_HISTORY)
+    ink_session_open = False
+    accumulated_canvas = None
     frame_number = 0
     falhas_seguidas = 0
     while True:
@@ -458,12 +480,14 @@ def run(source=0, save_dir="captures", markers_mode=False, width=None,
             else:
                 detected_corners, detected_verdict = None, None
                 ran_detection = False
-            tracker.update(
+            tracker_event = tracker.update(
                 detected_corners,
                 detected_verdict,
                 ran_detection,
                 time.monotonic(),
             )
+            if tracker_event == "drop":
+                ink_session_open = False
 
             frame_number += 1
             warped = (
@@ -471,6 +495,30 @@ def run(source=0, save_dir="captures", markers_mode=False, width=None,
                 if tracker.corners is not None
                 else None
             )
+
+            if ran_detection and tracker.corners is not None:
+                if not ink_session_open:
+                    # Folha nova na cena: canvas e geometria recomecam.
+                    ink_accumulator.reset()
+                    corner_history.clear()
+                    ink_session_open = True
+                corner_history.append(tracker.corners.copy())
+                ink_corners = np.median(
+                    np.stack(corner_history), axis=0
+                ).astype(np.float32)
+                ink_warped = paper_module.warp_sheet(frame, ink_corners)
+                observed = ink_module.extract_ink(ink_warped)
+                visible = None
+                if hand_masker is not None:
+                    camera_mask = hand_masker.mask(frame)
+                    if camera_mask is not None:
+                        hand_warped = paper_module.warp_sheet(
+                            camera_mask, ink_corners
+                        )
+                        visible = hand_warped == 0
+                accumulated_canvas = ink_module.render_canvas(
+                    ink_accumulator.update(observed, visible)
+                )
 
         status = frame.copy()
         if markers_mode:
@@ -534,7 +582,12 @@ def run(source=0, save_dir="captures", markers_mode=False, width=None,
                         ),
                         sheet_locked=True,
                     )
-            canvas = ink_module.render_canvas(ink_mask)
+            if markers_mode:
+                canvas = ink_module.render_canvas(ink_mask)
+            elif accumulated_canvas is not None:
+                canvas = accumulated_canvas
+            else:
+                canvas = ink_module.render_canvas(ink_mask)
             cv2.imshow("Draw - camera", _fit(status, 700))
             cv2.imshow("Draw - papel (vista de cima)", _fit(warped, 700))
             cv2.imshow("Draw - canvas digital", _fit(canvas, 700))
@@ -600,6 +653,19 @@ def main():
         help="detector neural (ONNX) como primario, com o classico de "
         "reserva. Sem caminho, usa a variavel de ambiente "
         "DRAW_NEURAL_MODEL",
+    )
+    parser.add_argument(
+        "--hand-model",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="MODELO.task",
+        help="mascara de mao (MediaPipe Hand Landmarker) para o "
+        "canvas acumulativo: a mao vira regiao desconhecida e nao "
+        "ganha nem perde tinta. Sem caminho, usa a variavel de "
+        "ambiente DRAW_HAND_MODEL ou models/hand_landmarker.task. "
+        "Sem o pacote mediapipe ou sem o modelo, o app roda sem a "
+        "mascara e avisa uma vez",
     )
     parser.add_argument(
         "--check",
@@ -757,6 +823,13 @@ def main():
                 "--neural sem caminho: passe o arquivo .onnx ou defina "
                 "a variavel DRAW_NEURAL_MODEL"
             )
+    hand_model = None
+    if args.hand_model is not None:
+        if args.markers:
+            parser.error("--hand-model nao combina com --markers")
+        hand_model = (
+            args.hand_model or os.environ.get("DRAW_HAND_MODEL") or ""
+        )
     try:
         backend = capture_module.backend_from_name(args.backend)
     except ValueError as error:
@@ -776,6 +849,7 @@ def main():
             capture_all_frames=args.capture_all_frames,
             light_normalize=args.light_normalize,
             session_mode=args.session,
+            hand_model=hand_model,
         )
     except (RuntimeError, FileNotFoundError) as error:
         print(f"Erro: {error}")
