@@ -377,6 +377,10 @@ def export_onnx(model, out_path, cfg):
     model.eval()
     size = cfg["model"]["input"]["height"]
     dummy = torch.randn(1, 3, size, size)
+    # dynamo=False: exportador legado. O exportador dynamo padrão do torch
+    # 2.11 exige onnxscript, que o ambiente do Kaggle não tem — sem isso,
+    # o treino inteiro falhava na exportação, depois das épocas, e perdia
+    # até o metrics.json. O exportador legado usa só o pacote onnx.
     torch.onnx.export(
         model,
         (dummy,),
@@ -386,6 +390,7 @@ def export_onnx(model, out_path, cfg):
         dynamic_axes={"image": [0], "logits": [0]},
         opset_version=cfg["export"]["opset_version"],
         do_constant_folding=True,
+        dynamo=False,
     )
     return out_path
 
@@ -533,10 +538,17 @@ def main(argv=None):
                 break
 
     # Exportação ONNX a partir do melhor checkpoint.
+    # Não-fatal: se a exportação falhar, as métricas e os demais artefatos
+    # ainda são escritos, e a falha fica registrada em onnx_validation —
+    # antes, uma falha aqui perdia o metrics.json inteiro após o treino.
     model.load_state_dict(torch.load(out_dir / "checkpoints" / "best.pt", map_location=device))
     onnx_path = out_dir / cfg["export"]["onnx"]
-    export_onnx(model, str(onnx_path), cfg)
-    onnx_check = validate_onnx(model, onnx_path, val_loader, device)
+    try:
+        export_onnx(model, str(onnx_path), cfg)
+        onnx_check = validate_onnx(model, onnx_path, val_loader, device)
+    except Exception as exc:  # noqa: BLE001 - registrar, não perder o treino
+        print(f"AVISO: exportação ONNX falhou ({exc}); métricas serão escritas sem ONNX.", file=sys.stderr)
+        onnx_check = {"status": "failed", "error": str(exc)}
     final_metrics = evaluate(model, val_loader, device)
     final_metrics["onnx_validation"] = onnx_check
     final_metrics["history"] = history
