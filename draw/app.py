@@ -8,6 +8,7 @@ Uso:
   python main.py --source 1                       # outra webcam local
   python main.py --source /dev/video2             # porta V4L2 especifica
   python main.py --source http://192.168.0.10:8080/video   # camera via rede
+  python main.py --light-normalize both   # sombra e luz baixa
 
 A fonte via rede (MJPEG/RTSP) e o caminho recomendado no WSL. O WSL nao
 enxerga webcams USB do Windows por padrao, mas enxerga streams de rede.
@@ -30,6 +31,7 @@ import numpy as np
 
 from . import capture as capture_module
 from . import ink as ink_module
+from . import light as light_module
 from . import paper as paper_module
 from . import strokes as strokes_module
 
@@ -72,6 +74,27 @@ def _configure_local_capture(capture, width=None, height=None, fps=None):
 def _local_open_hint(source):
     """Diagnostico por porta, o mesmo criterio do --check."""
     return capture_module.diagnose_local(source)[1]
+
+
+def _detection_frame(frame, light_normalize="off"):
+    """Frame que vai para a detecção da folha.
+
+    Com a flag desligada devolve o frame sem tocar nele. Com ela ligada,
+    devolve o frame normalizado (ver draw/light.py). A detecção por
+    marcadores não usa este caminho: ela continua no frame original,
+    para não mudar o comportamento do modo com marcadores.
+    """
+    return light_module.normalize_light(frame, light_normalize)
+
+
+def _ink_input(warped, light_normalize="off"):
+    """Folha retificada que vai para a extração de tinta.
+
+    Passo separado da detecção: a folha retificada é a do frame
+    original, normalizada uma única vez aqui. Com a flag desligada
+    devolve a folha sem tocar nela.
+    """
+    return light_module.normalize_light(warped, light_normalize)
 
 
 def _open_capture(source, **kwargs):
@@ -178,7 +201,7 @@ def _fit(image, max_h=700):
 
 def run(source=0, save_dir="captures", markers_mode=False, width=None,
         height=None, fps=None, backend=None, reconnect_attempts=3,
-        open_timeout_ms=3000):
+        open_timeout_ms=3000, light_normalize="off"):
     parsed = parse_source(source)
     capture = capture_module.ReconnectingCapture(
         parsed, attempts=reconnect_attempts, width=width, height=height,
@@ -266,7 +289,9 @@ def run(source=0, save_dir="captures", markers_mode=False, width=None,
             )
             if should_detect:
                 detected_corners, detected_verdict = (
-                    paper_module.detect_sheet_with_confidence(frame)
+                    paper_module.detect_sheet_with_confidence(
+                        _detection_frame(frame, light_normalize)
+                    )
                 )
             else:
                 detected_corners, detected_verdict = None, None
@@ -397,7 +422,8 @@ def run(source=0, save_dir="captures", markers_mode=False, width=None,
                     2,
                 )
             ink_mask = ink_module.extract_ink(
-                warped, clear_markers=markers_mode
+                _ink_input(warped, light_normalize),
+                clear_markers=markers_mode,
             )
             canvas = ink_module.render_canvas(ink_mask)
             cv2.imshow("Draw - camera", _fit(status, 700))
@@ -481,6 +507,13 @@ def main():
         "--open-timeout-ms", type=int, default=3000,
         help="timeout de abertura da fonte, em milissegundos",
     )
+    parser.add_argument(
+        "--light-normalize", default="off",
+        choices=list(light_module.LIGHT_MODES),
+        help="normalizacao de luz: off (padrao, sem mudanca), "
+        "background (fundo + divisao), clahe (contraste local) ou "
+        "both (fundo + CLAHE, o melhor medido em sombra e luz baixa)",
+    )
     parser.add_argument("--save-dir", default="captures")
     args = parser.parse_args()
     if args.list_cameras:
@@ -504,6 +537,7 @@ def main():
         backend=backend,
         reconnect_attempts=args.reconnect_attempts,
         open_timeout_ms=args.open_timeout_ms,
+        light_normalize=args.light_normalize,
     )
 
 
