@@ -32,10 +32,12 @@ import cv2
 import numpy as np
 
 from . import capture as capture_module
+from . import diagnose as diagnose_module
 from . import ink as ink_module
 from . import light as light_module
 from . import neural as neural_module
 from . import paper as paper_module
+from . import sequence as sequence_module
 from . import strokes as strokes_module
 
 
@@ -193,7 +195,7 @@ def _fit(image, max_h=700):
 def run(source=0, save_dir="captures", markers_mode=False, width=None,
         height=None, fps=None, backend=None, reconnect_attempts=3,
         open_timeout_ms=3000, neural_model=None, capture_all_frames=False,
-        light_normalize="off"):
+        light_normalize="off", session_mode=False):
     neural_detector = None
     if neural_model is not None and not markers_mode:
         neural_detector = neural_module.NeuralSheetDetector(neural_model)
@@ -249,6 +251,19 @@ def run(source=0, save_dir="captures", markers_mode=False, width=None,
         "f = capturar frame, "
         "g = captura automatica (desligada), q/Esc = sair."
     )
+    # Modo sessão (etapa 5 do Senado): rastreia a ordem temporal
+    # dos traços enquanto o desenho acontece. Desligado por padrão;
+    # a tecla v continua exportando o snapshot por centroide, e a
+    # tecla o exporta a sessão ordenada, só neste modo.
+    tracker = (
+        sequence_module.SequenceTracker() if session_mode else None
+    )
+    session_counter = 0
+    if session_mode:
+        print(
+            "Modo sessao ligado: a ordem dos tracos e registrada "
+            "enquanto eles aparecem (tecla o = salvar sessao ordenada)."
+        )
 
     frames_path = save_path / "frames"
     frames_saved = 0
@@ -465,6 +480,21 @@ def run(source=0, save_dir="captures", markers_mode=False, width=None,
                 _ink_input(warped, light_normalize),
                 clear_markers=markers_mode,
             )
+            if tracker is not None:
+                # Amostragem reduzida: uma amostra a cada 5 quadros
+                # retificados, não a cada quadro — o thinning e o
+                # rastreamento a cada quadro são custo sem ganho.
+                session_counter += 1
+                if session_counter % 5 == 1:
+                    tracker.update(
+                        strokes_module.extract_strokes(ink_mask),
+                        frame_index=loop_frames,
+                        timestamp_ms=int(time.time() * 1000),
+                        corners=(
+                            None if markers_mode else current_corners
+                        ),
+                        sheet_locked=True,
+                    )
             canvas = ink_module.render_canvas(ink_mask)
             cv2.imshow("Draw - camera", _fit(status, 700))
             cv2.imshow("Draw - papel (vista de cima)", _fit(warped, 700))
@@ -485,6 +515,14 @@ def run(source=0, save_dir="captures", markers_mode=False, width=None,
                 )
                 print(f"{len(strokes)} tracos salvos em {svg_path} "
                       f"e {json_path}")
+            if key == ord("o") and tracker is not None:
+                save_path.mkdir(parents=True, exist_ok=True)
+                base = save_path / f"session_{int(time.time())}"
+                svg_path, json_path = sequence_module.export_session(
+                    tracker, base
+                )
+                print(f"sessao com {len(tracker.ordered)} tracos "
+                      f"ordenados salva em {svg_path} e {json_path}")
             handle_capture_key(key, frame)
             if key in (ord("q"), 27):
                 break
@@ -535,6 +573,35 @@ def main():
         help="lista as webcams locais que abrem e sai, sem abrir janela",
     )
     parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="com --list-cameras, acrescenta backend e props negociadas",
+    )
+    parser.add_argument(
+        "--test-source",
+        default=None,
+        metavar="FONTE",
+        help="sonda uma fonte (indice, /dev/videoN, arquivo ou URL) "
+        "e sai, sem abrir janela e sem acao no sistema",
+    )
+    parser.add_argument(
+        "--test-all",
+        action="store_true",
+        help="sonda as webcams locais que abrem e sai, sem abrir janela",
+    )
+    parser.add_argument(
+        "--include-urls",
+        nargs="*",
+        default=[],
+        help="com --test-all, sonda tambem estas URLs explicitamente",
+    )
+    parser.add_argument(
+        "--report",
+        choices=["text", "json"],
+        default="text",
+        help="formato do relatorio de --test-source/--test-all",
+    )
+    parser.add_argument(
         "--width", type=int, default=None,
         help="largura pedida para webcam local (padrao: 1280)",
     )
@@ -566,6 +633,13 @@ def main():
         "background (fundo + divisao), clahe (contraste local) ou "
         "both (fundo + CLAHE, o melhor medido em sombra e luz baixa)",
     )
+    parser.add_argument(
+        "--session",
+        action="store_true",
+        help="modo sessao: registra a ordem temporal dos tracos "
+        "enquanto eles aparecem (tecla o = salvar sessao ordenada); "
+        "sem ele, v continua exportando o snapshot por centroide",
+    )
     parser.add_argument("--save-dir", default="captures")
     parser.add_argument(
         "--capture-all-frames",
@@ -573,9 +647,63 @@ def main():
         help="salva cada frame JPEG e seu timestamp para coleta de dados",
     )
     args = parser.parse_args()
+    if args.test_source is not None or args.test_all or args.include_urls:
+        reports = []
+        if args.test_source is not None:
+            reports.append(diagnose_module.probe_source(args.test_source))
+        if args.test_all:
+            reports.extend(diagnose_module.probe_all(
+                include_urls=args.include_urls
+            ))
+        elif args.include_urls:
+            reports.extend(diagnose_module.probe_all(
+                include_urls=args.include_urls,
+                list_fn=lambda: [],
+            ))
+        if args.report == "json":
+            import json
+
+            print(json.dumps(
+                [report.to_dict() for report in reports],
+                indent=2, default=str,
+            ))
+        else:
+            for report in reports:
+                print(diagnose_module.format_report(report))
+        if not reports:
+            sys.exit(2)
+        sys.exit(0 if all(report.ok for report in reports) else 1)
     if args.list_cameras:
         results = capture_module.list_cameras()
-        print(capture_module.format_camera_list(results))
+        if args.verbose:
+            probed = {}
+            for item in results:
+                if item["opened"]:
+                    probed[item["index"]] = diagnose_module.probe_source(
+                        item["index"], read_frames=1
+                    )
+            lines = []
+            for item in results:
+                status = "ok" if item["opened"] else "nao abriu"
+                node = f" ({item['node']})" if item.get("node") else ""
+                detail = ""
+                report = probed.get(item["index"])
+                if report is not None:
+                    props = []
+                    if report.width and report.height:
+                        props.append(f"{report.width}x{report.height}")
+                    if report.fps:
+                        props.append(f"@{report.fps}fps")
+                    if report.fourcc:
+                        props.append(str(report.fourcc))
+                    if report.backend_used:
+                        props.append(str(report.backend_used))
+                    if props:
+                        detail = f" [{', '.join(props)}]"
+                lines.append(f"  {item['index']}{node}: {status}{detail}")
+            print("\n".join(lines))
+        else:
+            print(capture_module.format_camera_list(results))
         sys.exit(0 if any(item["opened"] for item in results) else 1)
     if args.check:
         parsed = parse_source(args.source)
@@ -608,6 +736,7 @@ def main():
             neural_model=neural_model,
             capture_all_frames=args.capture_all_frames,
             light_normalize=args.light_normalize,
+            session_mode=args.session,
         )
     except (RuntimeError, FileNotFoundError) as error:
         print(f"Erro: {error}")
