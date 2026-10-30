@@ -117,6 +117,67 @@ def extract_ink(warped, clear_markers=False):
 _SESSION_BASE_SAMPLES = 12
 _SESSION_INK_DELTA = 12.0
 
+# Limiares do realinhamento a referencia, medidos no laboratorio
+# (draw-lab/session-align/REPORT.md e a verificacao de integracao
+# da classe). A resposta da correlacao de fase NAO serve de
+# confianca em producao: ela mede a fracao de energia espectral no
+# pico, e tinta nova no quadro a derruba (0,95 sem traco novo para
+# 0,65 com 8 tracos, na pagina real), embora a estimativa de
+# deslocamento continue solida (erro ~0,2 px em todos esses
+# casos). Quem julga a confianca e o residuo pos-correcao sobre a
+# estrutura da referencia (pixels escuros contra a mediana da
+# pagina): saudavel medido <= 0,97 por cento da estrutura com 0 a
+# 8 tracos novos; pagina girada 1 grau (translacao nao conserta)
+# da 40,3 por cento. O limiar de 5 por cento fica entre os dois,
+# com margem dos dois lados. Deslocamento estimado acima de
+# 10 px nao e jitter: e a pagina que andou de verdade (ou virou),
+# e a referencia certa e outra.
+_ALIGN_MAX_SHIFT_PX = 10.0
+_ALIGN_RESID_MAX = 0.05
+_STRUCT_MEDIAN_DELTA = 25.0
+_ALIGN_WINDOW = None
+
+
+def align_to_reference(reference_gray, current_gray):
+    """Realinha o quadro atual a referencia da sessao.
+
+    Os dois argumentos sao cinza float32 no espaco do papel.
+    Retorna (alinhado, (sx, sy), response, ok): alinhado e o
+    quadro atual com o deslocamento estimado removido (o proprio
+    current_gray, sem copia, quando ok e False); (sx, sy) e o
+    deslocamento estimado do conteudo do atual contra a
+    referencia, em px; response e a resposta da correlacao de
+    fase (diagnostico; nao entra no ok, ver o comentario dos
+    limiares); ok diz apenas que o deslocamento estimado e
+    plausivel como jitter (<= _ALIGN_MAX_SHIFT_PX). A confianca
+    de verdade e o residuo pos-correcao, julgado por quem chama.
+
+    Medido no laboratorio: erro de estimativa <= 0,04 px ate 5 px
+    de deslocamento e falsa tinta da regra da sessao de 21.889 px
+    (2,15 por cento da pagina, sem correcao a 5 px) para 93 px
+    (0,009 por cento), a 13,5 ms por chamada. O ECC affine entrega
+    o mesmo neste modo de falha (deslocamento puro) custando
+    243,6 ms, por isso fica fora do laco.
+    """
+    global _ALIGN_WINDOW
+    if _ALIGN_WINDOW is None or _ALIGN_WINDOW.shape != reference_gray.shape:
+        h, w = reference_gray.shape
+        _ALIGN_WINDOW = cv2.createHanningWindow((w, h), cv2.CV_32F)
+    (sx, sy), response = cv2.phaseCorrelate(
+        reference_gray, current_gray, _ALIGN_WINDOW)
+    shift = float(np.hypot(sx, sy))
+    if shift > _ALIGN_MAX_SHIFT_PX:
+        return current_gray, (float(sx), float(sy)), float(response), False
+    # Sem WARP_INVERSE_MAP, o warpAffine inverte a matriz: o
+    # deslocamento do conteudo e (b1, b2). Para remover o
+    # deslocamento estimado (sx, sy), b = (-sx, -sy).
+    m = np.array([[1.0, 0.0, -sx], [0.0, 1.0, -sy]], dtype=np.float32)
+    aligned = cv2.warpAffine(
+        current_gray, m,
+        (current_gray.shape[1], current_gray.shape[0]),
+        flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+    return aligned, (float(sx), float(sy)), float(response), True
+
 
 class SessionBaselineInk:
     """Tinta da sessao: o que escureceu em relacao a pagina base.
@@ -137,6 +198,10 @@ class SessionBaselineInk:
         self._baseline_min = None
         self.reference = None
         self._ref_median = None
+        self._base_blur = None
+        self._struct_mask = None
+        self.alignment_lost = False
+        self._align_failures = 0
 
     @property
     def ready(self):
@@ -149,14 +214,19 @@ class SessionBaselineInk:
         gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
         self._samples.append(gray)
         if len(self._samples) >= _SESSION_BASE_SAMPLES:
-            base = np.median(np.stack(self._samples), axis=0)
-            base = cv2.GaussianBlur(
-                base.astype(np.float32), (3, 3), 0)
-            # A referencia cheia fica guardada: e contra ela que um
-            # realinhamento futuro (ECC/fase) mede o deslocamento
-            # do quadro atual quando o caderno se mexe.
-            self.reference = base
+            base_raw = np.median(
+                np.stack(self._samples), axis=0).astype(np.float32)
+            base = cv2.GaussianBlur(base_raw, (3, 3), 0)
+            # A referencia cheia fica guardada sem blur: e contra
+            # ela que o realinhamento mede o deslocamento do
+            # quadro atual quando o caderno se mexe. A base com
+            # blur e a mascara da estrutura dela sustentam o
+            # residuo pos-correcao, o juiz do alinhamento.
+            self.reference = base_raw
             self._ref_median = float(np.median(base))
+            self._base_blur = base
+            self._struct_mask = base < (
+                self._ref_median - _STRUCT_MEDIAN_DELTA)
             # Minimo local 3x3: a estrutura escura da base ganha um
             # halo de 1 px que absorve o jitter residual do warp,
             # para a pauta nao virar tinta quando o quadro treme.
@@ -165,17 +235,48 @@ class SessionBaselineInk:
             self._samples = []
 
     def observe(self, warped):
-        """Mascara (255 = tinta) do que escureceu contra a base."""
-        if not self.ready:
-            return np.zeros(warped.shape[:2], dtype=np.uint8)
+        """Mascara (255 = tinta) do que escureceu contra a base.
+
+        Antes do delta, o quadro e realinhado a referencia por
+        correlacao de fase: sem isso, um deslocamento de 2 px do
+        caderno transforma a pauta em falsa tinta (medido: 1.362 px
+        sem correcao, 0 com). A confianca do alinhamento e o
+        residuo pos-correcao sobre a estrutura da referencia:
+        acima de _ALIGN_RESID_MAX, o quadro nao rende observacao;
+        3 seguidos acendem alignment_lost e o app pede uma pagina
+        base nova (tecla C), em vez de seguir desenhando sobre uma
+        referencia que nao vale mais.
+        """
+        shape = warped.shape[:2]
+        if not self.ready or self.alignment_lost:
+            return np.zeros(shape, dtype=np.uint8)
         gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
         gray = gray.astype(np.float32)
-        cur_median = float(np.median(gray))
-        gain = 1.0
-        if cur_median > 1.0 and self._ref_median is not None:
-            gain = float(np.clip(
-                self._ref_median / cur_median, 0.85, 1.18))
-        blurred = cv2.GaussianBlur(gray * gain, (3, 3), 0)
+        aligned, _shift, _response, ok = align_to_reference(
+            self.reference, gray)
+        blurred = None
+        if ok:
+            cur_median = float(np.median(aligned))
+            gain = 1.0
+            if cur_median > 1.0 and self._ref_median is not None:
+                gain = float(np.clip(
+                    self._ref_median / cur_median, 0.85, 1.18))
+            blurred = cv2.GaussianBlur(aligned * gain, (3, 3), 0)
+            resid = (
+                (np.abs(blurred - self._base_blur)
+                 >= _SESSION_INK_DELTA)
+                & self._struct_mask
+            )
+            ok = (
+                float(resid.sum())
+                <= _ALIGN_RESID_MAX * float(self._struct_mask.sum())
+            )
+        if not ok:
+            self._align_failures += 1
+            if self._align_failures >= 3:
+                self.alignment_lost = True
+            return np.zeros(shape, dtype=np.uint8)
+        self._align_failures = 0
         delta = self._baseline_min - blurred
         return np.where(
             delta >= _SESSION_INK_DELTA, 255, 0).astype(np.uint8)
