@@ -157,22 +157,36 @@ def test_pipeline_uniform_cadence_cursor_fusion_and_stamp_export():
         detect_fn=counting_detect,
     )
 
-    # Quadro 0 detecta a folha; armamos a página base (C) e alimentamos 12
-    # quadros consecutivos: na cadência uniforme 1/1, as 12 amostras fecham
-    # em exatos 12 quadros (em vez de 60 antes!).
+    # Quadro 0 detecta a folha; armamos a página base (C). Semantica
+    # de producao restaurada na reconciliacao (condicao 5 da revisao
+    # do PR #9): as 12 amostras da base sao espacadas pela cadencia
+    # de deteccao (1 a cada 5 quadros), como no bloco de tinta da
+    # main — 12 quadros consecutivos NAO fecham a base; ela fecha na
+    # 12a amostra espacada, ~60 quadros (~2 s a 30 fps).
     r0 = pipe.process_frame(frame_base, t_capture_ms=1000, now_s=1.0)
     assert r0.sheet_present and detect_calls == 1
     assert pipe.trigger_baseline()
     for i in range(12):
         ri = pipe.process_frame(
             frame_base,
-            t_capture_ms=1033 + i * 33,
-            now_s=1.033 + i * 0.033,
+            t_capture_ms=1033 + i * 16,
+            now_s=1.033 + i * 0.016,
         )
         assert ri.sheet_present
-    assert pipe.session_ink.ready, "12 quadros em cadencia 1/1 devem fechar a base"
-    # Em 13 quadros estáveis (0..12), a detecção só rodou nos múltiplos de 5 (0, 5, 10): 3 vezes!
-    assert detect_calls == 3
+    assert not pipe.session_ink.ready, (
+        "12 quadros consecutivos nao podem fechar a base: "
+        "as amostras sao espacadas de 5 em 5 quadros"
+    )
+    for i in range(12, 60):
+        ri = pipe.process_frame(
+            frame_base,
+            t_capture_ms=1033 + i * 16,
+            now_s=1.033 + i * 0.016,
+        )
+        assert ri.sheet_present
+    assert pipe.session_ink.ready, "a base fecha na 12a amostra espacada"
+    # Em 61 quadros estáveis (0..60), a detecção só rodou nos múltiplos de 5: 13 vezes!
+    assert detect_calls == 13
 
     # Agora alimentamos 8 quadros com o traço novo: mesmo entre detecções
     # (quadros não múltiplos de 5), o acumulador consolida o traço e a fusão

@@ -324,6 +324,7 @@ class DrawPipeline:
         self.ink_session_open = False
         self.accumulated_canvas = None
         self.baseline_armed = False
+        self._baseline_stride_count = 0
         self.session_corners = None
         self._restart_reference = False
         self._freeze_pending = False
@@ -441,6 +442,7 @@ class DrawPipeline:
             if self.session_ink is not None:
                 self.session_ink.reset()
                 self.baseline_armed = False
+                self._baseline_stride_count = 0
                 self.session_corners = None
                 self._freeze_pending = False
             self.corner_history.clear()
@@ -458,6 +460,7 @@ class DrawPipeline:
             self.ink_accumulator.reset()
             self.session_ink.reset()
             self.baseline_armed = True
+            self._baseline_stride_count = 0
             self.session_corners = ink_corners.copy()
             self._freeze_pending = False
         elif self._freeze_pending:
@@ -492,7 +495,28 @@ class DrawPipeline:
         if self.session_ink is not None:
             if not self.session_ink.ready:
                 if self.baseline_armed:
-                    self.session_ink.add_sample(ink_warped, visible)
+                    # Espacamento das amostras da base (condicao 5
+                    # da revisao do PR #9, aplicada na reconciliacao):
+                    # em producao as 12 amostras eram coletadas pelo
+                    # bloco de tinta, que rodava na cadencia de
+                    # deteccao (1 a cada _SHEET_DETECT_INTERVAL
+                    # quadros), ou seja ~2 s de cena a 30 fps. Na
+                    # cadencia 1/1 deste pipeline, coletar em quadros
+                    # consecutivos encolhe a janela para ~0,4 s, com
+                    # amostras muito mais correlacionadas entre si
+                    # (menos diversidade de micro-movimento e de mao
+                    # passando). O corpo do PR declara o
+                    # encolhimento como ganho, mas nenhuma medicao
+                    # compara as duas janelas sobre a mesma cena;
+                    # sem ela, vale a semantica de producao: uma
+                    # amostra a cada _SHEET_DETECT_INTERVAL quadros.
+                    if (
+                        self._baseline_stride_count
+                        % _SHEET_DETECT_INTERVAL
+                        == 0
+                    ):
+                        self.session_ink.add_sample(ink_warped, visible)
+                    self._baseline_stride_count += 1
                 observed = np.zeros(ink_warped.shape[:2], dtype=np.uint8)
             else:
                 observed = self.session_ink.observe(ink_warped, visible)
