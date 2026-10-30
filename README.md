@@ -347,6 +347,21 @@ baixo e da esquerda para a direita, e não a ordem temporal em que
 o traço foi desenhado. Rastrear a ordem temporal, frame a frame,
 é trabalho futuro.
 
+## v0.2 — traço vetorial
+
+A máscara de tinta vira traços com `draw/strokes.py`: afinamento da
+tinta para um esqueleto de 1 pixel, rastreamento do esqueleto em
+caminhos ordenados, suavização por média móvel e exportação em SVG
+e JSON, com largura, altura, pontos, comprimento e marca de traço
+fechado.
+
+Dois limites são intencionais e documentados no módulo. Junções
+dividem traços: um X vira 4 segmentos que se encontram no centro.
+E a ordem dos traços é determinística, por centroide, de cima para
+baixo e da esquerda para a direita, e não a ordem temporal em que
+o traço foi desenhado. Rastrear a ordem temporal, frame a frame,
+é trabalho futuro.
+
 ## Roadmap
 
 - [x] v0.1 — captura: folha retificada + canvas digital em tempo real
