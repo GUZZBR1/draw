@@ -133,8 +133,8 @@
       "traço grosso de caneta"
     ],
     "ink_tolerance": {
-      "method": "Dilatar predição e ground truth de ink por 2-3 px (disco, via cv2.dilate) e recalcular precision/recall sobre a versão dilatada. Traço fino deslocado 1-2 px é visualmente correto mas destrói a IoU estrita; a métrica com tolerância mede isso sem esconder a IoU estrita, que continua sendo reportada ao lado.",
-      "note": "Alternativas equivalentes (distance transform, comparação por esqueleto) são aceitáveis se documentadas, mas a dilatação é a implementação de referência deste projeto por ser simples e reproduzível.",
+      "method": "Dilatar predição e ground truth de ink por 2-3 px com disco euclidiano implementado em NumPy e recalcular precision/recall sobre a versão dilatada. Traço fino deslocado 1-2 px é visualmente correto mas destrói a IoU estrita; a métrica com tolerância mede isso sem esconder a IoU estrita, que continua sendo reportada ao lado.",
+      "note": "A implementação de referência usa NumPy puro para manter tools/seg_metrics.py sem dependência de OpenCV ou SciPy; a dilatação por distância é equivalente se documentada.",
       "radii_px": [
         2,
         3
