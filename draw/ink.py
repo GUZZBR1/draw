@@ -102,6 +102,68 @@ def extract_ink(warped, clear_markers=False):
     return ink
 
 
+# Amostras da pagina base e delta da tinta da sessao. A pagina base
+# e a mediana dos primeiros quadros retificados da sessao: pauta,
+# margem impressa, lombada e o que ja estava desenhado entram nela
+# e somem da observacao. So conta como tinta o que escurece DEPOIS
+# da base fechada. O delta de 12 niveis fica logo abaixo do traco
+# real medido contra o papel (~13 niveis, auditoria da tinta) e
+# acima da cintilacao de luz; o resto quem limpa e o voto temporal
+# do InkAccumulator sobre esta mascara.
+_SESSION_BASE_SAMPLES = 10
+_SESSION_INK_DELTA = 12.0
+
+
+class SessionBaselineInk:
+    """Tinta da sessao: o que escureceu em relacao a pagina base.
+
+    Diferente de extract_ink, que julga cada quadro sozinho contra
+    limiares absolutos e por isso entrega a estrutura do caderno
+    (pauta, margem, lombada) como tinta, esta fonte compara o
+    quadro com a pagina como ela estava quando a sessao abriu.
+    Desenho preexistente vira fundo por construcao: a pergunta que
+    ela responde e "o que foi desenhado nesta sessao".
+    """
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self._samples = []
+        self._baseline_min = None
+
+    @property
+    def ready(self):
+        return self._baseline_min is not None
+
+    def add_sample(self, warped):
+        """Alimenta a base; a mediana fecha na decima amostra."""
+        if self.ready:
+            return
+        gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
+        self._samples.append(gray)
+        if len(self._samples) >= _SESSION_BASE_SAMPLES:
+            base = np.median(np.stack(self._samples), axis=0)
+            base = cv2.GaussianBlur(
+                base.astype(np.float32), (3, 3), 0)
+            # Minimo local 3x3: a estrutura escura da base ganha um
+            # halo de 1 px que absorve o jitter residual do warp,
+            # para a pauta nao virar tinta quando o quadro treme.
+            self._baseline_min = cv2.erode(
+                base, np.ones((3, 3), dtype=np.uint8))
+            self._samples = []
+
+    def observe(self, warped):
+        """Mascara (255 = tinta) do que escureceu contra a base."""
+        if not self.ready:
+            return np.zeros(warped.shape[:2], dtype=np.uint8)
+        gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
+        blurred = cv2.GaussianBlur(gray, (3, 3), 0).astype(np.float32)
+        delta = self._baseline_min - blurred
+        return np.where(
+            delta >= _SESSION_INK_DELTA, 255, 0).astype(np.uint8)
+
+
 def render_canvas(ink_mask):
     """Renderiza o canvas digital: fundo branco, tinta preta."""
     canvas = np.full(

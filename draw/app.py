@@ -513,6 +513,7 @@ def run(
     neural_model=None,
     hand_model=None,
     ink_model=None,
+    session_baseline=False,
 ):
     neural_detector = None
     if neural_model is not None and not markers_mode:
@@ -538,6 +539,14 @@ def run(
                     f"Modelo de tinta ativo: {ink_model}. "
                     "A heuristica segue como reserva por frame."
                 )
+
+    session_ink = None
+    if session_baseline and not markers_mode:
+        session_ink = ink_module.SessionBaselineInk()
+        print(
+            "Tinta da sessao ativa: a pagina base dos primeiros "
+            "quadros vira fundo; so o traco novo entra no canvas."
+        )
 
     def ink_source(warped_img):
         if ink_extractor is not None:
@@ -654,6 +663,8 @@ def run(
                 if not ink_session_open:
                     # Folha nova na cena: canvas e geometria recomecam.
                     ink_accumulator.reset()
+                    if session_ink is not None:
+                        session_ink.reset()
                     corner_history.clear()
                     ink_session_open = True
                 corner_history.append(tracker.corners.copy())
@@ -661,7 +672,15 @@ def run(
                     np.stack(corner_history), axis=0
                 ).astype(np.float32)
                 ink_warped = paper_module.warp_sheet(frame, ink_corners)
-                observed = ink_source(ink_warped)
+                if session_ink is not None:
+                    if not session_ink.ready:
+                        session_ink.add_sample(ink_warped)
+                        observed = np.zeros(
+                            ink_warped.shape[:2], dtype=np.uint8)
+                    else:
+                        observed = session_ink.observe(ink_warped)
+                else:
+                    observed = ink_source(ink_warped)
                 visible = None
                 if hand_masker is not None:
                     camera_mask = hand_masker.mask(frame)
@@ -715,6 +734,12 @@ def run(
                 else:
                     status_text = "Folha detectada"
                     status_color = (0, 255, 0)
+                if session_ink is not None and not session_ink.ready:
+                    status_text = (
+                        "Folha detectada: capturando a pagina base, "
+                        "maos fora da folha"
+                    )
+                    status_color = (0, 255, 255)
                 cv2.putText(
                     status,
                     status_text,
@@ -809,6 +834,14 @@ def main():
         action="store_true",
         help="valida a camera local porta por porta e sai, sem abrir janela",
     )
+    parser.add_argument(
+        "--session-baseline",
+        action="store_true",
+        help="tinta da sessao: a pagina como esta quando a folha e "
+        "detectada vira fundo (pauta, margem impressa e desenho "
+        "antigo somem do canvas); so o traco feito depois da pagina "
+        "base entra. Incompativel com --markers",
+    )
     parser.add_argument("--save-dir", default="captures")
     args = parser.parse_args()
     if args.check:
@@ -834,6 +867,8 @@ def main():
                 "--ink-model sem caminho: passe o arquivo .onnx ou "
                 "defina a variavel DRAW_INK_MODEL"
             )
+    if args.session_baseline and args.markers:
+        parser.error("--session-baseline nao combina com --markers")
     hand_model = None
     if args.hand_model is not None:
         if args.markers:
@@ -849,6 +884,7 @@ def main():
             neural_model=neural_model,
             hand_model=hand_model,
             ink_model=ink_model,
+            session_baseline=args.session_baseline,
         )
     except (RuntimeError, FileNotFoundError) as error:
         print(f"Erro: {error}")
