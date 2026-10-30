@@ -77,6 +77,11 @@ _FIT_MIN_EDGE_COVERAGE = 0.5
 _MEMORY_MIN_MASK_IOU = 0.7
 _MEMORY_MASK_STRIDE = 4
 _ENV_MODEL_VAR = "DRAW_NEURAL_MODEL"
+_PAPER_CLASS = 1
+_INK_CLASS = 3
+_SEGMENTATION_PRESENCE_MIN_RATIO = 0.01
+_SEGMENTATION_ABSENT_LOGIT = -10.0
+_SEGMENTATION_PRESENT_LOGIT = 1.0
 
 # Portão do caminho clássico (medido em 2026-10-30 no laboratório,
 # draw-lab/fp-gate-2026-10-30/): com um modelo neural carregado, um
@@ -478,10 +483,11 @@ class NeuralSheetDetector:
     máscaras reduzidas por _MEMORY_MASK_STRIDE. Cena nova recomeça
     sem herança.
 
-    O atributo last_presence_logit guarda o logit de presença da
+    O atributo last_presence_logit guarda o sinal de presença da
     última chamada a predict (None antes da primeira e após um frame
-    vazio): é ele que o portão PRESENCE_VETO_LOGIT lê no app para
-    decidir se a reserva clássica pode falar.
+    vazio): nos modelos legados é o logit treinado; no SegFormer de
+    quatro classes é um sinal derivado da área segmentada. O app usa-o
+    para decidir se a reserva clássica pode falar.
     """
 
     def __init__(self, model_path):
@@ -543,7 +549,13 @@ class NeuralSheetDetector:
         return corners
 
     def predict(self, frame):
-        """Roda o modelo. Retorna (logit de presença, máscara 0/255)."""
+        """Roda o modelo. Retorna (sinal de presença, máscara 0/255).
+
+        O contrato legado tem uma máscara binária e um logit de presença.
+        O SegFormer de quatro classes exporta apenas logits semânticos;
+        nesse caso, papel e tinta formam a região da folha (a mão continua
+        excluída) e a própria área prevista fornece um sinal de presença.
+        """
         session = self._get_session()
         if self._resolved_input_size is None:
             self._resolved_input_size = _session_input_size(session)
@@ -557,19 +569,45 @@ class NeuralSheetDetector:
         ).astype(np.float32)
         tensor = ((resized / 255.0 - _MEAN) / _STD).transpose(2, 0, 1)
         tensor = tensor[None].astype(np.float32)
-        logits, presence = session.run(
-            ["mask_logits", "presence_logit"], {"image": tensor}
-        )
-        channel_bg, channel_paper = logits[0, 0], logits[0, 1]
-        peak = np.maximum(channel_bg, channel_paper)
-        exp_bg = np.exp(channel_bg - peak)
-        exp_paper = np.exp(channel_paper - peak)
-        probability = exp_paper / (exp_bg + exp_paper)
-        mask_small = (probability > _MASK_THRESHOLD).astype(np.uint8)
+        output_names = [output.name for output in session.get_outputs()]
+        outputs = session.run(output_names, {"image": tensor})
+        by_name = dict(zip(output_names, outputs))
+
+        if "mask_logits" in by_name and "presence_logit" in by_name:
+            logits = by_name["mask_logits"]
+            presence = by_name["presence_logit"]
+            channel_bg, channel_paper = logits[0, 0], logits[0, 1]
+            peak = np.maximum(channel_bg, channel_paper)
+            exp_bg = np.exp(channel_bg - peak)
+            exp_paper = np.exp(channel_paper - peak)
+            probability = exp_paper / (exp_bg + exp_paper)
+            mask_small = (probability > _MASK_THRESHOLD).astype(np.uint8)
+            self.last_presence_logit = float(presence[0])
+        elif output_names == ["logits"]:
+            logits = by_name["logits"]
+            if logits.ndim != 4 or logits.shape[1] != 4:
+                raise ValueError(
+                    "saída 'logits' precisa ter forma [N, 4, H, W] "
+                    "(fundo, papel, mão, tinta)"
+                )
+            classes = np.argmax(logits[0], axis=0)
+            page = (classes == _PAPER_CLASS) | (classes == _INK_CLASS)
+            page_ratio = float(np.mean(page))
+            mask_small = page.astype(np.uint8)
+            self.last_presence_logit = (
+                _SEGMENTATION_PRESENT_LOGIT
+                if page_ratio >= _SEGMENTATION_PRESENCE_MIN_RATIO
+                else _SEGMENTATION_ABSENT_LOGIT
+            )
+        else:
+            raise ValueError(
+                "saídas ONNX incompatíveis: esperava 'mask_logits' e "
+                "'presence_logit' ou apenas 'logits' com quatro classes; "
+                f"recebi {output_names}"
+            )
         mask = cv2.resize(
             mask_small, (frame_w, frame_h), interpolation=cv2.INTER_NEAREST
         )
-        self.last_presence_logit = float(presence[0])
         return self.last_presence_logit, mask * 255
 
     def __call__(self, frame):
