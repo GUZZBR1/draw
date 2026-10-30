@@ -103,14 +103,18 @@ def extract_ink(warped, clear_markers=False):
 
 
 # Amostras da pagina base e delta da tinta da sessao. A pagina base
-# e a mediana dos primeiros quadros retificados da sessao: pauta,
-# margem impressa, lombada e o que ja estava desenhado entram nela
-# e somem da observacao. So conta como tinta o que escurece DEPOIS
-# da base fechada. O delta de 12 niveis fica logo abaixo do traco
-# real medido contra o papel (~13 niveis, auditoria da tinta) e
-# acima da cintilacao de luz; o resto quem limpa e o voto temporal
-# do InkAccumulator sobre esta mascara.
-_SESSION_BASE_SAMPLES = 10
+# e a mediana dos primeiros quadros retificados depois que o
+# usuario manda comecar (tecla C no app): pauta, margem impressa,
+# lombada e o que ja estava desenhado entram nela e somem da
+# observacao. So conta como tinta o que escurece DEPOIS da base
+# fechada. O delta de 12 niveis fica logo abaixo do traco real
+# medido contra o papel (~13 niveis, auditoria da tinta) e acima
+# da cintilacao de luz; o resto quem limpa e o voto temporal do
+# InkAccumulator sobre esta mascara. A observacao normaliza a
+# iluminacao do quadro pela razao das medianas contra a base
+# (ganho limitado), para uma mudanca global de luz nao virar
+# tinta na pagina inteira.
+_SESSION_BASE_SAMPLES = 12
 _SESSION_INK_DELTA = 12.0
 
 
@@ -131,13 +135,15 @@ class SessionBaselineInk:
     def reset(self):
         self._samples = []
         self._baseline_min = None
+        self.reference = None
+        self._ref_median = None
 
     @property
     def ready(self):
         return self._baseline_min is not None
 
     def add_sample(self, warped):
-        """Alimenta a base; a mediana fecha na decima amostra."""
+        """Alimenta a base; a mediana fecha na decima segunda amostra."""
         if self.ready:
             return
         gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
@@ -146,6 +152,11 @@ class SessionBaselineInk:
             base = np.median(np.stack(self._samples), axis=0)
             base = cv2.GaussianBlur(
                 base.astype(np.float32), (3, 3), 0)
+            # A referencia cheia fica guardada: e contra ela que um
+            # realinhamento futuro (ECC/fase) mede o deslocamento
+            # do quadro atual quando o caderno se mexe.
+            self.reference = base
+            self._ref_median = float(np.median(base))
             # Minimo local 3x3: a estrutura escura da base ganha um
             # halo de 1 px que absorve o jitter residual do warp,
             # para a pauta nao virar tinta quando o quadro treme.
@@ -158,7 +169,13 @@ class SessionBaselineInk:
         if not self.ready:
             return np.zeros(warped.shape[:2], dtype=np.uint8)
         gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
-        blurred = cv2.GaussianBlur(gray, (3, 3), 0).astype(np.float32)
+        gray = gray.astype(np.float32)
+        cur_median = float(np.median(gray))
+        gain = 1.0
+        if cur_median > 1.0 and self._ref_median is not None:
+            gain = float(np.clip(
+                self._ref_median / cur_median, 0.85, 1.18))
+        blurred = cv2.GaussianBlur(gray * gain, (3, 3), 0)
         delta = self._baseline_min - blurred
         return np.where(
             delta >= _SESSION_INK_DELTA, 255, 0).astype(np.uint8)
