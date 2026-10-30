@@ -183,56 +183,12 @@ _SESSION_INK_DELTA = 12.0
 # um warp de 40+ px e pior que nao corrigir. Nenhum numero daqui
 # bloqueia a sessao; portoes foram removidos (ver observe).
 _ALIGN_MAX_SHIFT_PX = 10.0
-_ALIGN_BAND_H = 512
 _BASE_MIN_VISIBLE = 1
 _MIN_GAIN_VISIBLE_SUBSAMPLES = 256
-_ALIGN_WINDOW_CACHE = {}
+_ALIGN_WINDOW = None
 
 
-def _hanning_info(band_h, w):
-    key = (band_h, w)
-    info = _ALIGN_WINDOW_CACHE.get(key)
-    if info is None:
-        win = cv2.createHanningWindow((w, band_h), cv2.CV_32F)
-        opt_h = cv2.getOptimalDFTSize(band_h)
-        opt_w = cv2.getOptimalDFTSize(w)
-        info = (win, float(win.sum()), opt_h, opt_w)
-        _ALIGN_WINDOW_CACHE[key] = info
-    return info
-
-
-def _prepare_phase_patch(gray, out_buf=None):
-    """Prepara faixa de largura total em 1:1 com padding ótimo de FFT (512x864).
-
-    850 = 2 * 5^2 * 17 força DFT mista lenta na página inteira, mas um
-    recorte horizontal estreito perde a margem esquerda (x ~ 95) e os
-    furos da espiral (x ~ 22) — que numa folha pautada limpa são as
-    únicas âncoras verticais para medir deslocamento em X. Mantendo 100%
-    da largura (850 px) janelada por Hanning e acolchoada com zeros até
-    getOptimalDFTSize(850) = 864 = 2^5 * 3^3 em 512 = 2^9 linhas centrais,
-    o phaseCorrelate roda em radix-2/3 puro (~4,4 ms vs ~20 ms) sem perder
-    margem nem espiral e com escala nativa de 1 px.
-    """
-    h, w = gray.shape
-    band_h = _ALIGN_BAND_H if h >= _ALIGN_BAND_H else h
-    y0 = (h - band_h) // 2
-    sub = gray[y0 : y0 + band_h, :]
-    win, win_sum, opt_h, opt_w = _hanning_info(band_h, w)
-    if out_buf is None or out_buf.shape != (opt_h, opt_w):
-        out_buf = np.zeros((opt_h, opt_w), dtype=np.float32)
-    else:
-        out_buf.fill(0.0)
-    roi = out_buf[:band_h, :w]
-    # Subtrai média e aplica janela de Hanning antes do zero-padding,
-    # evitando degrau artificial na coluna w -> opt_w.
-    cv2.subtract(sub, float(cv2.mean(sub)[0]), dst=roi)
-    cv2.multiply(roi, win, dst=roi)
-    return out_buf
-
-
-def align_to_reference(
-    reference_gray, current_gray, _ref_patch=None, _cur_buf=None
-):
+def align_to_reference(reference_gray, current_gray):
     """Realinha o quadro atual a referencia da sessao.
 
     Os dois argumentos sao cinza float32 no espaco do papel.
@@ -254,13 +210,12 @@ def align_to_reference(
     o mesmo neste modo de falha (deslocamento puro) custando
     243,6 ms, por isso fica fora do laco.
     """
-    ref_patch = (
-        _ref_patch
-        if _ref_patch is not None
-        else _prepare_phase_patch(reference_gray)
-    )
-    cur_patch = _prepare_phase_patch(current_gray, out_buf=_cur_buf)
-    (sx, sy), response = cv2.phaseCorrelate(ref_patch, cur_patch)
+    global _ALIGN_WINDOW
+    if _ALIGN_WINDOW is None or _ALIGN_WINDOW.shape != reference_gray.shape:
+        h, w = reference_gray.shape
+        _ALIGN_WINDOW = cv2.createHanningWindow((w, h), cv2.CV_32F)
+    (sx, sy), response = cv2.phaseCorrelate(
+        reference_gray, current_gray, _ALIGN_WINDOW)
     shift = float(np.hypot(sx, sy))
     if shift > _ALIGN_MAX_SHIFT_PX:
         return current_gray, (float(sx), float(sy)), float(response), False
@@ -294,8 +249,6 @@ class SessionBaselineInk:
         self._sample_vis = []
         self._baseline_min = None
         self.reference = None
-        self._ref_patch = None
-        self._cur_patch_buf = None
         self._ref_median = None
 
     @property
@@ -343,8 +296,6 @@ class SessionBaselineInk:
             # ela que o realinhamento mede o deslocamento do
             # quadro atual quando o caderno se mexe.
             self.reference = base_raw
-            self._ref_patch = _prepare_phase_patch(base_raw)
-            self._cur_patch_buf = np.zeros_like(self._ref_patch)
             self._ref_median = float(np.median(base[::2, ::2]))
             # Minimo local 3x3: a estrutura escura da base ganha um
             # halo de 1 px que absorve o jitter residual do warp,
@@ -377,11 +328,7 @@ class SessionBaselineInk:
             return np.zeros(shape, dtype=np.uint8)
         gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY).astype(np.float32)
         aligned, _est, _response, _ok = align_to_reference(
-            self.reference,
-            gray,
-            _ref_patch=self._ref_patch,
-            _cur_buf=self._cur_patch_buf,
-        )
+            self.reference, gray)
         sub_aligned = aligned[::2, ::2]
         if visible is not None:
             vis_bool = (
