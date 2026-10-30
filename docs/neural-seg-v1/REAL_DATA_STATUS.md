@@ -14,7 +14,7 @@ modelo treinado** e não afirma melhora de qualidade ou acurácia.
 | Rótulos | As máscaras candidatas são pseudo-rótulos, não ground truth. Pixels `255` representam regiões desconhecidas e são ignorados pelo treinador. |
 | Dados publicados neste PR | Nenhuma captura original nem máscara gerada está incluída. |
 | Treino e resultado do modelo | Nenhum treino foi executado; nenhum checkpoint ou modelo treinado é entregue. |
-| Testes automatizados | Não foram executados durante a preparação deste PR. Os testes incluídos precisam passar no CI antes de se considerar o código validado. |
+| Testes automatizados | Após a reconciliação: 29 passaram e 2 testes dependentes de PyTorch completo foram ignorados, pois o ambiente local não tem PyTorch utilizável. O smoke CPU e as verificações de sintaxe/configuração passaram; treino e exportação ONNX completos continuam pendentes. |
 
 ## Uso permitido neste estágio
 

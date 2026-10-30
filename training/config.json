@@ -3,16 +3,15 @@
     "augmentation": {
       "geometric": [
         "horizontal_flip_p=0.5",
-        "rotation_degrees=15",
-        "scale=0.9-1.1",
-        "perspective_light"
+        "affine_rotation_degrees=-15..15_scale=0.9..1.1_mask_nearest_p=0.5",
+        "perspective_scale=0.02..0.06_mask_nearest_p=0.2"
       ],
       "note": "Augmentation geométrica aplica-se IDENTICAMENTE à imagem e à máscara (nunca só à imagem). Augmentation fotométrica só à imagem. Máscara nunca é borrada nem interpolada com bilinear: nearest-neighbor, para não criar classes fracionárias.",
       "photometric": [
-        "brightness_contrast=0.2",
-        "gaussian_blur_p=0.2",
-        "gaussian_noise_p=0.2",
-        "hue_saturation_value_light"
+        "brightness_contrast_limit=0.2_p=0.3",
+        "gaussian_blur_kernel=3..5_p=0.2",
+        "gaussian_noise_std=0.01..0.05_p=0.2",
+        "hue_shift=8_saturation_shift=12_value_shift=12_p=0.2"
       ]
     },
     "freihand": {
@@ -87,7 +86,11 @@
     "onnx": "draw_segmentation_v1.onnx",
     "opset_version": 14,
     "output_name": "logits",
-    "validation": "Rodar o modelo PyTorch e o ONNX no mesmo lote de validação e comparar: diferença máxima absoluta dos logits e IoU por classe. Degradação significativa aborta a entrega. O resultado vai para metrics.json (campo onnx_validation)."
+    "validation": "Rodar PyTorch e ONNX no mesmo lote. O ONNX só é considerado equivalente quando shape, max_abs_diff e min_argmax_iou passam os limites. Um status skipped nunca significa validado.",
+    "validation_thresholds": {
+      "max_abs_diff": 0.001,
+      "min_argmax_iou": 0.99
+    }
   },
   "kaggle": {
     "accelerator": "GPU disponível no Kaggle; confirmar o acelerador no runtime antes do treino.",
@@ -210,8 +213,9 @@
     "epochs": 30,
     "gradient_accumulation_steps": 1,
     "learning_rate": 6e-05,
-    "mixed_precision": "bf16 (fp16 se a GPU não suportar bf16)",
-    "note": "Batch 8 em 512x512 cabe numa T4/P100 de 16 GB com SegFormer-B0. Se houver OOM, baixar para batch 4 com gradient_accumulation_steps=2 (batch efetivo igual) em vez de reduzir a resolução: traço fino depende da resolução.",
+    "mixed_precision": "bf16",
+    "mixed_precision_fallback": "fp16",
+    "note": "Em GPU, o treino usa bf16 quando suportado, caso contrário fp16 escalado. Em CPU usa fp32. Se houver OOM, batch 4 com gradient_accumulation_steps=2 mantém o batch efetivo; não reduza a resolução, pois o traço fino depende de 512x512.",
     "num_workers": 4,
     "optimizer": "AdamW",
     "scheduler": "cosine_with_warmup",

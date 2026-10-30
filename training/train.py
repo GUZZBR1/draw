@@ -47,6 +47,11 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+from tools import seg_metrics as shared_metrics
+
 CLASSES = {0: "background", 1: "paper", 2: "hand", 3: "ink"}
 NUM_CLASSES = 4
 IGNORE_INDEX = 255
@@ -158,56 +163,26 @@ def compute_class_weights(counts, cap=10.0):
 
 # ---------------------------------------------------------------- métricas
 def per_class_metrics(pred, target):
-    """IoU, Dice, precision, recall por classe (numpy, sem torch).
-
-    pred/target: arrays 2D de inteiros 0..3/255, mesmo shape. Pixels 255
-    no target são excluídos de todos os denominadores e suportes.
-    """
-    out = {}
-    valid = target != IGNORE_INDEX
-    for c in range(NUM_CLASSES):
-        p = (pred == c) & valid
-        t = (target == c) & valid
-        tp = int((p & t).sum())
-        fp = int((p & ~t).sum())
-        fn = int((~p & t).sum())
-        denom_iou = tp + fp + fn
-        denom_dice = 2 * tp + fp + fn
-        out[CLASSES[c]] = {
-            "iou": tp / denom_iou if denom_iou else 1.0,
-            "dice": 2 * tp / denom_dice if denom_dice else 1.0,
-            "precision": tp / (tp + fp) if (tp + fp) else 1.0,
-            "recall": tp / (tp + fn) if (tp + fn) else 1.0,
-            "support_px": int(t.sum()),
-        }
-    return out
+    """Compatibility wrapper over the shared segmentation metric contract."""
+    report = shared_metrics.evaluate(pred, target)
+    return {
+        name: {
+            metric: report[metric][name]
+            for metric in ("iou", "dice", "precision", "recall")
+        } | {"support_px": report["support_px"][name]}
+        for name in shared_metrics.CLASSES
+    }
 
 
 def ink_tolerance_metrics(pred, target, radii=(2, 3)):
-    """Precision/recall de ink com tolerância espacial.
-
-    Dilata predição e ground truth de ink pelo raio dado: um traço fino
-    deslocado 1-2 px é visualmente correto, mas a IoU estrita o pune.
-    A IoU estrita continua sendo reportada ao lado; esta métrica não
-    a substitui, apenas a complementa.
-    """
+    """Compatibility wrapper over the shared, ignore-index-aware metric."""
     out = {}
-    valid = target != IGNORE_INDEX
-    pred_ink = ((pred == 3) & valid).astype(np.uint8)
-    target_ink = ((target == 3) & valid).astype(np.uint8)
-    for r in radii:
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
-        p_dil = (cv2.dilate(pred_ink, kernel) > 0) & valid
-        t_dil = (cv2.dilate(target_ink, kernel) > 0) & valid
-        # precision tolerante: predito que cai perto do traço real;
-        # recall tolerante: traço real coberto por predição próxima.
-        pred_valid = (pred_ink > 0) & valid
-        target_valid = (target_ink > 0) & valid
-        pred_n = int(pred_valid.sum())
-        target_n = int(target_valid.sum())
-        out[f"radius_{r}px"] = {
-            "precision": int((pred_valid & t_dil).sum()) / pred_n if pred_n else 1.0,
-            "recall": int((target_valid & p_dil).sum()) / target_n if target_n else 1.0,
+    for radius in radii:
+        report = shared_metrics.ink_tolerance_metrics(pred, target, radius)
+        out[f"radius_{radius}px"] = {
+            "precision": report["precision"],
+            "recall": report["recall"],
+            "f1": report["f1"],
         }
     return out
 
@@ -261,14 +236,35 @@ def build_dataset(data_dir, split, cfg, augment=False, extra_pairs=None):
             aug = A.Compose(
                 [
                     A.HorizontalFlip(p=0.5),
-                    A.Rotate(limit=15, p=0.5),
-                    A.RandomBrightnessContrast(p=0.3),
-                    A.GaussNoise(p=0.2),
-                    A.Blur(blur_limit=3, p=0.2),
+                    A.Affine(
+                        scale=(0.9, 1.1),
+                        rotate=(-15, 15),
+                        mask_interpolation=cv2.INTER_NEAREST,
+                        p=0.5,
+                    ),
+                    A.Perspective(
+                        scale=(0.02, 0.06),
+                        mask_interpolation=cv2.INTER_NEAREST,
+                        p=0.2,
+                    ),
+                    A.RandomBrightnessContrast(
+                        brightness_limit=0.2, contrast_limit=0.2, p=0.3
+                    ),
+                    A.GaussNoise(std_range=(0.01, 0.05), p=0.2),
+                    A.GaussianBlur(blur_limit=(3, 5), p=0.2),
+                    A.HueSaturationValue(
+                        hue_shift_range=(-8, 8),
+                        sat_shift_range=(-12, 12),
+                        val_shift_range=(-12, 12),
+                        p=0.2,
+                    ),
                 ]
             )
-        except ImportError:
-            print("AVISO: albumentations ausente; treino sem augmentation.", file=sys.stderr)
+        except ImportError as exc:
+            raise RuntimeError(
+                "albumentations é obrigatório para reproduzir as augmentations "
+                "definidas em training/config.json; instale training/requirements.txt"
+            ) from exc
 
     class SegDataset(Dataset):
         def __len__(self):
@@ -324,42 +320,112 @@ def combined_loss(logits, target, class_weights, ce_weight=0.5, dice_weight=0.5)
     return ce_weight * ce + dice_weight * dice
 
 
-def train_one_epoch(model, loader, optimizer, class_weights, device, scaler=None):
+def warmup_cosine_scheduler(optimizer, total_steps, warmup_ratio):
+    """LR linear warmup followed by cosine decay, stepped per optimizer update."""
     import torch
+
+    total_steps = max(int(total_steps), 1)
+    warmup_steps = min(int(total_steps * float(warmup_ratio)), total_steps)
+
+    def multiplier(step):
+        if warmup_steps and step < warmup_steps:
+            return float(step + 1) / warmup_steps
+        decay_steps = max(total_steps - warmup_steps, 1)
+        progress = min(max((step - warmup_steps) / decay_steps, 0.0), 1.0)
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, multiplier)
+
+
+def configure_mixed_precision(torch, device, training_cfg):
+    """Select configured bf16/fp16 on CUDA, fp32 elsewhere."""
+    if torch.device(device).type != "cuda":
+        return "fp32", None, None
+    preferred = training_cfg.get("mixed_precision", "bf16")
+    fallback = training_cfg.get("mixed_precision_fallback", "fp16")
+    supports_bf16 = bool(getattr(torch.cuda, "is_bf16_supported", lambda: False)())
+    precision = preferred if preferred == "bf16" and supports_bf16 else fallback
+    if precision == "bf16":
+        return precision, torch.bfloat16, None
+    if precision == "fp16":
+        return precision, torch.float16, torch.amp.GradScaler("cuda")
+    return "fp32", None, None
+
+
+def train_one_epoch(
+    model,
+    loader,
+    optimizer,
+    class_weights,
+    device,
+    scaler=None,
+    scheduler=None,
+    accumulation_steps=1,
+    amp_dtype=None,
+):
+    import torch
+    import torch.nn.functional as F
 
     model.train()
     total, n = 0.0, 0
-    for images, masks in loader:
+    accumulation_steps = max(int(accumulation_steps), 1)
+    num_batches = len(loader)
+    optimizer.zero_grad(set_to_none=True)
+    for batch_index, (images, masks) in enumerate(loader):
         images, masks = images.to(device), masks.to(device)
-        if not (masks != IGNORE_INDEX).any():
-            continue
-        optimizer.zero_grad()
-        logits = model(pixel_values=images).logits
-        # SegFormer pode devolver logits em resolução menor: interpola para a máscara.
-        if logits.shape[-2:] != masks.shape[-2:]:
-            import torch.nn.functional as F
-
-            logits = F.interpolate(logits, size=masks.shape[-2:], mode="bilinear", align_corners=False)
-        loss = combined_loss(logits, masks, class_weights)
-        loss.backward()
-        optimizer.step()
-        total += loss.item()
+        device_type = torch.device(device).type
+        with torch.autocast(
+            device_type=device_type,
+            dtype=amp_dtype,
+            enabled=amp_dtype is not None,
+        ):
+            logits = model(pixel_values=images).logits
+            if logits.shape[-2:] != masks.shape[-2:]:
+                logits = F.interpolate(
+                    logits, size=masks.shape[-2:], mode="bilinear", align_corners=False
+                )
+            loss = combined_loss(logits, masks, class_weights)
+        group_start = (batch_index // accumulation_steps) * accumulation_steps
+        group_size = min(accumulation_steps, num_batches - group_start)
+        scaled_loss = loss / group_size
+        if scaler is not None:
+            scaler.scale(scaled_loss).backward()
+        else:
+            scaled_loss.backward()
+        should_step = (
+            (batch_index + 1) % accumulation_steps == 0
+            or batch_index + 1 == num_batches
+        )
+        if should_step:
+            did_step = True
+            if scaler is not None:
+                previous_scale = scaler.get_scale()
+                scaler.step(optimizer)
+                scaler.update()
+                did_step = scaler.get_scale() >= previous_scale
+            else:
+                optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            if scheduler is not None and did_step:
+                scheduler.step()
+        total += float(loss.detach().item())
         n += 1
     if n == 0:
-        raise ValueError(
-            "época sem nenhum lote supervisionado: todas as máscaras contêm apenas 255"
-        )
+        raise ValueError("época sem lotes de treino")
     return total / n
 
 
 def evaluate(model, loader, device):
-    """Avalia um loader inteiro; devolve métricas agregadas por classe."""
+    """Avalia todo o loader usando as métricas compartilhadas do projeto."""
     import torch
 
     model.eval()
-    agg = {c: {"tp": 0, "fp": 0, "fn": 0} for c in range(NUM_CLASSES)}
-    ink_pred_list, ink_target_list = [], []
+    confusion = np.zeros((NUM_CLASSES, NUM_CLASSES), dtype=np.int64)
     supervised_px, ignored_px = 0, 0
+    tolerance_totals = {
+        radius: {"pred_ink": 0, "gt_ink": 0, "matched_pred": 0, "matched_gt": 0}
+        for radius in (2, 3)
+    }
     with torch.no_grad():
         for images, masks in loader:
             images = images.to(device)
@@ -373,36 +439,35 @@ def evaluate(model, loader, device):
             valid = target != IGNORE_INDEX
             supervised_px += int(valid.sum())
             ignored_px += int((~valid).sum())
-            for c in range(NUM_CLASSES):
-                p, t = (pred == c) & valid, (target == c) & valid
-                agg[c]["tp"] += int((p & t).sum())
-                agg[c]["fp"] += int((p & ~t).sum())
-                agg[c]["fn"] += int((~p & t).sum())
-            ink_pred_list.append(pred)
-            ink_target_list.append(target)
+            for pred_image, target_image in zip(pred, target):
+                confusion += shared_metrics.confusion_matrix(pred_image, target_image)
+                if not np.any(target_image != IGNORE_INDEX):
+                    continue
+                for radius in tolerance_totals:
+                    tol = shared_metrics.ink_tolerance_metrics(
+                        pred_image, target_image, tolerance_px=radius
+                    )
+                    for key in tolerance_totals[radius]:
+                        tolerance_totals[radius][key] += tol[key]
     if supervised_px == 0:
         raise ValueError("avaliação sem pixels supervisionados: todas as máscaras são 255")
-    metrics = {}
-    for c in range(NUM_CLASSES):
-        tp, fp, fn = agg[c]["tp"], agg[c]["fp"], agg[c]["fn"]
-        metrics[CLASSES[c]] = {
-            "iou": tp / (tp + fp + fn) if (tp + fp + fn) else 1.0,
-            "dice": 2 * tp / (2 * tp + fp + fn) if (2 * tp + fp + fn) else 1.0,
-            "precision": tp / (tp + fp) if (tp + fp) else 1.0,
-            "recall": tp / (tp + fn) if (tp + fn) else 1.0,
-            "support_px": int(agg[c]["tp"] + agg[c]["fn"]),
+    metrics = shared_metrics.evaluate_confusion_matrix(confusion, ignored_px=ignored_px)
+    aggregate_tolerance = {}
+    for radius, counts in tolerance_totals.items():
+        pred_ink, gt_ink = counts["pred_ink"], counts["gt_ink"]
+        precision = counts["matched_pred"] / pred_ink if pred_ink else (1.0 if not gt_ink else 0.0)
+        recall = counts["matched_gt"] / gt_ink if gt_ink else (1.0 if not pred_ink else 0.0)
+        f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+        aggregate_tolerance[f"radius_{radius}px"] = {
+            "precision": precision,
+            "recall": recall,
+            "f1": f1,
+            "pred_ink": pred_ink,
+            "gt_ink": gt_ink,
+            "matched_pred": counts["matched_pred"],
+            "matched_gt": counts["matched_gt"],
         }
-    metrics["supervised_px"] = supervised_px
-    metrics["ignored_px"] = ignored_px
-    pred_all = np.concatenate([p.ravel() for p in ink_pred_list]) if ink_pred_list else np.array([])
-    target_all = np.concatenate([t.ravel() for t in ink_target_list]) if ink_target_list else np.array([])
-    # Métrica de ink com tolerância precisa de imagem 2D; usa o primeiro
-    # lote como amostra representativa (o relatório completo usa o
-    # avaliador de cenários fixos, abaixo).
-    metrics["ink_tolerance_sample"] = {}
-    if ink_pred_list:
-        metrics["ink_tolerance_sample"] = ink_tolerance_metrics(ink_pred_list[0][0], ink_target_list[0][0])
-    metrics["mean_iou"] = float(np.mean([metrics[CLASSES[c]]["iou"] for c in range(NUM_CLASSES)]))
+    metrics["ink_tolerance"] = aggregate_tolerance
     return metrics
 
 
@@ -418,21 +483,47 @@ def _make_onnx_dummy(model, size):
     return torch.randn(1, 3, size, size, device=device)
 
 
+def make_onnx_export_model(model, size):
+    """Wrap SegFormer so exported logits match the full input resolution."""
+    import torch
+    import torch.nn.functional as F
+
+    class ExportModel(torch.nn.Module):
+        def __init__(self, wrapped_model, output_size):
+            super().__init__()
+            self.model = wrapped_model
+            self.output_size = output_size
+
+        def forward(self, image):
+            logits = self.model(pixel_values=image).logits
+            if logits.shape[-2:] != (self.output_size, self.output_size):
+                logits = F.interpolate(
+                    logits,
+                    size=(self.output_size, self.output_size),
+                    mode="bilinear",
+                    align_corners=False,
+                )
+            return logits
+
+    return ExportModel(model, size).eval()
+
+
 def export_onnx(model, out_path, cfg):
     """Exporta para ONNX com o contrato do Draw: input 'image', output 'logits'."""
     import torch
 
     model.eval()
     size = cfg["model"]["input"]["height"]
-    dummy = _make_onnx_dummy(model, size)
+    export_model = make_onnx_export_model(model, size)
+    dummy = _make_onnx_dummy(export_model, size)
     # dynamo=False: exportador legado. O exportador dynamo padrão do torch
     # 2.11 exige onnxscript, que o ambiente do Kaggle não tem — sem isso,
     # o treino inteiro falhava na exportação, depois das épocas, e perdia
     # até o metrics.json. O exportador legado usa só o pacote onnx.
     torch.onnx.export(
-        model,
+        export_model,
         (dummy,),
-        out_path,
+        f=out_path,
         input_names=["image"],
         output_names=["logits"],
         dynamic_axes={"image": [0], "logits": [0]},
@@ -443,25 +534,30 @@ def export_onnx(model, out_path, cfg):
     return out_path
 
 
-def validate_onnx(model, onnx_path, loader, device):
-    """Compara PyTorch vs ONNX no mesmo lote; retorna diffs ou None se sem onnxruntime."""
-    try:
-        import onnxruntime as ort
-        import torch
-    except ImportError:
-        print("AVISO: onnxruntime ausente; validação ONNX pulada.", file=sys.stderr)
-        return None
-    model.eval()
+def validate_onnx(model, onnx_path, loader, device, cfg):
+    """Valida shape, diferença dos logits e IoU de argmax contra o ONNX."""
+    from tools.validate_onnx import (
+        DEFAULT_MAX_DIFF_TOL,
+        DEFAULT_MIN_ARGMAX_IOU,
+        validate_onnx as validate_export,
+    )
+
     images, _ = next(iter(loader))
-    with torch.no_grad():
-        torch_logits = model(pixel_values=images.to(device)).logits.detach().cpu().numpy()
-    session = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
-    image_np = images.numpy()
-    # Normalização já feita no dataset; o ONNX recebe o tensor normalizado.
-    onnx_logits = session.run(["logits"], {"image": image_np})[0]
-    if torch_logits.shape != onnx_logits.shape:
-        return {"max_abs_diff": None, "note": f"shape divergente: torch {torch_logits.shape} vs onnx {onnx_logits.shape}"}
-    return {"max_abs_diff": float(np.abs(torch_logits - onnx_logits).max())}
+    size = cfg["model"]["input"]["height"]
+    classes = cfg["model"]["num_classes"]
+    thresholds = cfg["export"]["validation_thresholds"]
+    export_model = make_onnx_export_model(model, size)
+    report = validate_export(
+        export_model,
+        onnx_path,
+        images.to(device),
+        max_diff_tol=thresholds.get("max_abs_diff", DEFAULT_MAX_DIFF_TOL),
+        min_argmax_iou=thresholds.get("min_argmax_iou", DEFAULT_MIN_ARGMAX_IOU),
+        expected_shape=(images.shape[0], classes, size, size),
+    )
+    if report["status"] == "skipped":
+        print(f"AVISO: validação ONNX não executada: {report['reason']}", file=sys.stderr)
+    return report
 
 
 # ---------------------------------------------------------------- smoke
@@ -504,6 +600,7 @@ def smoke(smoke_dir):
     weights = compute_class_weights(counts)
     assert len(weights) == NUM_CLASSES and all(w > 0 for w in weights), weights
     pred = load_mask(mask_dir / "scene_0001.png")
+    pred[pred == IGNORE_INDEX] = 0  # predições sempre são classes válidas; só o GT usa 255.
     # Predição perfeita exceto 1 px de tinta deslocado: IoU estrita cai,
     # tolerância de 2-3 px deve recuperar.
     pred_shifted = pred.copy()
@@ -535,8 +632,9 @@ def smoke(smoke_dir):
 
     try:
         import torch
-    except ImportError:
-        print("AVISO: torch ausente; smoke de loss torch com pixel ignorado pulado.", file=sys.stderr)
+        torch.nn
+    except (ImportError, AttributeError):
+        print("AVISO: PyTorch completo ausente; smoke de loss torch com pixel ignorado pulado.", file=sys.stderr)
     else:
         # ONNX export receives a CUDA model after Kaggle training. The dummy
         # input must follow that model's device; CPU is still the fallback for
@@ -598,7 +696,7 @@ def smoke(smoke_dir):
     assert contract["output_shape"][1] == NUM_CLASSES
     print(f"SMOKE OK: {len(pairs)} pares, pixels supervisionados {counts.tolist()}, ignorados {ignored}, pesos {[round(w, 2) for w in weights]}")
     print(f"SMOKE OK: ink IoU estrita {m['ink']['iou']:.3f}, recall com tolerância 2px {tol['radius_2px']['recall']:.3f}")
-    print("SMOKE OK: pixels 255 excluídos de loss, métricas e contagens; lote totalmente ignorado produz loss/gradiente zero")
+    print("SMOKE OK: pixels 255 excluídos de métricas e contagens; loss com pixel ignorado é verificada quando PyTorch está disponível")
     print("SMOKE OK: amostra ONNX acompanha o dispositivo do modelo (CPU/meta; CUDA se disponível no runtime)")
     print(f"SMOKE OK: contrato ONNX {contract}")
     return 0
@@ -650,8 +748,10 @@ def main(argv=None):
         args.data_dir, "train", cfg, augment=True, extra_pairs=real_pairs
     )
     val_ds = build_dataset(args.data_dir, "val", cfg, augment=False)
+    test_ds = build_dataset(args.data_dir, "test", cfg, augment=False)
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=tr["num_workers"])
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=tr["num_workers"])
+    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=tr["num_workers"])
     train_pairs = synthetic_train_pairs + real_pairs
     counts = pixel_counts(train_pairs)
     print(
@@ -664,17 +764,32 @@ def main(argv=None):
 
     model = build_model(cfg).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=tr["learning_rate"], weight_decay=tr["weight_decay"])
-    total_steps = epochs * max(len(train_loader), 1)
-    warmup = int(total_steps * tr["warmup_ratio"])
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(total_steps - warmup, 1))
+    accumulation_steps = max(int(tr.get("gradient_accumulation_steps", 1)), 1)
+    steps_per_epoch = math.ceil(len(train_loader) / accumulation_steps)
+    scheduler = warmup_cosine_scheduler(
+        optimizer,
+        total_steps=epochs * max(steps_per_epoch, 1),
+        warmup_ratio=tr["warmup_ratio"],
+    )
+    precision, amp_dtype, scaler = configure_mixed_precision(torch, device, tr)
+    print(f"precisão de treino: {precision}; acumulação: {accumulation_steps}")
     class_weights = torch.tensor(cfg["loss"]["cross_entropy_class_weights"], dtype=torch.float32, device=device)
 
     best_iou, bad_epochs = -1.0, 0
     history = []
     for epoch in range(epochs):
-        loss = train_one_epoch(model, train_loader, optimizer, class_weights, device)
+        loss = train_one_epoch(
+            model,
+            train_loader,
+            optimizer,
+            class_weights,
+            device,
+            scaler=scaler,
+            scheduler=scheduler,
+            accumulation_steps=accumulation_steps,
+            amp_dtype=amp_dtype,
+        )
         metrics = evaluate(model, val_loader, device)
-        scheduler.step()
         history.append({"epoch": epoch, "train_loss": loss, "val": metrics})
         print(f"época {epoch}: loss {loss:.4f}, val_mean_iou {metrics['mean_iou']:.4f}")
         torch.save(model.state_dict(), out_dir / "checkpoints" / "last.pt")
@@ -696,11 +811,12 @@ def main(argv=None):
     onnx_path = out_dir / cfg["export"]["onnx"]
     try:
         export_onnx(model, str(onnx_path), cfg)
-        onnx_check = validate_onnx(model, onnx_path, val_loader, device)
+        onnx_check = validate_onnx(model, onnx_path, val_loader, device, cfg)
     except Exception as exc:  # noqa: BLE001 - registrar, não perder o treino
         print(f"AVISO: exportação ONNX falhou ({exc}); métricas serão escritas sem ONNX.", file=sys.stderr)
         onnx_check = {"status": "failed", "error": str(exc)}
     final_metrics = evaluate(model, val_loader, device)
+    final_metrics["test"] = evaluate(model, test_loader, device)
     final_metrics["onnx_validation"] = onnx_check
     final_metrics["history"] = history
     final_metrics["train_pixel_counts"] = counts.tolist()
@@ -712,7 +828,10 @@ def main(argv=None):
         "synthetic_root": str(Path(args.data_dir)),
         "real_train_root": str(Path(args.real_train_dir)) if args.real_train_dir else None,
         "train_pair_counts": final_metrics["train_source_counts"],
-        "validation_and_test_source": "synthetic --data-dir only",
+        "validation_source": "synthetic --data-dir/val only",
+        "test_source": "synthetic --data-dir/test only; evaluated once after selecting best checkpoint",
+        "mixed_precision_used": precision,
+        "gradient_accumulation_steps": accumulation_steps,
     }
 
     (out_dir / "classes.json").write_text(json.dumps(CLASSES, indent=2), encoding="utf-8")

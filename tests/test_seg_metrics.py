@@ -92,6 +92,44 @@ def test_invalid_masks_raise():
         seg_metrics.evaluate(bad, gt)
 
 
+def test_ignore_index_255_is_excluded_from_metrics_and_ink_tolerance():
+    gt = _mask_with_all_classes()
+    gt[5:7, 5:7] = seg_metrics.IGNORE_INDEX
+    perfect = gt.copy()
+    wrong_in_ignored = gt.copy()
+    perfect[5:7, 5:7] = seg_metrics.BACKGROUND
+    wrong_in_ignored[5:7, 5:7] = seg_metrics.INK
+
+    baseline = seg_metrics.evaluate(perfect, gt)
+    changed = seg_metrics.evaluate(wrong_in_ignored, gt)
+    assert changed == baseline
+    assert baseline["ignored_px"] == 4
+    assert baseline["supervised_px"] == gt.size - 4
+    assert baseline["support_px"]["ink"] == 25
+
+    tol = seg_metrics.ink_tolerance_metrics(wrong_in_ignored, gt, tolerance_px=1)
+    assert tol["pred_ink"] == 25
+    assert tol["matched_pred"] == 25
+    assert tol["matched_gt"] == 25
+
+
+def test_all_ignored_ground_truth_is_rejected():
+    ignored = np.full((4, 4), seg_metrics.IGNORE_INDEX, dtype=np.uint8)
+    with pytest.raises(ValueError, match="sem pixels supervisionados"):
+        seg_metrics.evaluate(np.zeros_like(ignored), ignored)
+
+
+def test_streaming_confusion_metrics_match_full_evaluation():
+    gt = _mask_with_all_classes()
+    gt[:2, :2] = seg_metrics.IGNORE_INDEX
+    pred = gt.copy()
+    pred[:2, :2] = seg_metrics.BACKGROUND
+    pred[7, 7] = 0
+    assert seg_metrics.evaluate_confusion_matrix(seg_metrics.confusion_matrix(pred, gt), 4) == (
+        seg_metrics.evaluate(pred, gt)
+    )
+
+
 def test_scenario_battery_has_exactly_fifteen():
     assert len(seg_metrics.SCENARIOS) == 15
     ids = [s["id"] for s in seg_metrics.SCENARIOS]
@@ -228,6 +266,31 @@ def test_validate_onnx_dummy_degraded_is_flagged(monkeypatch):
     assert report["status"] == "degraded"
     assert report["degraded"] is True
     assert report["comparison"]["min_argmax_iou"] < 0.99
+
+
+def test_validate_onnx_expected_output_shape_is_enforced(monkeypatch):
+    mask = _mask_with_all_classes()
+    logits = _logits_from_mask(mask)
+    model, path = _install_fake_torch_and_ort(logits.copy())
+    report = validate_onnx.validate_onnx(
+        model, path, logits, expected_shape=(1, 4, 12, 10)
+    )
+    assert report["status"] == "degraded"
+    assert report["shape_matches"] is False
+    assert report["actual_shape"] == [1, 4, 10, 10]
+
+
+def test_validate_onnx_reports_onnx_shape_mismatch_as_degraded(monkeypatch):
+    mask = _mask_with_all_classes()
+    logits = _logits_from_mask(mask)
+    lower_resolution = logits[:, :, :5, :]
+    model, path = _install_fake_torch_and_ort(lower_resolution)
+    report = validate_onnx.validate_onnx(model, path, logits)
+    assert report["status"] == "degraded"
+    assert report["shape_matches"] is False
+    assert report["actual_shape"] == [1, 4, 10, 10]
+    assert report["onnx_shape"] == [1, 4, 5, 10]
+    assert report["comparison"] is None
 
 
 def test_validate_onnx_skipped_without_libraries(monkeypatch):

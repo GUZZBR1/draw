@@ -87,6 +87,7 @@ import numpy as np
 CLASSES = ("background", "paper", "hand", "ink")
 BACKGROUND, PAPER, HAND, INK = 0, 1, 2, 3
 NUM_CLASSES = len(CLASSES)
+IGNORE_INDEX = 255
 
 # Paleta de visualização (BGR, para cv2.imwrite): fundo preto, folha
 # cinza-clara, mão avermelhada, tinta azul. Cores distintas por
@@ -120,8 +121,8 @@ SCENARIOS = (
 SCENARIO_IDS = tuple(s["id"] for s in SCENARIOS)
 
 
-def _validate_masks(pred, gt):
-    """Valida forma e valores de duas máscaras de classes."""
+def _validate_masks(pred, gt, require_supervised=True):
+    """Valida predição e ground truth; pixels 255 do ground truth são ignorados."""
     pred = np.asarray(pred)
     gt = np.asarray(gt)
     if pred.shape != gt.shape:
@@ -131,12 +132,21 @@ def _validate_masks(pred, gt):
         )
     if pred.ndim != 2 or gt.ndim != 2:
         raise ValueError("máscaras devem ser 2D (H, W) com valores de classe")
-    for name, mask in (("pred", pred), ("gt", gt)):
-        if mask.min() < 0 or mask.max() >= NUM_CLASSES:
-            raise ValueError(
-                f"{name} contém classe fora de 0..{NUM_CLASSES - 1}; "
-                f"classes válidas: {list(CLASSES)}"
-            )
+    if pred.size == 0 or pred.min() < 0 or pred.max() >= NUM_CLASSES:
+        raise ValueError(
+            f"pred contém classe fora de 0..{NUM_CLASSES - 1}; "
+            f"classes válidas: {list(CLASSES)}"
+        )
+    valid_gt = (gt >= 0) & (gt < NUM_CLASSES)
+    ignored_gt = gt == IGNORE_INDEX
+    if np.any(~(valid_gt | ignored_gt)):
+        bad = np.unique(gt[~(valid_gt | ignored_gt)]).tolist()
+        raise ValueError(
+            f"gt contém valores inválidos: {bad}; permitidos: "
+            f"0..{NUM_CLASSES - 1} e {IGNORE_INDEX}=ignorado"
+        )
+    if require_supervised and not np.any(valid_gt):
+        raise ValueError("gt sem pixels supervisionados; todas as classes são 255")
     return pred, gt
 
 
@@ -145,8 +155,9 @@ def _tp_fp_fn(pred, gt):
     tp = np.zeros(NUM_CLASSES, dtype=np.int64)
     fp = np.zeros(NUM_CLASSES, dtype=np.int64)
     fn = np.zeros(NUM_CLASSES, dtype=np.int64)
+    valid = gt != IGNORE_INDEX
     for cls in range(NUM_CLASSES):
-        p = pred == cls
+        p = (pred == cls) & valid
         g = gt == cls
         tp[cls] = int(np.count_nonzero(p & g))
         fp[cls] = int(np.count_nonzero(p & ~g))
@@ -202,8 +213,58 @@ def precision_recall_per_class(pred, gt):
     return {"precision": precision, "recall": recall}
 
 
+def confusion_matrix(pred, gt):
+    """Matriz real × predito; pixels 255 do ground truth não entram."""
+    pred, gt = _validate_masks(pred, gt, require_supervised=False)
+    valid = gt != IGNORE_INDEX
+    encoded = gt[valid].astype(np.int64) * NUM_CLASSES + pred[valid].astype(np.int64)
+    return np.bincount(encoded, minlength=NUM_CLASSES**2).reshape(NUM_CLASSES, NUM_CLASSES)
+
+
+def evaluate_confusion_matrix(matrix, ignored_px=0):
+    """Reduz uma matriz real × predito às métricas agregadas do projeto."""
+    matrix = np.asarray(matrix, dtype=np.int64)
+    if matrix.shape != (NUM_CLASSES, NUM_CLASSES) or np.any(matrix < 0):
+        raise ValueError(f"matriz de confusão inválida: shape={matrix.shape}")
+    supervised_px = int(matrix.sum())
+    if supervised_px == 0:
+        raise ValueError("sem pixels supervisionados para calcular métricas")
+    tp = np.diag(matrix)
+    fp = matrix.sum(axis=0) - tp
+    fn = matrix.sum(axis=1) - tp
+    iou = {}
+    dice = {}
+    precision = {}
+    recall = {}
+    support_px = {}
+    for cls, name in enumerate(CLASSES):
+        iou[name] = _safe_div(tp[cls], tp[cls] + fp[cls] + fn[cls])
+        dice[name] = _safe_div(2 * tp[cls], 2 * tp[cls] + fp[cls] + fn[cls])
+        precision[name] = 1.0 if (tp[cls] + fp[cls] == 0 and tp[cls] + fn[cls] == 0) else (
+            float(tp[cls]) / (tp[cls] + fp[cls]) if tp[cls] + fp[cls] else 0.0
+        )
+        recall[name] = 1.0 if (tp[cls] + fn[cls] == 0 and tp[cls] + fp[cls] == 0) else (
+            float(tp[cls]) / (tp[cls] + fn[cls]) if tp[cls] + fn[cls] else 0.0
+        )
+        support_px[name] = int(matrix[cls].sum())
+    present = [name for cls, name in enumerate(CLASSES) if matrix[cls].sum() > 0]
+    return {
+        "iou": iou,
+        "dice": dice,
+        "precision": precision,
+        "recall": recall,
+        "mean_iou": float(np.mean([iou[name] for name in CLASSES])),
+        "mean_iou_present": float(np.mean([iou[name] for name in present])),
+        "mean_dice": float(np.mean([dice[name] for name in CLASSES])),
+        "accuracy": float(tp.sum() / supervised_px),
+        "support_px": support_px,
+        "supervised_px": supervised_px,
+        "ignored_px": int(ignored_px),
+    }
+
+
 def evaluate(pred, gt):
-    """Avaliação completa de uma predição contra o ground truth.
+    """Avaliação completa; pixels 255 do ground truth são ignorados.
 
     Retorna dict com ``iou``, ``dice``, ``precision``, ``recall``
     (todos por classe), ``mean_iou``, ``mean_iou_present`` (média só
@@ -211,22 +272,9 @@ def evaluate(pred, gt):
     ``accuracy`` (contexto apenas, nunca critério único).
     """
     pred, gt = _validate_masks(pred, gt)
-    iou = iou_per_class(pred, gt)
-    dice = dice_per_class(pred, gt)
-    pr = precision_recall_per_class(pred, gt)
-    present = [CLASSES[cls] for cls in range(NUM_CLASSES) if np.any(gt == cls)]
-    return {
-        "iou": iou,
-        "dice": dice,
-        "precision": pr["precision"],
-        "recall": pr["recall"],
-        "mean_iou": float(np.mean([iou[c] for c in CLASSES])),
-        "mean_iou_present": (
-            float(np.mean([iou[c] for c in present])) if present else 1.0
-        ),
-        "mean_dice": float(np.mean([dice[c] for c in CLASSES])),
-        "accuracy": float(np.mean(pred == gt)),
-    }
+    return evaluate_confusion_matrix(
+        confusion_matrix(pred, gt), ignored_px=int(np.count_nonzero(gt == IGNORE_INDEX))
+    )
 
 
 def _dilate_disk(mask, radius):
@@ -267,8 +315,9 @@ def ink_tolerance_metrics(pred, gt, tolerance_px=3):
     ``matched`` (pixels previstos dentro da tolerância).
     """
     pred, gt = _validate_masks(pred, gt)
-    pred_ink = pred == INK
-    gt_ink = gt == INK
+    valid = gt != IGNORE_INDEX
+    pred_ink = (pred == INK) & valid
+    gt_ink = (gt == INK) & valid
     n_pred = int(np.count_nonzero(pred_ink))
     n_gt = int(np.count_nonzero(gt_ink))
     if n_pred == 0 and n_gt == 0:
@@ -280,9 +329,11 @@ def ink_tolerance_metrics(pred, gt, tolerance_px=3):
             "pred_ink": 0,
             "gt_ink": 0,
             "matched": 0,
+            "matched_pred": 0,
+            "matched_gt": 0,
         }
-    matched_pred = int(np.count_nonzero(pred_ink & _dilate_disk(gt_ink, tolerance_px)))
-    matched_gt = int(np.count_nonzero(gt_ink & _dilate_disk(pred_ink, tolerance_px)))
+    matched_pred = int(np.count_nonzero(pred_ink & _dilate_disk(gt_ink, tolerance_px) & valid))
+    matched_gt = int(np.count_nonzero(gt_ink & _dilate_disk(pred_ink, tolerance_px) & valid))
     # Mesma convenção do módulo: 0/0 só vale 1.0 com ink ausente dos
     # dois lados; predição vazia com ink real vale 0.0.
     precision = 0.0 if (n_pred == 0 and n_gt > 0) else _safe_div(matched_pred, n_pred)
@@ -296,6 +347,8 @@ def ink_tolerance_metrics(pred, gt, tolerance_px=3):
         "pred_ink": n_pred,
         "gt_ink": n_gt,
         "matched": matched_pred,
+        "matched_pred": matched_pred,
+        "matched_gt": matched_gt,
     }
 
 

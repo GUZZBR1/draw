@@ -148,7 +148,8 @@ def run_onnx_model(onnx_path, dummy_input):
 
 def validate_onnx(torch_model, onnx_path, dummy_input,
                   max_diff_tol=DEFAULT_MAX_DIFF_TOL,
-                  min_argmax_iou=DEFAULT_MIN_ARGMAX_IOU):
+                  min_argmax_iou=DEFAULT_MIN_ARGMAX_IOU,
+                  expected_shape=None):
     """Valida um ONNX contra o modelo PyTorch original.
 
     Retorna um relatório dict, sempre com ``status``:
@@ -160,8 +161,10 @@ def validate_onnx(torch_model, onnx_path, dummy_input,
       ``reason``). Skipped NÃO é validação: não entregar o ONNX
       como validado com base nele.
 
-    Os demais campos (``comparison``, ``degraded``, ``thresholds``)
-    só existem quando a comparação foi feita.
+    ``expected_shape`` pode fixar o shape de saída esperado; use ``None``
+    em dimensões dinâmicas. Uma divergência de shape também retorna
+    ``status: "degraded"``. Os campos de comparação só existem quando a
+    execução PyTorch e ONNX foi possível.
     """
     try:
         torch_out = run_torch_model(torch_model, dummy_input)
@@ -171,15 +174,47 @@ def validate_onnx(torch_model, onnx_path, dummy_input,
         onnx_out = run_onnx_model(onnx_path, dummy_input)
     except RuntimeError as exc:
         return {"status": "skipped", "reason": str(exc), "degraded": None}
+    actual_shape = tuple(torch_out.shape)
+    onnx_shape = tuple(onnx_out.shape)
+    def matches_expected(shape):
+        return expected_shape is None or (
+            len(shape) == len(expected_shape)
+            and all(expected is None or actual == expected
+                    for actual, expected in zip(shape, expected_shape))
+        )
+    shape_matches = (
+        actual_shape == onnx_shape
+        and matches_expected(actual_shape)
+        and matches_expected(onnx_shape)
+    )
+    if not shape_matches:
+        return {
+            "status": "degraded",
+            "degraded": True,
+            "comparison": None,
+            "expected_shape": list(expected_shape) if expected_shape is not None else None,
+            "actual_shape": list(actual_shape),
+            "onnx_shape": list(onnx_shape),
+            "shape_matches": False,
+            "thresholds": {
+                "max_diff_tol": max_diff_tol,
+                "min_argmax_iou": min_argmax_iou,
+            },
+        }
     comparison = compare_model_outputs(torch_out, onnx_out)
     degraded = bool(
         comparison["max_abs_diff"] > max_diff_tol
         or comparison["min_argmax_iou"] < min_argmax_iou
+        or not shape_matches
     )
     return {
         "status": "degraded" if degraded else "ok",
         "degraded": degraded,
         "comparison": comparison,
+        "expected_shape": list(expected_shape) if expected_shape is not None else None,
+        "actual_shape": list(actual_shape),
+        "onnx_shape": list(onnx_shape),
+        "shape_matches": shape_matches,
         "thresholds": {
             "max_diff_tol": max_diff_tol,
             "min_argmax_iou": min_argmax_iou,
