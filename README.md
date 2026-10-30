@@ -283,7 +283,7 @@ O kernel da v3 levou 44,7 minutos numa T4. O kernel da v2 levou 3 horas e 51 min
 - `bridge/` tem a ponte de captura no Windows. Um `ffmpeg.exe` no Windows serve a webcam como stream MJPEG e o Draw consome pelo `--source`. O passo a passo fica em [bridge/README.md](bridge/README.md).
 - `scripts/` tem os scripts de instalação. Hoje guarda `setup_camera_wsl.sh`, o instalador da câmera do WSL.
 - `tests/` tem os testes sem webcam. Hoje guarda `selftest.py`, que valida detecção, homografia, extração de tinta e o portão de textura em cenas sintéticas.
-- `tools/` tem as ferramentas de apoio. `label_frames.py` rotula frames capturados. `eval_real_frames.py` é o harness dos frames reais, o portão de qualquer modelo neural.
+- `tools/` tem as ferramentas de apoio do projeto. As ferramentas de treino (`label_frames.py`, `eval_real_frames.py` e outras) ficaram na branch `training-zone`.
 - `verification/` é o registro da verificação formal limitada da v0. Ele guarda a skill do projeto e o script que prova propriedades da homografia com sondas numéricas. É um registro histórico de uma etapa concluída, não uma etapa do pipeline.
 - `docs/` tem a documentação de instalação, com o guia do Windows com WSL.
 - `main.py` é o ponto de entrada. Ele só chama o app.
@@ -330,12 +330,7 @@ A verificação formal limitada roda com o comando abaixo.
 python verification/run_verification.py
 ```
 
-Para rotular frames capturados:
-
-```bash
-python tools/label_frames.py captures/frames dataset/rotulos```
-
-A saída é um `labels.json` com os frames rotulados e os rejeitados. Cada frame rotulado ganha uma imagem de revisão na subpasta `overlays`. Os frames de origem nunca são modificados.
+Para rotular frames capturados, use a branch `training-zone`: ela guarda `tools/label_frames.py` e `captures/` fora da main.
 
 ## v0.2 — traço vetorial
 
