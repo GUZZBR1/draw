@@ -328,8 +328,38 @@ def _video_nodes():
 
 
 def run_check(source=0):
-    """Validacao da camera local, porta por porta. Retorna 0 ou 1."""
+    """Validacao da fonte de video porta por porta. Retorna 0 ou 1."""
     print(f"PASS: OpenCV disponivel. Versao {cv2.__version__}.")
+    parsed = parse_source(source)
+
+    if not isinstance(parsed, int):
+        capture = cv2.VideoCapture(parsed)
+        if not capture.isOpened():
+            print(
+                f"FAIL: nao consegui abrir a fonte {parsed!r}. "
+                "Confira o caminho ou URL e se a transmissao esta ativa."
+            )
+            return 1
+        frame = None
+        deadline = time.time() + 3.0
+        while time.time() < deadline:
+            ok, candidate = capture.read()
+            if ok and candidate is not None:
+                frame = candidate
+                break
+            time.sleep(0.05)
+        capture.release()
+        if frame is None:
+            print(
+                f"FAIL: {parsed!r} abriu, mas nenhum quadro chegou em "
+                "3 segundos."
+            )
+            return 1
+        print(
+            f"PASS: quadro lido de {parsed!r}. "
+            f"Formato (altura, largura, canais): {frame.shape}."
+        )
+        return 0
 
     nodes = _video_nodes()
     if not nodes:
@@ -346,7 +376,18 @@ def run_check(source=0):
     print(f"PASS: dispositivos de video encontrados: {', '.join(nodes)}.")
 
     all_ok = True
-    node = nodes[0]
+    node = f"/dev/video{parsed}"
+    if node not in nodes:
+        print(
+            f"FAIL: {node} nao existe neste sistema "
+            f"(disponiveis: {', '.join(nodes)})."
+        )
+        first_idx = nodes[0][len("/dev/video"):]
+        print(
+            f"  Correcao: use --source {first_idx} ou confira o indice "
+            "da webcam desejada."
+        )
+        return 1
 
     access = os.access(node, os.R_OK | os.W_OK)
     group_note = ""
@@ -379,8 +420,7 @@ def run_check(source=0):
         print('  Correcao nesta sessao: sg video -c "python3 main.py".')
         all_ok = False
 
-    index = int(node[len("/dev/video"):])
-    capture = cv2.VideoCapture(index)
+    capture = cv2.VideoCapture(parsed)
     if not capture.isOpened():
         print(
             f"FAIL: nao consegui abrir {node}. Outro programa "
@@ -898,8 +938,7 @@ def main():
     parser.add_argument("--save-dir", default="captures")
     args = parser.parse_args()
     if args.check:
-        parsed = parse_source(args.source)
-        sys.exit(run_check(parsed if isinstance(parsed, int) else 0))
+        sys.exit(run_check(parse_source(args.source)))
     neural_model = None
     if args.neural is not None:
         if args.markers:
