@@ -117,25 +117,18 @@ def extract_ink(warped, clear_markers=False):
 _SESSION_BASE_SAMPLES = 12
 _SESSION_INK_DELTA = 12.0
 
-# Limiares do realinhamento a referencia, medidos no laboratorio
+# Limiar do realinhamento a referencia, medido no laboratorio
 # (draw-lab/session-align/REPORT.md e as rodadas de replay de
 # 2026-10-30). A resposta da correlacao de fase NAO serve de
 # confianca em producao: ela mede a fracao de energia espectral no
 # pico, e tinta nova no quadro a derruba (0,95 sem traco novo para
 # 0,65 com 8 tracos, na pagina real), embora a estimativa de
 # deslocamento continue solida (erro ~0,2 px em todos esses
-# casos). O residuo pos-correcao tambem NAO serve, por tres
-# medicoes seguidas: mao, antebraco, sombra e flexao da pagina
-# divergem da referencia tanto quanto um movimento real da folha
-# (ver o historico no docstring de observe). O que resta de
-# confiavel e a propria estimativa: deslocamento acima de 10 px
-# nao e jitter, e a pagina que andou de verdade (ou virou).
-# Falha so conta quando as estimativas concordam entre si
-# (_ALIGN_AGREE_PX): o wrap da correlacao espica sozinho em
-# 2,8 por cento das amostras do replay, sempre espalhado.
+# casos). Acima de 10 px a estimativa nao e aplicada: pode ser
+# movimento real ou wrap da correlacao, e nos dois casos chutar
+# um warp de 40+ px e pior que nao corrigir. Nenhum numero daqui
+# bloqueia a sessao; portoes foram removidos (ver observe).
 _ALIGN_MAX_SHIFT_PX = 10.0
-_ALIGN_FAIL_FRAMES = 5
-_ALIGN_AGREE_PX = 5.0
 _BASE_MIN_VISIBLE = 1
 _ALIGN_WINDOW = None
 
@@ -203,9 +196,6 @@ class SessionBaselineInk:
         self.reference = None
         self._ref_median = None
         self._base_blur = None
-        self.alignment_lost = False
-        self._align_failures = 0
-        self._last_bad_shift = None
 
     @property
     def ready(self):
@@ -268,50 +258,26 @@ class SessionBaselineInk:
         Antes do delta, o quadro e realinhado a referencia por
         correlacao de fase: sem isso, um deslocamento de 2 px do
         caderno transforma a pauta em falsa tinta (medido: 1.362 px
-        sem correcao, 0 com). O unico portao que restou e o do
-        deslocamento impossivel: estimativa de fase alem de
-        _ALIGN_MAX_SHIFT_PX por _ALIGN_FAIL_FRAMES quadros
-        seguidos, com estimativas concordando entre si (empurrao
-        de verdade estima consistente; o wrap da correlacao, que
-        espica em 2,8 por cento das amostras reais, espalha).
-
-        O portao por residuo estrutural MORREU em 2026-10-30,
-        depois de tres construcoes medidas (escala fina, escala
-        grossa, escala grossa com base por mediana de
-        visibilidade): nas tres, mao, antebraco fora da mascara,
-        sombra projetada e a pagina flexionando produzem tanta
-        divergencia contra a referencia quanto um movimento real
-        da folha, e o portao matou tres sessoes boas (a do Lucas
-        ao vivo e duas de replay) sem nunca pegar um evento real.
-        A premissa de que residuo separa "a folha mexeu" de "algo
-        cobriu a folha" e falsa nesta cena. Quem filtra o lixo
-        transitorio do delta (sombra que passa, braco que mexe) e
-        o acumulador com histerese e veto de visibilidade.
+        sem correcao, 0 com). Estimativa alem de
+        _ALIGN_MAX_SHIFT_PX nao e aplicada (a correlacao da o wrap
+        e o quadro entra como esta), mas NADA aqui bloqueia a
+        sessao: nao existe portao, contador de falhas nem banner
+        de alinhamento. Portoes de alinhamento foram removidos em
+        2026-10-30 depois de matarem sessoes boas ao vivo e em
+        replay (residuo estrutural nao separa "a folha mexeu" de
+        "algo cobriu a folha": mao, antebraco, sombra e flexao
+        divergem tanto quanto movimento real). Se a folha mexe de
+        verdade, o canvas degrada e quem decide recomecar e o
+        usuario, com a tecla C. Quem filtra o lixo transitorio do
+        delta e o acumulador com histerese e veto de visibilidade.
         """
         shape = warped.shape[:2]
-        if not self.ready or self.alignment_lost:
+        if not self.ready:
             return np.zeros(shape, dtype=np.uint8)
         gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
         gray = gray.astype(np.float32)
-        aligned, est, _response, ok = align_to_reference(
+        aligned, _est, _response, _ok = align_to_reference(
             self.reference, gray)
-        if not ok:
-            if (
-                self._last_bad_shift is not None
-                and float(np.hypot(
-                    est[0] - self._last_bad_shift[0],
-                    est[1] - self._last_bad_shift[1],
-                )) <= _ALIGN_AGREE_PX
-            ):
-                self._align_failures += 1
-            else:
-                self._align_failures = 1
-            self._last_bad_shift = est
-            if self._align_failures >= _ALIGN_FAIL_FRAMES:
-                self.alignment_lost = True
-            return np.zeros(shape, dtype=np.uint8)
-        self._align_failures = 0
-        self._last_bad_shift = None
         cur_median = float(np.median(aligned))
         gain = 1.0
         if cur_median > 1.0 and self._ref_median is not None:
