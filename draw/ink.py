@@ -31,6 +31,7 @@ apagaria desenho de verdade perto dos cantos da página.
 """
 
 from collections import deque
+import time
 
 import cv2
 import numpy as np
@@ -132,6 +133,19 @@ class InkAccumulator:
     artefato de pauta abaixo de 0,3, então enter=0,45 separa os
     dois; exit=0,20 segura o traço através da cintilação sem segurar
     o artefato, cuja fração desaba quando a luz muda.
+
+    Além do canvas, o acumulador guarda dois carimbos por pixel,
+    first_seen_ms e last_update_ms (uint32, 850×1200 cada, 0 =
+    sem carimbo): quando o pixel entrou no canvas e quando a
+    evidência dele se renovou pela última vez. É a ordem temporal
+    dos traços que o raster sozinho perde, e é o que a vetorização
+    consome para ordenar as polilinhas. A época dos carimbos é o
+    relógio monotônico em milissegundos (time.monotonic), e o
+    instante que vale é o de CAPTURA do frame, passado por quem
+    chama em update(t_capture_ms=...): carimbo de processamento
+    mediria a fila do pipeline, não o desenho. A manutenção dos
+    carimbos só acontece em pixel visível no frame corrente:
+    pixel sob a mão congela os dois carimbos junto com o estado.
     """
 
     def __init__(
@@ -159,9 +173,29 @@ class InkAccumulator:
         self._ink_counts = np.zeros(self._shape, dtype=np.int16)
         self._vis_counts = np.zeros(self._shape, dtype=np.int16)
         self.state = np.zeros(self._shape, dtype=bool)
+        self._first_seen_ms = np.zeros(self._shape, dtype=np.uint32)
+        self._last_update_ms = np.zeros(self._shape, dtype=np.uint32)
 
-    def update(self, ink_mask, visible_mask=None):
-        """Alimenta uma observação e retorna o canvas (255 = tinta)."""
+    def first_seen_ms(self):
+        """Cópia do plano de primeira vista (uint32, ms monotônico)."""
+        return self._first_seen_ms.copy()
+
+    def last_update_ms(self):
+        """Cópia do plano de última atualização (uint32, ms monotônico)."""
+        return self._last_update_ms.copy()
+
+    def update(self, ink_mask, visible_mask=None, t_capture_ms=None):
+        """Alimenta uma observação e retorna o canvas (255 = tinta).
+
+        t_capture_ms é o instante de captura do frame, em ms do
+        relógio monotônico. Se None, usa o instante de processamento
+        (monotônico de agora) e os carimbos passam a medir
+        processamento, não captura: o app deve passar o de captura.
+        """
+        if t_capture_ms is None:
+            t_ms = int(time.monotonic() * 1000)
+        else:
+            t_ms = int(t_capture_ms)
         ink = ink_mask > 0
         if visible_mask is None:
             visible = np.ones(ink.shape, dtype=bool)
@@ -189,4 +223,27 @@ class InkAccumulator:
         clear = judged & self.state & (fraction <= self._exit)
         self.state[enter] = True
         self.state[clear] = False
+        self._update_stamps(evidence, visible, t_ms)
         return (self.state * 255).astype(np.uint8)
+
+    def _update_stamps(self, evidence, visible, t_ms):
+        """Mantém first_seen/last_update sobre o estado já atualizado.
+
+        Semântica, só em pixel visível neste frame: pixel de tinta
+        sem carimbo (entrou agora, ou entrou coberto e só agora
+        ficou visível) ganha first_seen = last_update = t; pixel de
+        tinta cuja evidência (a mesma dilatada que alimenta os
+        votos) se renova neste frame tem last_update = t; pixel fora
+        do canvas zera os dois. Pixel não visível não entra em
+        nenhum dos três casos: sob a mão, os carimbos congelam.
+        """
+        t_val = np.uint32(t_ms & 0xFFFFFFFF)
+        ink_visible = self.state & visible
+        fresh = ink_visible & (self._first_seen_ms == 0)
+        self._first_seen_ms[fresh] = t_val
+        self._last_update_ms[fresh] = t_val
+        renewed = ink_visible & evidence
+        self._last_update_ms[renewed] = t_val
+        gone = visible & ~self.state
+        self._first_seen_ms[gone] = 0
+        self._last_update_ms[gone] = 0
