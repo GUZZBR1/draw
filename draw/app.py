@@ -38,6 +38,7 @@ from . import diagnose as diagnose_module
 from . import hand as hand_module
 from . import ink as ink_module
 from . import light as light_module
+from . import light_guard as light_guard_module
 from . import neural as neural_module
 from . import paper as paper_module
 from . import sequence as sequence_module
@@ -228,6 +229,13 @@ def _ink_input(warped, light_normalize="off"):
     return light_module.normalize_light(warped, light_normalize)
 
 
+def detect_sheet_with_light_guard(frame, light_normalize="off"):
+    """Delega para draw/light_guard.py (off primeiro, background depois)."""
+    return light_guard_module.detect_sheet_with_light_guard(
+        frame, light_normalize
+    )
+
+
 def _open_capture(source, **kwargs):
     """Abre via draw/capture.py, com backends, timeout e erro especifico."""
     return capture_module.open_capture(source, **kwargs)
@@ -339,16 +347,21 @@ def run(source=0, save_dir="captures", markers_mode=False, width=None,
             "desconhecida no canvas acumulativo."
         )
 
+    winning_light = {"mode": light_normalize}
+
     def detect_sheet(frame):
         if neural_detector is not None:
             corners, verdict = (
                 neural_detector.detect_sheet_with_confidence(frame)
             )
             if corners is not None:
+                winning_light["mode"] = light_normalize
                 return corners, verdict
-        return paper_module.detect_sheet_with_confidence(
-            _detection_frame(frame, light_normalize)
+        corners, verdict, winning = detect_sheet_with_light_guard(
+            frame, light_normalize
         )
+        winning_light["mode"] = winning
+        return corners, verdict
     parsed = parse_source(source)
     capture = capture_module.ReconnectingCapture(
         parsed, attempts=reconnect_attempts, width=width, height=height,
@@ -564,7 +577,7 @@ def run(source=0, save_dir="captures", markers_mode=False, width=None,
                     2,
                 )
             ink_mask = ink_module.extract_ink(
-                _ink_input(warped, light_normalize),
+                _ink_input(warped, winning_light["mode"]),
                 clear_markers=markers_mode,
             )
             if tracker is not None:
