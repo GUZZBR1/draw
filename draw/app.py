@@ -778,20 +778,12 @@ def run(source=0, save_dir="captures", markers_mode=False, width=None,
                             ink_warped, visible)
                 else:
                     observed = ink_source(ink_warped)
-                # Com o alinhamento perdido, o canvas CONGELA: o
-                # acumulador nao recebe zeros (receber zeros decai
-                # os votos e apaga o desenho ja capturado, medido
-                # no replay de 2026-10-30: 7.329 px a 0 em ~1,5 s).
-                # O desenho so some quando o usuario aperta C e
-                # comeca outra pagina base, por escolha dele.
-                if not (session_ink is not None
-                        and session_ink.alignment_lost):
-                    accumulated_canvas = ink_module.render_canvas(
-                        ink_accumulator.update(
-                            observed, visible,
-                            t_capture_ms=frame_capture_ms
-                        )
+                accumulated_canvas = ink_module.render_canvas(
+                    ink_accumulator.update(
+                        observed, visible,
+                        t_capture_ms=frame_capture_ms
                     )
+                )
 
         status = frame.copy()
         if markers_mode:
@@ -832,13 +824,7 @@ def run(source=0, save_dir="captures", markers_mode=False, width=None,
                 else:
                     status_text = "Folha detectada"
                     status_color = (0, 255, 0)
-                if session_ink is not None and session_ink.alignment_lost:
-                    status_text = (
-                        "Perdi o alinhamento com a pagina base: "
-                        "aperte C para refazer a pagina base"
-                    )
-                    status_color = (0, 0, 255)
-                elif session_ink is not None and not session_ink.ready:
+                if session_ink is not None and not session_ink.ready:
                     if baseline_armed:
                         status_text = (
                             "Folha detectada: capturando a pagina "
