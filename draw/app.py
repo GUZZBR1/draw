@@ -419,6 +419,53 @@ def _fit(image, max_h=700):
     return cv2.resize(image, (int(w * scale), max_h))
 
 
+_BLANK_SHEET = None
+
+
+def _blank_sheet():
+    global _BLANK_SHEET
+    if _BLANK_SHEET is None:
+        _BLANK_SHEET = ink_module.render_canvas(
+            np.zeros(
+                (ink_module.config.PAPER_H, ink_module.config.PAPER_W),
+                dtype=np.uint8,
+            )
+        )
+    return _BLANK_SHEET
+
+
+def _compose_view(camera_img, canvas_img):
+    """Janela unica: camera a esquerda, folha ao vivo a direita.
+
+    A folha ao vivo e o canvas digital (fundo branco, tinta preta) na
+    mesma janela e na mesma altura da camera: o traco no papel e o
+    traco digital aparecem lado a lado, sem janelas separadas.
+    """
+    target_h = 640
+    cam = _fit(camera_img, target_h)
+    sheet = _fit(canvas_img, target_h)
+    if cam.shape[0] != sheet.shape[0]:
+        h = min(cam.shape[0], sheet.shape[0])
+        cam = cv2.resize(cam, (int(cam.shape[1] * h / cam.shape[0]), h))
+        sheet = cv2.resize(
+            sheet, (int(sheet.shape[1] * h / sheet.shape[0]), h))
+    cv2.putText(
+        sheet,
+        "folha ao vivo",
+        (12, 26),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        (140, 140, 140),
+        1,
+    )
+    divider = np.full((cam.shape[0], 6, 3), (60, 60, 60), dtype=np.uint8)
+    view = np.hstack([cam, divider, sheet])
+    if view.shape[1] > 1600:
+        scale = 1600 / view.shape[1]
+        view = cv2.resize(view, (1600, int(view.shape[0] * scale)))
+    return view
+
+
 def _detect_sheet_combined(frame, neural_detector):
     """Detecção do modo sem marcadores: neural primário, clássico reserva.
 
@@ -654,7 +701,12 @@ def run(
                 (0, 0, 255),
                 2,
             )
-            cv2.imshow("Draw - camera", _fit(status, 700))
+            panel = (
+                accumulated_canvas
+                if accumulated_canvas is not None
+                else _blank_sheet()
+            )
+            cv2.imshow("Draw", _compose_view(status, panel))
         else:
             if not markers_mode:
                 if tracker.verdict == "blank_maybe":
@@ -682,9 +734,7 @@ def run(
             else:
                 ink_mask = ink_source(warped)
                 canvas = ink_module.render_canvas(ink_mask)
-            cv2.imshow("Draw - camera", _fit(status, 700))
-            cv2.imshow("Draw - papel (vista de cima)", _fit(warped, 700))
-            cv2.imshow("Draw - canvas digital", _fit(canvas, 700))
+            cv2.imshow("Draw", _compose_view(status, canvas))
 
             key = cv2.waitKey(1) & 0xFF
             if key == ord("s"):
