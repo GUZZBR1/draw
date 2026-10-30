@@ -798,7 +798,13 @@ def run(source=0, save_dir="captures", markers_mode=False, width=None,
                 else:
                     status_text = "Folha detectada"
                     status_color = (0, 255, 0)
-                if session_ink is not None and not session_ink.ready:
+                if session_ink is not None and session_ink.alignment_lost:
+                    status_text = (
+                        "Folha mexeu demais: aperte C para nova "
+                        "pagina base"
+                    )
+                    status_color = (0, 0, 255)
+                elif session_ink is not None and not session_ink.ready:
                     if baseline_armed:
                         status_text = (
                             "Folha detectada: capturando a pagina "
