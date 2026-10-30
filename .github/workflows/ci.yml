@@ -21,4 +21,6 @@ jobs:
       - name: Run synthetic selftest
         run: python tests/selftest.py
       - name: Run pytest
-        run: python -m pytest tests/test_pipeline.py -q
+        run: python -m pytest tests/ -q
+      - name: Run geometric verification
+        run: python verification/run_verification.py
