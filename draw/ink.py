@@ -31,6 +31,7 @@ apagaria desenho de verdade perto dos cantos da página.
 """
 
 from collections import deque
+from fractions import Fraction
 import time
 
 import cv2
@@ -354,6 +355,28 @@ class InkAccumulator:
         self._window = window
         self._enter = enter
         self._exit = exit
+        # Julgamento da histerese em inteiro. enter e exit viram
+        # fracoes exatas (0,45 = 9/20; 0,20 = 1/5) e a comparacao
+        # ink/vis >= enter vira ink*escala >= coef*vis, sem a
+        # divisao float32 de pagina cheia. Limiar sem fracao exata
+        # de denominador pequeno falha alto na construcao em vez de
+        # derivar em silencio. Equivalencia com a forma float
+        # varrida par a par em draw-lab/bottleneck-2026-10-30/
+        # ink-optim/check_predicates.py.
+        enter_frac = Fraction(float(enter)).limit_denominator(100)
+        exit_frac = Fraction(float(exit)).limit_denominator(100)
+        if float(enter_frac) != float(enter) or float(
+            exit_frac
+        ) != float(exit):
+            raise ValueError(
+                "enter/exit precisam de fracao exata de denominador "
+                "<= 100 para o julgamento inteiro"
+            )
+        self._count_scale = (
+            enter_frac.denominator * exit_frac.denominator
+        )
+        self._enter_coef = enter_frac.numerator * exit_frac.denominator
+        self._exit_coef = exit_frac.numerator * enter_frac.denominator
         self._min_visible = min_visible
         size = 2 * tolerance + 1
         self._kernel = np.ones((size, size), dtype=np.uint8)
@@ -409,12 +432,13 @@ class InkAccumulator:
         self._ink_counts += evidence
         self._vis_counts += visible
         judged = self._vis_counts >= self._min_visible
-        fraction = np.zeros(self._shape, dtype=np.float32)
-        fraction[judged] = self._ink_counts[judged] / np.maximum(
-            self._vis_counts[judged], 1
-        )
-        enter = judged & ~self.state & (fraction >= self._enter)
-        clear = judged & self.state & (fraction <= self._exit)
+        # Mesmo denominador efetivo da forma float, max(vis, 1):
+        # pixel nunca visivel na janela tem fracao 0 nos dois
+        # mundos, e a multiplicacao cruzada nao degenera nele.
+        vis = np.maximum(self._vis_counts, 1).astype(np.int32)
+        scaled = self._ink_counts.astype(np.int32) * self._count_scale
+        enter = judged & ~self.state & (scaled >= vis * self._enter_coef)
+        clear = judged & self.state & (scaled <= vis * self._exit_coef)
         self.state[enter] = True
         self.state[clear] = False
         self._update_stamps(evidence, visible, t_ms)
@@ -438,6 +462,13 @@ class InkAccumulator:
         self._last_update_ms[fresh] = t_val
         renewed = ink_visible & evidence
         self._last_update_ms[renewed] = t_val
-        gone = visible & ~self.state
+        # Quem saiu zera os dois, mas so onde ha carimbo para
+        # zerar: a pagina inteira fora do canvas nao precisa das
+        # duas escritas de zero. Restringir por first_seen basta,
+        # porque last_update != 0 implica first_seen != 0: os
+        # dois nascem juntos no fresh, e o renewed so escreve em
+        # pixel de tinta visivel, que ou ja tinha first_seen ou
+        # e fresh deste mesmo frame.
+        gone = visible & ~self.state & (self._first_seen_ms != 0)
         self._first_seen_ms[gone] = 0
         self._last_update_ms[gone] = 0
