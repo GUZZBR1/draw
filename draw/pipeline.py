@@ -351,7 +351,9 @@ class DrawPipeline:
                 return mask
         return ink_module.extract_ink(warped_img)
 
-    def process_frame(self, frame, t_capture_ms=None, now_s=None):
+    def process_frame(
+        self, frame, t_capture_ms=None, now_s=None, canvas_buffer=None
+    ):
         """Processa um quadro BGR e devolve `FrameResult`."""
         if now_s is None:
             now_s = time.monotonic()
@@ -374,7 +376,7 @@ class DrawPipeline:
                     tracker_event=None,
                 )
             ink_mask = ink_module.extract_ink(warped, clear_markers=True)
-            canvas = ink_module.render_canvas(ink_mask)
+            canvas = ink_module.render_canvas(ink_mask, out=canvas_buffer)
             self.accumulated_canvas = canvas
             return FrameResult(
                 sheet_present=True,
@@ -511,7 +513,9 @@ class DrawPipeline:
         consolidated = self.ink_accumulator.update(
             observed, visible, t_capture_ms=t_capture_ms
         )
-        self.accumulated_canvas = ink_module.render_canvas(consolidated)
+        self.accumulated_canvas = ink_module.render_canvas(
+            consolidated, out=canvas_buffer
+        )
 
         return FrameResult(
             sheet_present=True,
@@ -525,7 +529,10 @@ class DrawPipeline:
             tracker_event=tracker_event,
         )
 
-    def save_artifacts(self, save_dir, canvas_override=None, ts=None):
+    def save_artifacts(
+        self, save_dir, canvas_override=None, ts=None,
+        png_writer=None, on_png_saved=None,
+    ):
         """Salva `canvas_<ts>.png` e, quando há carimbos, `canvas_<ts>_stamps.npz`."""
         canvas = (
             canvas_override
@@ -538,7 +545,10 @@ class DrawPipeline:
         save_path.mkdir(parents=True, exist_ok=True)
         stamp = int(time.time()) if ts is None else int(ts)
         png_path = save_path / f"canvas_{stamp}.png"
-        cv2.imwrite(str(png_path), canvas)
+        if png_writer is None:
+            cv2.imwrite(str(png_path), canvas)
+        else:
+            png_writer.save(png_path, canvas, on_png_saved)
 
         npz_path = None
         if not self.markers_mode and bool(self.ink_accumulator.state.any()):
