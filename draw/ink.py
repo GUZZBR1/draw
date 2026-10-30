@@ -413,15 +413,21 @@ class SessionBaselineInk:
         return ink.view(np.uint8) * np.uint8(255)
 
 
-def render_canvas(ink_mask):
-    """Renderiza o canvas digital: fundo branco, tinta preta."""
-    mask_u8 = (
-        ink_mask.view(np.uint8)
-        if ink_mask.dtype == bool
-        else ink_mask
-    )
-    _, inv = cv2.threshold(mask_u8, 0, 255, cv2.THRESH_BINARY_INV)
-    return cv2.cvtColor(inv, cv2.COLOR_GRAY2BGR)
+def render_canvas(ink_mask, out=None):
+    """Renderiza canvas branco com tinta preta, reutilizando ``out`` se dado."""
+    if out is None:
+        canvas = np.full((config.PAPER_H, config.PAPER_W, 3), 255, dtype=np.uint8)
+    else:
+        expected_shape = (config.PAPER_H, config.PAPER_W, 3)
+        if out.shape != expected_shape or out.dtype != np.uint8:
+            raise ValueError(
+                f"out de render_canvas precisa ser {expected_shape} uint8, "
+                f"veio {out.shape} {out.dtype}"
+            )
+        canvas = out
+        canvas.fill(255)
+    canvas[ink_mask > 0] = (0, 0, 0)
+    return canvas
 
 
 class InkAccumulator:
