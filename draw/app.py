@@ -584,6 +584,15 @@ def run(
     auto_capture = False
     restart_reference = False
     baseline_armed = False
+    # Geometria da tinta CONGELADA na tecla C: os warps da sessao
+    # usam estes cantos, nao os do rastreador ao vivo. Medido nos
+    # frames reais de 2026-10-30: sobre o caderno aberto, o ajuste
+    # do detector oscila ate 314 px entre frames de uma cena
+    # parada; com a geometria viva, o warp teleporta e nenhuma
+    # referencia sobrevive. O rastreador segue vivo para o
+    # contorno verde e os banners; a tinta vive na geometria do C.
+    session_corners = None
+    freeze_pending = False
     loop_frames = 0
 
     def save_raw_frame(img):
@@ -661,6 +670,8 @@ def run(
             )
             if tracker_event == "drop":
                 ink_session_open = False
+                session_corners = None
+                freeze_pending = False
 
             frame_number += 1
             warped = (
@@ -676,44 +687,67 @@ def run(
                     if session_ink is not None:
                         session_ink.reset()
                         baseline_armed = False
+                        session_corners = None
+                        freeze_pending = False
                     corner_history.clear()
                     ink_session_open = True
                 if restart_reference:
                     # Tecla C: novo ponto zero da sessao. O canvas
                     # acumulado zera junto, porque a pagina base nova
                     # redefine o que conta como traco desta sessao.
+                    # A geometria congela nos cantos deste momento.
                     restart_reference = False
                     ink_accumulator.reset()
                     session_ink.reset()
                     baseline_armed = True
+                    freeze_pending = True
                 corner_history.append(tracker.corners.copy())
                 ink_corners = np.median(
                     np.stack(corner_history), axis=0
                 ).astype(np.float32)
-                ink_warped = paper_module.warp_sheet(frame, ink_corners)
-                if session_ink is not None:
-                    if not session_ink.ready:
-                        if baseline_armed:
-                            session_ink.add_sample(ink_warped)
-                        observed = np.zeros(
-                            ink_warped.shape[:2], dtype=np.uint8)
-                    else:
-                        observed = session_ink.observe(ink_warped)
-                else:
-                    observed = ink_source(ink_warped)
+                if freeze_pending:
+                    session_corners = ink_corners.copy()
+                    freeze_pending = False
+                warp_corners = (
+                    session_corners
+                    if session_ink is not None
+                    and session_corners is not None
+                    else ink_corners
+                )
+                ink_warped = paper_module.warp_sheet(frame, warp_corners)
                 visible = None
                 if hand_masker is not None:
                     camera_mask = hand_masker.mask(frame)
                     if camera_mask is not None:
                         hand_warped = paper_module.warp_sheet(
-                            camera_mask, ink_corners
+                            camera_mask, warp_corners
                         )
                         visible = hand_warped == 0
-                accumulated_canvas = ink_module.render_canvas(
-                    ink_accumulator.update(
-                        observed, visible, t_capture_ms=frame_capture_ms
+                if session_ink is not None:
+                    if not session_ink.ready:
+                        if baseline_armed:
+                            session_ink.add_sample(ink_warped, visible)
+                        observed = np.zeros(
+                            ink_warped.shape[:2], dtype=np.uint8)
+                    else:
+                        observed = session_ink.observe(
+                            ink_warped, visible)
+                else:
+                    observed = ink_source(ink_warped)
+                # Com o alinhamento perdido, o canvas CONGELA: o
+                # acumulador nao recebe zeros (receber zeros decai
+                # os votos e apaga o desenho ja capturado, medido
+                # no replay de 2026-10-30: 7.329 px a 0 em ~1,5 s).
+                # O desenho so some quando o usuario aperta C e
+                # comeca outra pagina base, por escolha dele.
+                if not (session_ink is not None
+                        and session_ink.alignment_lost):
+                    accumulated_canvas = ink_module.render_canvas(
+                        ink_accumulator.update(
+                            observed, visible,
+                            t_capture_ms=frame_capture_ms
+                        )
                     )
-                )
 
         status = frame.copy()
         if markers_mode:
@@ -756,8 +790,8 @@ def run(
                     status_color = (0, 255, 0)
                 if session_ink is not None and session_ink.alignment_lost:
                     status_text = (
-                        "Folha mexeu demais: aperte C para nova "
-                        "pagina base"
+                        "Perdi o alinhamento com a pagina base: "
+                        "aperte C para refazer a pagina base"
                     )
                     status_color = (0, 0, 255)
                 elif session_ink is not None and not session_ink.ready:

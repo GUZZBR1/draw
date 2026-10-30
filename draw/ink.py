@@ -118,23 +118,25 @@ _SESSION_BASE_SAMPLES = 12
 _SESSION_INK_DELTA = 12.0
 
 # Limiares do realinhamento a referencia, medidos no laboratorio
-# (draw-lab/session-align/REPORT.md e a verificacao de integracao
-# da classe). A resposta da correlacao de fase NAO serve de
+# (draw-lab/session-align/REPORT.md e as rodadas de replay de
+# 2026-10-30). A resposta da correlacao de fase NAO serve de
 # confianca em producao: ela mede a fracao de energia espectral no
 # pico, e tinta nova no quadro a derruba (0,95 sem traco novo para
 # 0,65 com 8 tracos, na pagina real), embora a estimativa de
 # deslocamento continue solida (erro ~0,2 px em todos esses
-# casos). Quem julga a confianca e o residuo pos-correcao sobre a
-# estrutura da referencia (pixels escuros contra a mediana da
-# pagina): saudavel medido <= 0,97 por cento da estrutura com 0 a
-# 8 tracos novos; pagina girada 1 grau (translacao nao conserta)
-# da 40,3 por cento. O limiar de 5 por cento fica entre os dois,
-# com margem dos dois lados. Deslocamento estimado acima de
-# 10 px nao e jitter: e a pagina que andou de verdade (ou virou),
-# e a referencia certa e outra.
+# casos). O residuo pos-correcao tambem NAO serve, por tres
+# medicoes seguidas: mao, antebraco, sombra e flexao da pagina
+# divergem da referencia tanto quanto um movimento real da folha
+# (ver o historico no docstring de observe). O que resta de
+# confiavel e a propria estimativa: deslocamento acima de 10 px
+# nao e jitter, e a pagina que andou de verdade (ou virou).
+# Falha so conta quando as estimativas concordam entre si
+# (_ALIGN_AGREE_PX): o wrap da correlacao espica sozinho em
+# 2,8 por cento das amostras do replay, sempre espalhado.
 _ALIGN_MAX_SHIFT_PX = 10.0
-_ALIGN_RESID_MAX = 0.05
-_STRUCT_MEDIAN_DELTA = 25.0
+_ALIGN_FAIL_FRAMES = 5
+_ALIGN_AGREE_PX = 5.0
+_BASE_MIN_VISIBLE = 1
 _ALIGN_WINDOW = None
 
 
@@ -150,7 +152,8 @@ def align_to_reference(reference_gray, current_gray):
     fase (diagnostico; nao entra no ok, ver o comentario dos
     limiares); ok diz apenas que o deslocamento estimado e
     plausivel como jitter (<= _ALIGN_MAX_SHIFT_PX). A confianca
-    de verdade e o residuo pos-correcao, julgado por quem chama.
+    de verdade e a consistencia da estimativa entre quadros,
+    julgada por quem chama (ver observe).
 
     Medido no laboratorio: erro de estimativa <= 0,04 px ate 5 px
     de deslocamento e falsa tinta da regra da sessao de 21.889 px
@@ -195,91 +198,136 @@ class SessionBaselineInk:
 
     def reset(self):
         self._samples = []
+        self._sample_vis = []
         self._baseline_min = None
         self.reference = None
         self._ref_median = None
         self._base_blur = None
-        self._struct_mask = None
         self.alignment_lost = False
         self._align_failures = 0
+        self._last_bad_shift = None
 
     @property
     def ready(self):
         return self._baseline_min is not None
 
-    def add_sample(self, warped):
-        """Alimenta a base; a mediana fecha na decima segunda amostra."""
+    def add_sample(self, warped, visible=None):
+        """Alimenta a base; a mediana fecha na decima segunda amostra.
+
+        Com mascara de visibilidade, a mediana de cada pixel usa
+        SO as amostras em que ele estava visivel: mao ou braco
+        parados sobre a pagina durante o C nao entram na
+        referencia (medido no replay de 2026-10-30: com o braco
+        em 10 de 12 amostras, a mediana comum gravava o braco
+        como estrutura da pagina e a sessao morria em segundos
+        quando ele saia). Pixel nunca visivel cai para a mediana
+        comum, que e o que existe.
+        """
         if self.ready:
             return
         gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
         self._samples.append(gray)
+        self._sample_vis.append(
+            None if visible is None else visible.astype(bool))
         if len(self._samples) >= _SESSION_BASE_SAMPLES:
-            base_raw = np.median(
-                np.stack(self._samples), axis=0).astype(np.float32)
+            stack = np.stack(self._samples).astype(np.float32)
+            base_raw = np.median(stack, axis=0).astype(np.float32)
+            if any(v is not None for v in self._sample_vis):
+                vis = np.stack([
+                    np.ones(stack.shape[1:], dtype=bool)
+                    if v is None else v
+                    for v in self._sample_vis
+                ])
+                count = vis.sum(axis=0)
+                ordered = np.sort(
+                    np.where(vis, stack, np.float32(1e6)), axis=0)
+                pick = np.clip((count - 1) // 2, 0, stack.shape[0] - 1)
+                picked = np.take_along_axis(
+                    ordered, pick[None].astype(np.int64), axis=0)[0]
+                base_raw = np.where(
+                    count >= _BASE_MIN_VISIBLE, picked, base_raw
+                ).astype(np.float32)
             base = cv2.GaussianBlur(base_raw, (3, 3), 0)
             # A referencia cheia fica guardada sem blur: e contra
             # ela que o realinhamento mede o deslocamento do
-            # quadro atual quando o caderno se mexe. A base com
-            # blur e a mascara da estrutura dela sustentam o
-            # residuo pos-correcao, o juiz do alinhamento.
+            # quadro atual quando o caderno se mexe.
             self.reference = base_raw
             self._ref_median = float(np.median(base))
             self._base_blur = base
-            self._struct_mask = base < (
-                self._ref_median - _STRUCT_MEDIAN_DELTA)
             # Minimo local 3x3: a estrutura escura da base ganha um
             # halo de 1 px que absorve o jitter residual do warp,
             # para a pauta nao virar tinta quando o quadro treme.
             self._baseline_min = cv2.erode(
                 base, np.ones((3, 3), dtype=np.uint8))
             self._samples = []
+            self._sample_vis = []
 
-    def observe(self, warped):
+    def observe(self, warped, visible=None):
         """Mascara (255 = tinta) do que escureceu contra a base.
 
         Antes do delta, o quadro e realinhado a referencia por
         correlacao de fase: sem isso, um deslocamento de 2 px do
         caderno transforma a pauta em falsa tinta (medido: 1.362 px
-        sem correcao, 0 com). A confianca do alinhamento e o
-        residuo pos-correcao sobre a estrutura da referencia:
-        acima de _ALIGN_RESID_MAX, o quadro nao rende observacao;
-        3 seguidos acendem alignment_lost e o app pede uma pagina
-        base nova (tecla C), em vez de seguir desenhando sobre uma
-        referencia que nao vale mais.
+        sem correcao, 0 com). O unico portao que restou e o do
+        deslocamento impossivel: estimativa de fase alem de
+        _ALIGN_MAX_SHIFT_PX por _ALIGN_FAIL_FRAMES quadros
+        seguidos, com estimativas concordando entre si (empurrao
+        de verdade estima consistente; o wrap da correlacao, que
+        espica em 2,8 por cento das amostras reais, espalha).
+
+        O portao por residuo estrutural MORREU em 2026-10-30,
+        depois de tres construcoes medidas (escala fina, escala
+        grossa, escala grossa com base por mediana de
+        visibilidade): nas tres, mao, antebraco fora da mascara,
+        sombra projetada e a pagina flexionando produzem tanta
+        divergencia contra a referencia quanto um movimento real
+        da folha, e o portao matou tres sessoes boas (a do Lucas
+        ao vivo e duas de replay) sem nunca pegar um evento real.
+        A premissa de que residuo separa "a folha mexeu" de "algo
+        cobriu a folha" e falsa nesta cena. Quem filtra o lixo
+        transitorio do delta (sombra que passa, braco que mexe) e
+        o acumulador com histerese e veto de visibilidade.
         """
         shape = warped.shape[:2]
         if not self.ready or self.alignment_lost:
             return np.zeros(shape, dtype=np.uint8)
         gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
         gray = gray.astype(np.float32)
-        aligned, _shift, _response, ok = align_to_reference(
+        aligned, est, _response, ok = align_to_reference(
             self.reference, gray)
-        blurred = None
-        if ok:
-            cur_median = float(np.median(aligned))
-            gain = 1.0
-            if cur_median > 1.0 and self._ref_median is not None:
-                gain = float(np.clip(
-                    self._ref_median / cur_median, 0.85, 1.18))
-            blurred = cv2.GaussianBlur(aligned * gain, (3, 3), 0)
-            resid = (
-                (np.abs(blurred - self._base_blur)
-                 >= _SESSION_INK_DELTA)
-                & self._struct_mask
-            )
-            ok = (
-                float(resid.sum())
-                <= _ALIGN_RESID_MAX * float(self._struct_mask.sum())
-            )
         if not ok:
-            self._align_failures += 1
-            if self._align_failures >= 3:
+            if (
+                self._last_bad_shift is not None
+                and float(np.hypot(
+                    est[0] - self._last_bad_shift[0],
+                    est[1] - self._last_bad_shift[1],
+                )) <= _ALIGN_AGREE_PX
+            ):
+                self._align_failures += 1
+            else:
+                self._align_failures = 1
+            self._last_bad_shift = est
+            if self._align_failures >= _ALIGN_FAIL_FRAMES:
                 self.alignment_lost = True
             return np.zeros(shape, dtype=np.uint8)
         self._align_failures = 0
+        self._last_bad_shift = None
+        cur_median = float(np.median(aligned))
+        gain = 1.0
+        if cur_median > 1.0 and self._ref_median is not None:
+            gain = float(np.clip(
+                self._ref_median / cur_median, 0.85, 1.18))
+        blurred = cv2.GaussianBlur(aligned * gain, (3, 3), 0)
         delta = self._baseline_min - blurred
-        return np.where(
-            delta >= _SESSION_INK_DELTA, 255, 0).astype(np.uint8)
+        ink = delta >= _SESSION_INK_DELTA
+        if visible is not None:
+            # Pixel coberto nao e tinta: a mao pousada sobre a
+            # pagina escurece contra a base, mas nao desenha. O
+            # acumulador tambem veta por visibilidade; zerar aqui
+            # mantem a saida do observe limpa para qualquer
+            # consumidor.
+            ink &= visible
+        return np.where(ink, 255, 0).astype(np.uint8)
 
 
 def render_canvas(ink_mask):
