@@ -37,3 +37,13 @@ The ONNX input is `image`, `[N,3,512,512]`, ImageNet-normalized float32. It has
 one output, `logits`, with four class channels at one-quarter input resolution.
 The app adapter is responsible for deriving the page mask from paper and ink
 classes while excluding hand pixels.
+
+## App activation
+
+Merging this pilot does not make it the app's default model and does not replace
+the current model selection. To test this artifact explicitly from the
+repository root, run:
+
+```bash
+python main.py --neural models/kaggle-real-pilot-v1/model.onnx
+```
