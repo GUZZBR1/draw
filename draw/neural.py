@@ -78,6 +78,72 @@ _MEMORY_MIN_MASK_IOU = 0.7
 _MEMORY_MASK_STRIDE = 4
 _ENV_MODEL_VAR = "DRAW_NEURAL_MODEL"
 
+# Portão do caminho clássico (medido em 2026-10-30 no laboratório,
+# draw-lab/fp-gate-2026-10-30/): com um modelo neural carregado, um
+# logit de presença até este valor é um "não há papel" forte o bastante
+# para o clássico não poder declarar folha por cima dele (o incidente
+# da caixa branca: a v2 media logit ≈ −10,9 na caixa e o banner vinha
+# do clássico). Nos frames reais medidos (44 positivos por modelo: os
+# 43 do frames-dataset e o frame_real), o menor logit de positivo foi
+# +7,38 (v3 dinâmico); nos 6 negativos do dataset, o maior logit foi
+# −6,98 (v3). O limiar fica 10,4 abaixo do positivo mais fraco e 4,0
+# acima do negativo mais forte: veta o clássico em 18/18 corridas
+# (3 modelos × 6 negativos) sobre os negativos do dataset e não custa
+# nenhum positivo medido. Ele NÃO cobre a caixa branca na v3 a 512
+# (logit +0,41 a +0,98: a própria neural afirma papel, fraco, e o
+# quadrilátero fecha sobre ~3,5% de máscara) nem os logits −0,006 a
+# −0,382 da v3 dinâmica na caixa: nenhum dos dois é "fortemente
+# negativo", e baixar o limiar para perto de zero desligaria a reserva
+# clássica justamente no cenário de generalização, a folha real que a
+# neural subdispara num setup novo.
+PRESENCE_VETO_LOGIT = -3.0
+
+# Guarda de plausibilidade do ajuste (medida em 2026-10-30 no
+# laboratório, draw-lab/noite-2026-10-30/block6/): o ajuste neural cru
+# é biestável sob oclusão. Nas 1.132 detecções gravadas dos dois
+# vídeos de replay, uma família de ajustes colapsa uma aresta (a
+# direita com 213–269 px contra a esquerda com 980–1.025 px: razão
+# entre arestas opostas de 3,81 a 4,67), enquanto tudo o que o app
+# exibiu em trechos quietos fica em 2,42 ou menos e o máximo do outro
+# vídeo é 3,00. A guarda recusa o quadrilátero cuja maior razão entre
+# arestas opostas passa de _FIT_OPPOSITE_RATIO_MAX. Recusa também o
+# que extrapola um canto para além de _FIT_EXCURSION_DIAG_FRAC da
+# diagonal do quadro: nas gravações a folha sai do recorte de tela de
+# verdade até 9,9% da diagonal, mas o modo fora do quadro medido no
+# frame_real.png (1289x710) chegou a 21,4%. Ajuste recusado vale
+# "sem quadrilátero" e não alimenta a memória de arestas: quem chamou
+# decide (no app, o rastreador segura o quadrilátero anterior). Nas
+# gravações, a guarda recusa 26 de 1.132 ajustes (25 da família
+# colapsada de um vídeo, 1 do outro). Ressalva: as gravações são de
+# tela, com overlay queimado; a guarda precisa de reconfirmação em
+# captura crua.
+_FIT_OPPOSITE_RATIO_MAX = 3.0
+_FIT_EXCURSION_DIAG_FRAC = 0.15
+
+
+def _fit_plausible(corners, frame_shape):
+    """True se o quadrilátero passa na guarda de plausibilidade."""
+    quad = np.asarray(corners, dtype=np.float64)
+    if quad.shape != (4, 2):
+        return False
+    edges = np.array(
+        [np.linalg.norm(quad[(i + 1) % 4] - quad[i]) for i in range(4)]
+    )
+    if edges.min() <= 0:
+        return False
+    for a, b in ((0, 2), (3, 1)):
+        ratio = max(edges[a], edges[b]) / min(edges[a], edges[b])
+        if ratio > _FIT_OPPOSITE_RATIO_MAX:
+            return False
+    height, width = frame_shape[:2]
+    margin = _FIT_EXCURSION_DIAG_FRAC * float(np.hypot(width, height))
+    return not (
+        quad[:, 0].min() < -margin
+        or quad[:, 0].max() > width + margin
+        or quad[:, 1].min() < -margin
+        or quad[:, 1].max() > height + margin
+    )
+
 
 def _load_session(model_path):
     try:
@@ -411,6 +477,11 @@ class NeuralSheetDetector:
     _MEMORY_MIN_MASK_IOU com a da chamada anterior, medido nas
     máscaras reduzidas por _MEMORY_MASK_STRIDE. Cena nova recomeça
     sem herança.
+
+    O atributo last_presence_logit guarda o logit de presença da
+    última chamada a predict (None antes da primeira e após um frame
+    vazio): é ele que o portão PRESENCE_VETO_LOGIT lê no app para
+    decidir se a reserva clássica pode falar.
     """
 
     def __init__(self, model_path):
@@ -419,6 +490,7 @@ class NeuralSheetDetector:
         self._resolved_input_size = None
         self._edge_lines = None
         self._memory_mask = None
+        self.last_presence_logit = None
 
     def _get_session(self):
         if self._session is None:
@@ -443,9 +515,18 @@ class NeuralSheetDetector:
         return self._edge_lines
 
     def _fit(self, mask, frame):
-        """fit_quad com a memória de arestas do detector."""
+        """fit_quad com a memória de arestas do detector.
+
+        A guarda de plausibilidade (_fit_plausible) fecha o caminho:
+        quadrilátero recusado devolve None e não alimenta a memória
+        de arestas, para a geometria selvagem não virar herança.
+        """
         fallback = self._fallback_lines(mask)
         corners, lines, trusted = _fit_quad_impl(mask, frame, fallback)
+        if corners is not None and not _fit_plausible(
+            corners, frame.shape
+        ):
+            return None
         if lines is not None:
             stored = (
                 list(self._edge_lines)
@@ -488,10 +569,12 @@ class NeuralSheetDetector:
         mask = cv2.resize(
             mask_small, (frame_w, frame_h), interpolation=cv2.INTER_NEAREST
         )
-        return float(presence[0]), mask * 255
+        self.last_presence_logit = float(presence[0])
+        return self.last_presence_logit, mask * 255
 
     def __call__(self, frame):
         if frame is None or frame.size == 0:
+            self.last_presence_logit = None
             return None, None, None
         presence, mask = self.predict(frame)
         if presence <= 0:

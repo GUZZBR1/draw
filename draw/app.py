@@ -6,6 +6,7 @@ Uso:
   python main.py --list-cameras                   # lista webcams que abrem
   python main.py --markers                        # folha-modelo impressa
   python main.py --neural modelo.onnx             # detector neural primario
+  python main.py --ink-model modelo.onnx          # modelo aprendido de tinta
   python main.py --hand-model modelo.task         # mascara de mao no canvas
   python main.py --source 1                       # outra webcam local
   python main.py --source /dev/video2             # porta V4L2 especifica
@@ -39,6 +40,13 @@ from . import hand as hand_module
 from . import ink as ink_module
 from . import light as light_module
 from . import light_guard as light_guard_module
+try:
+    from . import ink_model as ink_model_module
+except ImportError:
+    # O extrator de tinta por modelo aprendido e opcional e o modulo
+    # dele ainda nao faz parte do pacote publicado. Sem o modulo,
+    # --ink-model avisa e o app segue so com a heuristica.
+    ink_model_module = None
 from . import neural as neural_module
 from . import paper as paper_module
 from . import sequence as sequence_module
@@ -47,7 +55,19 @@ from . import strokes as strokes_module
 
 _SHEET_NEAR_LIMIT_PX = 40.0
 _SHEET_BLEND_ALPHA = 0.3
-_SHEET_JUMP_CONFIRMATIONS = 3
+# Confirmação de salto por TEMPO, não por contagem de detecções
+# (medido em 2026-10-30 no laboratório,
+# draw-lab/noite-2026-10-30/block6/): com a contagem de 3, um salto
+# selvagem confirmava em ~0,1 s na cadência densa de "missed" (a
+# detecção roda a cada quadro), e os vídeos de replay mediam 64
+# passos oficiais acima de 100 px em 1.857 quadros. Exigir que o
+# candidato persista 0,3 s de tempo de vídeo (o dobro para
+# blank_maybe, como era o dobro na contagem) derruba os passos
+# >100 px para 15 e o jitter médio da grade de 29,39 para 9,66 px,
+# sem nenhuma queda nova e com o atraso de remoção intacto em
+# 0,53 s. Ressalva: a medição é sobre gravações de tela com overlay
+# queimado; reconfirmar em captura crua.
+_SHEET_JUMP_PERSIST_SECONDS = 0.3
 _SHEET_DETECT_INTERVAL = 5
 # Perda da folha medida em tempo, nao em quadros: com a contagem em
 # quadros, o mesmo limite valia ~1 s a 30 fps e ~3 s numa sessao lenta,
@@ -80,13 +100,26 @@ class _SheetTracker:
     """Estabilizacao temporal do quadrilatero da folha.
 
     Guarda o quadrilatero atual e decide, quadro a quadro, entre
-    misturar uma deteccao vizinha, exigir confirmacoes para um salto
+    misturar uma deteccao vizinha, exigir persistencia para um salto
     de posicao e descartar a folha perdida. Deteccao perto mistura
-    com _SHEET_BLEND_ALPHA; salto precisa de
-    _SHEET_JUMP_CONFIRMATIONS deteccoes consistentes seguidas (o
-    dobro para o candidato blank_maybe). A perda dispara quando os
-    dois criterios de _SHEET_LOST_* passam: tempo sem confirmacao e
-    quadros sem confirmacao.
+    com _SHEET_BLEND_ALPHA; salto (deteccao a mais de
+    _SHEET_NEAR_LIMIT_PX do quad atual) so confirma quando o
+    candidato persiste _SHEET_JUMP_PERSIST_SECONDS de relogio com
+    deteccoes seguintes pousando perto dele (o dobro para
+    blank_maybe). A perda dispara quando os dois criterios de
+    _SHEET_LOST_* passam: tempo sem confirmacao e quadros sem
+    confirmacao.
+
+    Presenca e posicao sao perguntas separadas no relogio de perda:
+    enquanto deteccoes "paper" plausiveis continuam chegando, a
+    folha esta la, mesmo com a posicao incerta. Por isso um salto
+    ainda nao confirmado com veredito "paper" renova o relogio de
+    perda sem mover o quadrilatero exibido, e um quadro com
+    veredito "paper" sem quadrilatero (o modelo afirmou papel e
+    nenhum ajuste fechou) tambem renova. Sem isso, a espera da
+    confirmacao por tempo esfomeia o relogio e a folha cai no meio
+    da janela da mao (medido no replay: 11 quadros sem folha e
+    atraso de remocao de 0,30 s, contra 0,53 s com a renovacao).
     """
 
     def __init__(self):
@@ -95,6 +128,7 @@ class _SheetTracker:
         self.missed = False
         self._pending = None
         self._pending_hits = 0
+        self._pending_since = None
         self._frames_since_seen = 0
         self._last_seen_at = None
 
@@ -110,6 +144,7 @@ class _SheetTracker:
         self.verdict = verdict
         self._pending = None
         self._pending_hits = 0
+        self._pending_since = None
         self._frames_since_seen = 0
         self._last_seen_at = now
         self.missed = False
@@ -124,6 +159,22 @@ class _SheetTracker:
         nos demais quadros (so para diagnostico).
         """
         event = None
+        if (
+            detected is None
+            and ran_detection
+            and verdict == "paper"
+            and self.corners is not None
+        ):
+            # Evento so de presenca: quem detectou afirma papel mas
+            # nenhum quadrilatero utilizavel fechou (o ajuste neural
+            # foi recusado pela guarda de plausibilidade, ou nao
+            # fechou). A folha esta la; a posicao e que nao veio.
+            # Renova o relogio de perda, nao mexe no quadrilatero
+            # exibido nem no candidato pendente.
+            self._frames_since_seen = 0
+            self._last_seen_at = now
+            self.missed = True
+            return None
         if detected is not None:
             if self.corners is None and verdict == "paper":
                 self._confirm(detected.copy(), verdict, now)
@@ -140,11 +191,11 @@ class _SheetTracker:
             else:
                 # Salto de posicao ou candidato ainda sem trava.
                 # Candidato blank_maybe (branco e liso, sem textura
-                # de papel) exige o dobro de confirmacoes seguidas.
-                confirmations_needed = (
-                    2 * _SHEET_JUMP_CONFIRMATIONS
+                # de papel) exige o dobro do tempo de persistencia.
+                confirm_seconds = (
+                    2 * _SHEET_JUMP_PERSIST_SECONDS
                     if verdict == "blank_maybe"
-                    else _SHEET_JUMP_CONFIRMATIONS
+                    else _SHEET_JUMP_PERSIST_SECONDS
                 )
                 if (
                     self._pending is not None
@@ -156,17 +207,29 @@ class _SheetTracker:
                 else:
                     self._pending = detected.copy()
                     self._pending_hits = 1
+                    self._pending_since = now
 
-                if self._pending_hits >= confirmations_needed:
+                if (
+                    self._pending_since is not None
+                    and now - self._pending_since >= confirm_seconds
+                ):
                     self._confirm(self._pending.copy(), verdict, now)
                     event = "seen"
                 else:
-                    self._frames_since_seen += 1
+                    if verdict == "paper":
+                        # Presenca renovada, posicao ainda incerta:
+                        # o relogio de perda nao corre contra uma
+                        # folha que o detector continua vendo.
+                        self._frames_since_seen = 0
+                        self._last_seen_at = now
+                    else:
+                        self._frames_since_seen += 1
                     self.missed = True
         elif self.corners is not None:
             if ran_detection:
                 self._pending = None
                 self._pending_hits = 0
+                self._pending_since = None
                 self.missed = True
             self._frames_since_seen += 1
 
@@ -180,6 +243,7 @@ class _SheetTracker:
             self.verdict = None
             self._pending = None
             self._pending_hits = 0
+            self._pending_since = None
             self._frames_since_seen = 0
             self.missed = False
             event = "drop"
@@ -326,10 +390,53 @@ def _fit(image, max_h=700):
     return cv2.resize(image, (int(w * scale), max_h))
 
 
+def _detect_sheet_combined(frame, neural_detector, classic_detect=None):
+    """Detecção do modo sem marcadores: neural primário, clássico reserva.
+
+    Sem detector neural, é o clássico puro, o comportamento de sempre.
+    Com detector, ele decide primeiro; fechando o quadrilátero, vale o
+    veredito dele. Não fechando, a reserva clássica só fala quando a
+    neural não negou a folha com força: logit de presença até
+    neural.PRESENCE_VETO_LOGIT devolve (None, None) direto, sem deixar
+    o clássico declarar "paper" nem "blank_maybe" contra um "não há
+    papel" forte do modelo. É o portão do incidente da caixa branca
+    (2026-10-29): a v2 media logit ≈ −10,9 na caixa e o "Folha
+    detectada" ao vivo vinha do clássico. A justificativa medida do
+    limiar mora em draw.neural.PRESENCE_VETO_LOGIT. Logit negativo
+    fraco (acima do limiar) não veta: a reserva segue valendo para a
+    folha real que a neural subdispara num setup novo.
+
+    Terceiro desfecho: se nenhum quadrilátero fechou (o ajuste neural
+    foi recusado pela guarda de plausibilidade, ou não fechou, e o
+    clássico também não achou candidato) mas o logit de presença é
+    positivo, devolve (None, "paper"): presença sem posição. O
+    rastreador lê isso como "a folha está lá, segura o quadrilátero
+    anterior e renova o relógio de perda", em vez de contar o quadro
+    como ausência (medido no replay do laboratório em 2026-10-30:
+    sem esse canal, cada ajuste recusado vira contagem de perda e a
+    folha cai durante os episódios de oclusão).
+    """
+    if classic_detect is None:
+        classic_detect = paper_module.detect_sheet_with_confidence
+    if neural_detector is not None:
+        corners, verdict = neural_detector.detect_sheet_with_confidence(frame)
+        if corners is not None:
+            return corners, verdict
+        logit = neural_detector.last_presence_logit
+        if logit is not None and logit <= neural_module.PRESENCE_VETO_LOGIT:
+            return None, None
+        corners, verdict = classic_detect(frame)
+        if corners is None and logit is not None and logit > 0:
+            return None, "paper"
+        return corners, verdict
+    return classic_detect(frame)
+
+
 def run(source=0, save_dir="captures", markers_mode=False, width=None,
         height=None, fps=None, backend=None, reconnect_attempts=3,
         open_timeout_ms=3000, neural_model=None, capture_all_frames=False,
-        light_normalize="off", session_mode=False, hand_model=None):
+        light_normalize="off", session_mode=False, hand_model=None,
+        ink_model=None):
     neural_detector = None
     if neural_model is not None and not markers_mode:
         neural_detector = neural_module.NeuralSheetDetector(neural_model)
@@ -338,6 +445,29 @@ def run(source=0, save_dir="captures", markers_mode=False, width=None,
             f"Detector neural ativo: {neural_model}. "
             "O classico cobre os frames em que o neural nao ve folha."
         )
+
+    ink_extractor = None
+    if ink_model is not None and not markers_mode:
+        if ink_model_module is None:
+            print(
+                "Modelo de tinta solicitado, mas o modulo "
+                "draw/ink_model.py nao esta presente neste pacote. "
+                "Seguindo com a heuristica."
+            )
+        else:
+            ink_extractor = ink_model_module.InkModelExtractor(ink_model)
+            if ink_extractor.load():
+                print(
+                    f"Modelo de tinta ativo: {ink_model}. "
+                    "A heuristica segue como reserva por frame."
+                )
+
+    def ink_source(warped_img):
+        if ink_extractor is not None:
+            mask = ink_extractor.ink_mask(warped_img)
+            if mask is not None:
+                return mask
+        return ink_module.extract_ink(warped_img)
 
     hand_masker = None
     if hand_model is not None and not markers_mode:
@@ -350,17 +480,21 @@ def run(source=0, save_dir="captures", markers_mode=False, width=None,
     winning_light = {"mode": light_normalize}
 
     def detect_sheet(frame):
-        if neural_detector is not None:
-            corners, verdict = (
-                neural_detector.detect_sheet_with_confidence(frame)
+        # Reserva classica do fork: a guarda de luz, em vez do
+        # classico puro do upstream. O portao de veto neural e a
+        # presenca sem quadrilatero vem de _detect_sheet_combined.
+        def classic_with_light_guard(frame):
+            corners, verdict, winning = detect_sheet_with_light_guard(
+                frame, light_normalize
             )
-            if corners is not None:
-                winning_light["mode"] = light_normalize
-                return corners, verdict
-        corners, verdict, winning = detect_sheet_with_light_guard(
-            frame, light_normalize
+            winning_light["mode"] = winning
+            return corners, verdict
+
+        corners, verdict = _detect_sheet_combined(
+            frame, neural_detector, classic_with_light_guard
         )
-        winning_light["mode"] = winning
+        if corners is not None:
+            winning_light["mode"] = light_normalize
         return corners, verdict
     parsed = parse_source(source)
     capture = capture_module.ReconnectingCapture(
@@ -402,7 +536,7 @@ def run(source=0, save_dir="captures", markers_mode=False, width=None,
     # dos traços enquanto o desenho acontece. Desligado por padrão;
     # a tecla v continua exportando o snapshot por centroide, e a
     # tecla o exporta a sessão ordenada, só neste modo.
-    tracker = (
+    session_tracker = (
         sequence_module.SequenceTracker() if session_mode else None
     )
     session_counter = 0
@@ -463,6 +597,11 @@ def run(source=0, save_dir="captures", markers_mode=False, width=None,
                 break
             continue
         falhas_seguidas = 0
+        # Instante de captura aproximado: a câmera não expõe carimbo
+        # de hardware neste caminho, então vale o instante logo após
+        # a leitura do frame, o mais próximo da captura que o laço
+        # conhece. É ele que carimba os pixels no acumulador.
+        frame_capture_ms = int(time.monotonic() * 1000)
 
         loop_frames += 1
         if dataset_writer is not None:
@@ -520,7 +659,7 @@ def run(source=0, save_dir="captures", markers_mode=False, width=None,
                     np.stack(corner_history), axis=0
                 ).astype(np.float32)
                 ink_warped = paper_module.warp_sheet(frame, ink_corners)
-                observed = ink_module.extract_ink(ink_warped)
+                observed = ink_source(ink_warped)
                 visible = None
                 if hand_masker is not None:
                     camera_mask = hand_masker.mask(frame)
@@ -530,7 +669,9 @@ def run(source=0, save_dir="captures", markers_mode=False, width=None,
                         )
                         visible = hand_warped == 0
                 accumulated_canvas = ink_module.render_canvas(
-                    ink_accumulator.update(observed, visible)
+                    ink_accumulator.update(
+                        observed, visible, t_capture_ms=frame_capture_ms
+                    )
                 )
 
         status = frame.copy()
@@ -580,18 +721,18 @@ def run(source=0, save_dir="captures", markers_mode=False, width=None,
                 _ink_input(warped, winning_light["mode"]),
                 clear_markers=markers_mode,
             )
-            if tracker is not None:
+            if session_tracker is not None:
                 # Amostragem reduzida: uma amostra a cada 5 quadros
                 # retificados, não a cada quadro — o thinning e o
                 # rastreamento a cada quadro são custo sem ganho.
                 session_counter += 1
                 if session_counter % 5 == 1:
-                    tracker.update(
+                    session_tracker.update(
                         strokes_module.extract_strokes(ink_mask),
                         frame_index=loop_frames,
                         timestamp_ms=int(time.time() * 1000),
                         corners=(
-                            None if markers_mode else current_corners
+                            None if markers_mode else tracker.corners
                         ),
                         sheet_locked=True,
                     )
@@ -600,6 +741,11 @@ def run(source=0, save_dir="captures", markers_mode=False, width=None,
             elif accumulated_canvas is not None:
                 canvas = accumulated_canvas
             else:
+                # ink_mask ja veio de extract_ink sobre a entrada
+                # com luz normalizada; o modelo de tinta do
+                # upstream so o substitui quando esta ativo.
+                if ink_extractor is not None:
+                    ink_mask = ink_source(warped)
                 canvas = ink_module.render_canvas(ink_mask)
             cv2.imshow("Draw - camera", _fit(status, 700))
             cv2.imshow("Draw - papel (vista de cima)", _fit(warped, 700))
@@ -620,13 +766,13 @@ def run(source=0, save_dir="captures", markers_mode=False, width=None,
                 )
                 print(f"{len(strokes)} tracos salvos em {svg_path} "
                       f"e {json_path}")
-            if key == ord("o") and tracker is not None:
+            if key == ord("o") and session_tracker is not None:
                 save_path.mkdir(parents=True, exist_ok=True)
                 base = save_path / f"session_{int(time.time())}"
                 svg_path, json_path = sequence_module.export_session(
-                    tracker, base
+                    session_tracker, base
                 )
-                print(f"sessao com {len(tracker.ordered)} tracos "
+                print(f"sessao com {len(session_tracker.ordered)} tracos "
                       f"ordenados salva em {svg_path} e {json_path}")
             handle_capture_key(key, frame)
             if key in (ord("q"), 27):
@@ -666,6 +812,18 @@ def main():
         help="detector neural (ONNX) como primario, com o classico de "
         "reserva. Sem caminho, usa a variavel de ambiente "
         "DRAW_NEURAL_MODEL",
+    )
+    parser.add_argument(
+        "--ink-model",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="MODELO.onnx",
+        help="modelo aprendido de tinta (ONNX) como fonte da mascara "
+        "no modo sem marcadores, no lugar da heuristica. Sem caminho, "
+        "usa a variavel de ambiente DRAW_INK_MODEL. Sem o arquivo ou "
+        "com erro de carga, o app avisa uma vez e segue com a "
+        "heuristica",
     )
     parser.add_argument(
         "--hand-model",
@@ -836,6 +994,16 @@ def main():
                 "--neural sem caminho: passe o arquivo .onnx ou defina "
                 "a variavel DRAW_NEURAL_MODEL"
             )
+    ink_model = None
+    if args.ink_model is not None:
+        if args.markers:
+            parser.error("--ink-model nao combina com --markers")
+        ink_model = args.ink_model or os.environ.get("DRAW_INK_MODEL")
+        if not ink_model:
+            parser.error(
+                "--ink-model sem caminho: passe o arquivo .onnx ou "
+                "defina a variavel DRAW_INK_MODEL"
+            )
     hand_model = None
     if args.hand_model is not None:
         if args.markers:
@@ -863,6 +1031,7 @@ def main():
             light_normalize=args.light_normalize,
             session_mode=args.session,
             hand_model=hand_model,
+            ink_model=ink_model,
         )
     except (RuntimeError, FileNotFoundError) as error:
         print(f"Erro: {error}")
