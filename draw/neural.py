@@ -2,8 +2,18 @@
 de draw.paper.detect_sheet_with_confidence.
 
 O modelo da fase 2 (SegFormer-B0 exportado para ONNX) recebe o frame
-esmagado para 512x512, normalizado com média e desvio do ImageNet, e
-devolve logits de máscara em dois canais e um logit de presença. A
+esmagado para a resolução de entrada, normalizado com média e desvio
+do ImageNet, e devolve logits de máscara em dois canais e um logit
+de presença. A resolução segue o arquivo: um ONNX de formato fixo
+impõe o tamanho dele (512x512 no export original); um ONNX dinâmico
+(eixos H/W simbólicos) roda a 384x384, o ponto medido no Ryzen 7
+7700X do Lucas em 2026-10-29 — session.run de 122 para 58 ms, IoU de
+máscara de 0,984 contra o 512, nenhum veredito de presença trocado
+nos frames dele fora as três frames da caixa branca, que a 384
+deixam de ser falso positivo. A sessão roda com 4 threads intra-op,
+também medido: o padrão do ONNX Runtime marcava 248 ms no mesmo
+tensor, 4 threads marcam 122 ms e 16 threads pioram para 210 ms
+(draw-lab/perf-ryzen-2026-10-29/REPORT.md). A
 presença decide se há papel. A máscara decide onde: o quadrilátero da
 folha sai do maior contorno da máscara limiarizada, com a mesma escada
 de epsilon do detector clássico, um reajuste de cada aresta como reta
@@ -55,7 +65,9 @@ import numpy as np
 
 from . import paper as _paper
 
-_INPUT_SIZE = 512
+_INPUT_SIZE = 384
+_ORT_INTRA_THREADS = 4
+_ENV_THREADS_VAR = "DRAW_ORT_THREADS"
 _MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 _STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 _MASK_THRESHOLD = 0.5
@@ -81,9 +93,37 @@ def _load_session(model_path):
             f"modelo ONNX nao encontrado: {path}. Passe o caminho do "
             f"arquivo .onnx ou defina a variavel {_ENV_MODEL_VAR}."
         )
+    options = ort.SessionOptions()
+    options.intra_op_num_threads = _ort_intra_threads()
     return ort.InferenceSession(
-        str(path), providers=["CPUExecutionProvider"]
+        str(path), sess_options=options, providers=["CPUExecutionProvider"]
     )
+
+
+def _ort_intra_threads():
+    """Threads intra-op da sessão: 4, medido no Ryzen do Lucas.
+
+    A variável DRAW_ORT_THREADS troca o valor sem tocar no código,
+    para medir em outra máquina; valor inválido ou não positivo
+    volta ao medido.
+    """
+    raw = os.environ.get(_ENV_THREADS_VAR)
+    if raw:
+        try:
+            value = int(raw)
+        except ValueError:
+            value = 0
+        if value > 0:
+            return value
+    return _ORT_INTRA_THREADS
+
+
+def _session_input_size(session):
+    """Resolução de entrada: a do arquivo, se fixa; senão _INPUT_SIZE."""
+    shape = session.get_inputs()[0].shape
+    if len(shape) > 2 and isinstance(shape[2], int) and shape[2] > 0:
+        return shape[2]
+    return _INPUT_SIZE
 
 
 def _order_corners(points):
@@ -376,6 +416,7 @@ class NeuralSheetDetector:
     def __init__(self, model_path):
         self.model_path = str(model_path)
         self._session = None
+        self._resolved_input_size = None
         self._edge_lines = None
         self._memory_mask = None
 
@@ -423,11 +464,14 @@ class NeuralSheetDetector:
     def predict(self, frame):
         """Roda o modelo. Retorna (logit de presença, máscara 0/255)."""
         session = self._get_session()
+        if self._resolved_input_size is None:
+            self._resolved_input_size = _session_input_size(session)
+        size = self._resolved_input_size
         frame_h, frame_w = frame.shape[:2]
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         resized = cv2.resize(
             rgb,
-            (_INPUT_SIZE, _INPUT_SIZE),
+            (size, size),
             interpolation=cv2.INTER_LINEAR,
         ).astype(np.float32)
         tensor = ((resized / 255.0 - _MEAN) / _STD).transpose(2, 0, 1)
