@@ -23,7 +23,9 @@ c = congelar a pagina base (so com --session-baseline), q/Esc = sair.
 import argparse
 import glob
 import os
+import queue
 import sys
+import threading
 import time
 from collections import deque
 from pathlib import Path
@@ -74,6 +76,21 @@ _SHEET_LOST_MIN_FRAMES = 10
 # voto por pixel do canvas acumulativo; a mediana de 5 segura a
 # geometria no lugar por tempo bastante para a janela do acumulador.
 _INK_CORNER_HISTORY = 5
+# Limite de falhas seguidas de leitura que declara a fonte morta.
+# Era a contagem do laco principal (15 read() falhos seguidos e o app
+# avisava e saia); com a leitura numa thread propria, a contagem mora
+# na thread e o desfecho visivel e o mesmo.
+_CAPTURE_MAX_FAILURES = 15
+# Pausa entre tentativas de leitura no caminho de falha. Sem ela, um
+# driver que devolve False na hora faz a thread girar uma CPU inteira
+# enquanto a camera nao volta; o laco antigo girava sem dormir.
+_READ_RETRY_SECONDS = 0.005
+# Teto da espera pela drenagem da fila de PNG na saida do app.
+_PNG_DRAIN_SECONDS = 5.0
+# Tempo que o aviso de fonte morta fica na janela antes da saida.
+# Sem ele, a morte da fonte e um congelamento silencioso. O waitKey
+# devolve antes se qualquer tecla for apertada.
+_DEAD_NOTICE_MS = 3000
 
 
 def _corner_distance(current, detected):
@@ -239,6 +256,174 @@ class _SheetTracker:
             self.missed = False
             event = "drop"
         return event
+
+
+class _LatestFrameCapture:
+    """Captura em thread separada que guarda so o quadro mais novo.
+
+    Uma thread le da captura sem parar e publica cada quadro com o
+    instante de captura (ms monotonicos, tirado logo que o read()
+    retorna), um numero de sequencia e a contagem de quadros
+    descartados (publicados e substituidos antes de alguem consumir).
+    Quem consome espera por sequencia nova numa Condition: nao gira
+    em vazio e nunca reprocessa o mesmo quadro. Os quadros que o
+    driver empilha enquanto o laco processa nao viram fila aqui: o
+    consumidor pega sempre o mais novo, e e isso que tira o teto da
+    latencia de captura.
+
+    Falha de leitura tem um equivalente declarado do comportamento
+    antigo. O laco antigo contava as falhas seguidas de read() e, com
+    _CAPTURE_MAX_FAILURES, imprimia o aviso e saia; abaixo do limite,
+    girava sem imshow e sem waitKey, com a janela congelada. Aqui a
+    thread conta as falhas seguidas e, no limite, marca a fonte como
+    morta e acorda quem espera; quem espera recebe None e o laco
+    imprime o mesmo aviso e sai. Abaixo do limite, nenhum quadro novo
+    chega e o consumidor fica bloqueado na espera: janela congelada e
+    teclas sem resposta, como antes. Uma leitura boa zera a contagem.
+    """
+
+    def __init__(self, capture):
+        self._capture = capture
+        self._condition = threading.Condition()
+        self._thread = threading.Thread(
+            target=self._pump, name="draw-capture", daemon=True
+        )
+        self._frame = None
+        self._seq = 0
+        self._taken_seq = 0
+        self._capture_ms = 0
+        self._dropped = 0
+        self._failures = 0
+        self._dead = False
+        self._stopped = False
+
+    def start(self):
+        self._thread.start()
+        return self
+
+    def _pump(self):
+        try:
+            self._pump_loop()
+        finally:
+            with self._condition:
+                if not self._stopped:
+                    self._dead = True
+                self._condition.notify_all()
+
+    def _pump_loop(self):
+        while True:
+            with self._condition:
+                if self._stopped:
+                    return
+            ok, frame = self._capture.read()
+            if ok and frame is not None:
+                capture_ms = int(time.monotonic() * 1000)
+                with self._condition:
+                    if self._stopped:
+                        return
+                    if self._seq > self._taken_seq:
+                        self._dropped += 1
+                    self._seq += 1
+                    self._frame = frame
+                    self._capture_ms = capture_ms
+                    self._failures = 0
+                    self._condition.notify_all()
+            else:
+                with self._condition:
+                    if self._stopped:
+                        return
+                    self._failures += 1
+                    if self._failures >= _CAPTURE_MAX_FAILURES:
+                        self._dead = True
+                        self._condition.notify_all()
+                        return
+                time.sleep(_READ_RETRY_SECONDS)
+
+    def wait_next(self, after_seq, timeout=None):
+        """Espera um quadro com sequencia maior que after_seq.
+
+        Devolve (frame, capture_ms, seq). Devolve None quando a
+        fonte morreu, quando stop() foi chamado ou quando o timeout
+        vence sem quadro novo; quem chama distingue por dead.
+        """
+        with self._condition:
+            self._condition.wait_for(
+                lambda: (
+                    self._seq > after_seq or self._dead or self._stopped
+                ),
+                timeout=timeout,
+            )
+            if self._seq > after_seq:
+                self._taken_seq = self._seq
+                return self._frame, self._capture_ms, self._seq
+            return None
+
+    @property
+    def dead(self):
+        with self._condition:
+            return self._dead
+
+    @property
+    def dropped(self):
+        with self._condition:
+            return self._dropped
+
+    @property
+    def failures(self):
+        with self._condition:
+            return self._failures
+
+    def stop(self):
+        """Para a thread e libera a captura.
+
+        O release() tenta destravar um read() pendurado no driver.
+        Se mesmo assim a thread nao voltar, o join tem teto e a
+        thread e daemon: a saida do app nao depende dela.
+        """
+        with self._condition:
+            self._stopped = True
+            self._condition.notify_all()
+        self._capture.release()
+        self._thread.join(timeout=2.0)
+
+
+class _PngWriter:
+    """Escritora de PNG em thread unica, para o imwrite sair do laco.
+
+    Medido no laboratorio (draw-lab/bottleneck-2026-10-30/loop): o
+    imwrite sincrono de um frame cru custa 50 a 71 ms (zlib) e o do
+    canvas, 10 a 12 ms; dentro do laco, cada salvamento era um
+    engasgo inteiro. save() copia a imagem e enfileira; a escritora
+    grava em ordem e roda o callback de confirmacao depois da
+    escrita, que e onde moram o contador e o print de "salvo".
+    close() enfileira o fim da fila e espera a drenagem com teto de
+    _PNG_DRAIN_SECONDS: a saida nao trava num disco patologico, e o
+    que nao drenar a tempo fica por conta da thread daemon.
+    """
+
+    def __init__(self):
+        self._queue = queue.SimpleQueue()
+        self._thread = threading.Thread(
+            target=self._work, name="draw-png-writer", daemon=True
+        )
+        self._thread.start()
+
+    def save(self, path, image, on_done=None):
+        self._queue.put((Path(path), image.copy(), on_done))
+
+    def _work(self):
+        while True:
+            item = self._queue.get()
+            if item is None:
+                return
+            path, image, on_done = item
+            cv2.imwrite(str(path), image)
+            if on_done is not None:
+                on_done(path)
+
+    def close(self):
+        self._queue.put(None)
+        self._thread.join(timeout=_PNG_DRAIN_SECONDS)
 
 
 def parse_source(value):
@@ -461,9 +646,54 @@ def _compose_view(camera_img, canvas_img):
     )
     divider = np.full((cam.shape[0], 6, 3), (60, 60, 60), dtype=np.uint8)
     view = np.hstack([cam, divider, sheet])
-    if view.shape[1] > 1600:
-        scale = 1600 / view.shape[1]
-        view = cv2.resize(view, (1600, int(view.shape[0] * scale)))
+    if view.shape[:2] != (640, 1600):
+        # Tamanho final fixo: sem isto, a geometria da janela
+        # depende do tamanho entregue pela camera (com 1289x710 o
+        # resize antigo cortava a altura para 632; com 1280x720
+        # ele nem rodava e a vista saia com 1596 de largura).
+        view = cv2.resize(view, (1600, 640))
+    return view
+
+
+def _dead_source_view(last_view):
+    """Quadro de aviso da fonte morta, desenhado sobre a ultima vista.
+
+    Sem nenhum quadro exibido ainda, o aviso vai sobre um fundo
+    solido no formato da vista composta. O texto usa a mesma
+    mensagem do aviso no console, sem acentos, como o restante dos
+    textos que o app desenha com a fonte Hershey.
+    """
+    if last_view is not None:
+        view = last_view.copy()
+    else:
+        view = np.full((640, 1280, 3), (30, 30, 30), dtype=np.uint8)
+    cv2.putText(
+        view,
+        "A fonte de video morreu",
+        (40, 90),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        1.2,
+        (0, 0, 255),
+        3,
+    )
+    cv2.putText(
+        view,
+        "A camera parou de entregar quadros.",
+        (40, 140),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.8,
+        (255, 255, 255),
+        2,
+    )
+    cv2.putText(
+        view,
+        "Feche outros programas usando a camera e tente de novo.",
+        (40, 180),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.8,
+        (255, 255, 255),
+        2,
+    )
     return view
 
 
@@ -569,6 +799,8 @@ def run(
         return _detect_sheet_combined(frame, neural_detector)
 
     capture = _open_capture(parse_source(source))
+    frame_source = _LatestFrameCapture(capture).start()
+    png_writer = _PngWriter()
     save_path = Path(save_dir)
     if markers_mode:
         print("Draw v0 rodando. Mostre a folha-modelo para a camera.")
@@ -596,12 +828,15 @@ def run(
     loop_frames = 0
 
     def save_raw_frame(img):
-        nonlocal frames_saved
         frames_path.mkdir(parents=True, exist_ok=True)
         out = frames_path / f"frame_{int(time.time() * 1000)}.png"
-        cv2.imwrite(str(out), img)
-        frames_saved += 1
-        print(f"Frame salvo em {out} (total: {frames_saved}).")
+
+        def _saved(path):
+            nonlocal frames_saved
+            frames_saved += 1
+            print(f"Frame salvo em {path} (total: {frames_saved}).")
+
+        png_writer.save(out, img, _saved)
 
     def handle_capture_key(key, img):
         nonlocal auto_capture, restart_reference
@@ -628,25 +863,41 @@ def run(
     corner_history = deque(maxlen=_INK_CORNER_HISTORY)
     ink_session_open = False
     accumulated_canvas = None
+    # Buffers donos dos canvas renderizados no laco. O acumulado
+    # mora em canvas_buffer de um frame de deteccao ao outro, e
+    # view_canvas_buffer serve aos canvas transitorios de exibicao.
+    # Sao buffers separados porque o acumulado e retido entre
+    # frames: nenhum outro uso pode escrever nele.
+    canvas_buffer = np.empty(
+        (ink_module.config.PAPER_H, ink_module.config.PAPER_W, 3),
+        dtype=np.uint8,
+    )
+    view_canvas_buffer = np.empty_like(canvas_buffer)
     frame_number = 0
-    falhas_seguidas = 0
+    last_seq = 0
+    last_view = None
     while True:
-        ok, frame = capture.read()
-        if not ok:
-            falhas_seguidas += 1
-            if falhas_seguidas >= 15:
-                print(
-                    "A camera abriu, mas parou de entregar quadros. "
-                    "Feche outros programas usando a camera e tente de novo."
-                )
-                break
-            continue
-        falhas_seguidas = 0
-        # Instante de captura aproximado: a câmera não expõe carimbo
-        # de hardware neste caminho, então vale o instante logo após
-        # a leitura do frame, o mais próximo da captura que o laço
-        # conhece. É ele que carimba os pixels no acumulador.
-        frame_capture_ms = int(time.monotonic() * 1000)
+        item = frame_source.wait_next(last_seq)
+        if item is None:
+            # A thread de captura declarou a fonte morta (falhas
+            # seguidas de leitura ou excecao no read) e wait_next
+            # acordou sem quadro. O aviso vai para o console e para
+            # a janela, sobre a ultima vista, e fica _DEAD_NOTICE_MS
+            # ou ate uma tecla: so o console seria um congelamento
+            # silencioso para quem esta olhando a janela.
+            print(
+                "A camera abriu, mas parou de entregar quadros. "
+                "Feche outros programas usando a camera e tente de novo."
+            )
+            cv2.imshow("Draw", _dead_source_view(last_view))
+            cv2.waitKey(_DEAD_NOTICE_MS)
+            break
+        frame, frame_capture_ms, last_seq = item
+        # O carimbo de captura nasce na thread de captura, logo que
+        # o read() retorna la: a camera nao expoe carimbo de
+        # hardware neste caminho, entao esse e o instante mais perto
+        # da captura que o app conhece. E ele que carimba os pixels
+        # no acumulador, como fazia o carimbo tirado no laco.
 
         loop_frames += 1
         if auto_capture and loop_frames % 10 == 0:
@@ -654,6 +905,7 @@ def run(
 
         if markers_mode:
             warped, markers = paper_module.warp_paper(frame)
+            sheet_present = warped is not None
         else:
             markers = {}
             if tracker.should_detect(frame_number):
@@ -674,11 +926,14 @@ def run(
                 freeze_pending = False
 
             frame_number += 1
-            warped = (
-                paper_module.warp_sheet(frame, tracker.corners)
-                if tracker.corners is not None
-                else None
-            )
+            # Presenca e o estado do rastreador: warp_sheet com
+            # cantos nunca devolve None, entao o warp por quadro
+            # era so um teste de presenca caro, e o resultado era
+            # descartado. O unico consumo dos pixels fora do bloco
+            # de tinta e o fallback de exibicao, que retifica sob
+            # demanda.
+            sheet_present = tracker.corners is not None
+            warped = None
 
             if ran_detection and tracker.corners is not None:
                 if not ink_session_open:
@@ -738,7 +993,8 @@ def run(
                     ink_accumulator.update(
                         observed, visible,
                         t_capture_ms=frame_capture_ms
-                    )
+                    ),
+                    out=canvas_buffer,
                 )
 
         status = frame.copy()
@@ -750,7 +1006,7 @@ def run(
             cv2.polylines(status, [outline], True, (0, 255, 0), 2)
             for x, y in tracker.corners:
                 cv2.circle(status, (int(x), int(y)), 8, (0, 255, 0), -1)
-        if warped is None:
+        if not sheet_present:
             if markers_mode:
                 status_text = (
                     f"Mostre a folha-modelo ({len(markers)}/4 marcadores)"
@@ -771,7 +1027,8 @@ def run(
                 if accumulated_canvas is not None
                 else _blank_sheet()
             )
-            cv2.imshow("Draw", _compose_view(status, panel))
+            last_view = _compose_view(status, panel)
+            cv2.imshow("Draw", last_view)
         else:
             if not markers_mode:
                 if tracker.verdict == "blank_maybe":
@@ -805,20 +1062,30 @@ def run(
                 ink_mask = ink_module.extract_ink(
                     warped, clear_markers=True
                 )
-                canvas = ink_module.render_canvas(ink_mask)
+                canvas = ink_module.render_canvas(
+                    ink_mask, out=view_canvas_buffer
+                )
             elif accumulated_canvas is not None:
                 canvas = accumulated_canvas
             else:
-                ink_mask = ink_source(warped)
-                canvas = ink_module.render_canvas(ink_mask)
-            cv2.imshow("Draw", _compose_view(status, canvas))
+                ink_mask = ink_source(
+                    paper_module.warp_sheet(frame, tracker.corners)
+                )
+                canvas = ink_module.render_canvas(
+                    ink_mask, out=view_canvas_buffer
+                )
+            last_view = _compose_view(status, canvas)
+            cv2.imshow("Draw", last_view)
 
             key = cv2.waitKey(1) & 0xFF
             if key == ord("s"):
                 save_path.mkdir(parents=True, exist_ok=True)
                 out = save_path / f"canvas_{int(time.time())}.png"
-                cv2.imwrite(str(out), canvas)
-                print(f"Canvas salvo em {out}")
+                png_writer.save(
+                    out,
+                    canvas,
+                    lambda path: print(f"Canvas salvo em {path}"),
+                )
             handle_capture_key(key, frame)
             if key in (ord("q"), 27):
                 break
@@ -829,7 +1096,8 @@ def run(
         if key in (ord("q"), 27):
             break
 
-    capture.release()
+    frame_source.stop()
+    png_writer.close()
     cv2.destroyAllWindows()
 
 

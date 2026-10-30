@@ -297,11 +297,28 @@ class SessionBaselineInk:
         return np.where(ink, 255, 0).astype(np.uint8)
 
 
-def render_canvas(ink_mask):
-    """Renderiza o canvas digital: fundo branco, tinta preta."""
-    canvas = np.full(
-        (config.PAPER_H, config.PAPER_W, 3), 255, dtype=np.uint8
-    )
+def render_canvas(ink_mask, out=None):
+    """Renderiza o canvas digital: fundo branco, tinta preta.
+
+    Com out, escreve num buffer do chamador em vez de alocar um
+    canvas novo por chamada. O buffer precisa ter a forma e o tipo
+    do canvas; quem passa out é dono dele e decide se o conteúdo
+    pode ser sobrescrito na próxima chamada.
+    """
+    if out is None:
+        canvas = np.full(
+            (config.PAPER_H, config.PAPER_W, 3), 255, dtype=np.uint8
+        )
+    else:
+        if out.shape != (config.PAPER_H, config.PAPER_W, 3) \
+                or out.dtype != np.uint8:
+            raise ValueError(
+                "out de render_canvas precisa ser "
+                f"{(config.PAPER_H, config.PAPER_W, 3)} uint8, "
+                f"veio {out.shape} {out.dtype}"
+            )
+        canvas = out
+        canvas.fill(255)
     canvas[ink_mask > 0] = (0, 0, 0)
     return canvas
 
