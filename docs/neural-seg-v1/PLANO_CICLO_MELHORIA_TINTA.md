@@ -4,7 +4,7 @@
 
 **Princípio:** o modelo pode sugerir máscaras e apontar exemplos difíceis. Uma previsão não vira rótulo de treino sem revisão. O modelo não altera os próprios pesos durante a captura.
 
-**Estado:** proposta de planejamento, não autorização de execução. Antes de implementar o ciclo ou iniciar treino/envio ao Kaggle, a arquitetura precisa de revisão do Senado e o usuário precisa pedir explicitamente a execução no Kaggle.
+**Estado:** arquitetura revisada pelo Senado com veredito `CONDITIONAL`. A primeira etapa local foi implementada: criar um número definido de ciclos, congelar snapshots distintos com hashes e registrar se os dados só servem para exploração ou se podem sustentar uma alegação de qualidade. O treinador automático e a promoção continuam bloqueados até haver rótulos pixelwise adequados, avaliação real independente e integração de treino específica para segmentação de tinta. Nenhum kernel foi lançado por esta implementação.
 
 ## Resultado pretendido
 
@@ -104,3 +104,21 @@ Só `training_approved` entra no snapshot de treino. Aprovação para treino nã
 - O modelo anterior permanece disponível até a promoção ser confirmada.
 
 Até esses critérios serem atingidos, chamar o sistema de **ciclo experimental assistido por agentes**, não de autoaperfeiçoamento autônomo nem de modelo validado.
+
+## Implementação local disponível
+
+O primeiro estágio está em `tools/runner/improvement_loop.py`. Ele não chama Kaggle nem altera modelos. Inicializa um fluxo retomável com exatamente N slots, valida o manifesto de um snapshot, confere hashes das fontes, imagens e máscaras por frame, confirma que os IDs pertencem ao split congelado e que as contagens excluídas batem. Rejeita holdout com sobreposição de sessão/linhagem e não aceita reutilizar o mesmo conteúdo de dados em dois ciclos. Frames excluídos na revisão podem faltar no pacote, mas precisam constar como exclusões no manifesto. Um consenso de agentes pode ser registrado como `snapshot_frozen_exploratory`, mas não como evidência de qualidade real.
+
+```bash
+python3 -m tools.runner.improvement_loop init \
+  --workdir runs/ink-loop/<id> --cycles 5
+
+python3 -m tools.runner.improvement_loop freeze \
+  --workdir runs/ink-loop/<id> --cycle 1 \
+  --dataset-manifest captures/triage/training_ready/<run>/dataset_manifest.json
+
+python3 -m tools.runner.improvement_loop status \
+  --workdir runs/ink-loop/<id>
+```
+
+Cada slot representa uma versão nova e congelada dos dados, não uma repetição do mesmo treino. O comando `freeze` exige suporte de tinta supervisionada nos splits e hash íntegro das fontes. Hoje o manifesto do piloto de consenso não passa como ground truth humano, e não existe holdout real independente válido; portanto o estado que pode ser registrado com os dados atuais é exploratório. A etapa seguinte — treino sequencial, avaliação do candidato e decisão — só deve ser ligada quando a receita de segmentação consumir esses snapshots e o avaliador real independente existir. A execução Kaggle fica fora desta primeira etapa e exige pedido explícito do usuário.
