@@ -1,10 +1,8 @@
 """Relatorio de diagnostico por fonte de camera, sem acao no sistema.
 
 Este modulo so observa: abre a fonte, le alguns quadros e solta a
-captura. Ele nao anexa USB, nao muda grupo, nao liga servico e nao
-re-escreve o `python main.py --check`. O --check continua sendo o
-diagnostico porta a porta do upstream; aqui o foco e outro: para
-cada fonte, dizer se abriu, com qual backend, com quais props
+captura. Ele nao anexa USB, nao muda grupo nem liga servico. Aqui o
+foco e dizer, para cada fonte, se abriu, com qual backend, com quais props
 negociadas, quantos quadros chegaram e, se falhou, qual e o tipo
 do problema e o que fazer. URLs so sao testadas quando passadas
 explicitamente; probe_all() so testa fontes locais vindas de
@@ -93,14 +91,15 @@ def _fourcc_str(value):
 
 def probe_source(source, read_frames=3, deadline=_DEFAULT_DEADLINE_S,
                  open_timeout_ms=None, backend=None, backends=None,
-                 capture_factory=None, monotonic=None, sleep=None):
+                 capture_factory=None, monotonic=None, sleep=None,
+                 read_timeout_ms=None):
     """Sonda uma fonte e devolve um SourceReport, sem travar.
 
     deadline e o teto, em segundos de relogio de parede, para a
-    leitura de quadros depois da abertura. Ele limita o loop de
-    leitura; uma unica chamada read() bloqueante de um backend nao
-    pode ser interrompida por ele, por isso a abertura tambem usa
-    open_timeout_ms. A fabrica e injetavel para testes com mocks.
+    leitura de quadros depois da abertura. O backend recebe tambem
+    read_timeout_ms; se nao aceitar esse limite, a sonda falha sem
+    fazer uma leitura potencialmente bloqueante. A fabrica e
+    injetavel para testes com mocks.
     """
     clock = monotonic or time.monotonic
     sleeper = sleep or time.sleep
@@ -112,14 +111,13 @@ def probe_source(source, read_frames=3, deadline=_DEFAULT_DEADLINE_S,
     def recording_factory(parsed_source, candidate=None, params=None):
         attempted.append(candidate)
         factory = capture_factory or cv2.VideoCapture
-        # Ponte de integracao com a main: open_capture() da main chama
-        # a fabrica com (fonte, backend, params de timeout). Fabricas
-        # antigas (incluindo as de teste do senado) aceitam so 2
-        # argumentos; nesse caso, tenta sem params em vez de deixar
-        # a sonda de rede falhar com TypeError. Fabricas novas e o
-        # cv2.VideoCapture real recebem os 3 argumentos.
+        # Ponte de integração com a main: fábricas injetadas antigas
+        # podem aceitar só dois argumentos nos testes. A fábrica real
+        # nunca é reaberta sem os parâmetros de timeout pedidos.
         if params is None:
             return factory(parsed_source, candidate)
+        if capture_factory is None:
+            return factory(parsed_source, candidate, params)
         try:
             return factory(parsed_source, candidate, params)
         except TypeError:
@@ -128,6 +126,9 @@ def probe_source(source, read_frames=3, deadline=_DEFAULT_DEADLINE_S,
     open_kwargs = {}
     if open_timeout_ms is not None:
         open_kwargs["open_timeout_ms"] = open_timeout_ms
+    if read_timeout_ms is None:
+        read_timeout_ms = max(1, int(deadline * 1000))
+    open_kwargs["read_timeout_ms"] = read_timeout_ms
     if backend is not None:
         open_kwargs["backend"] = backend
     if backends is not None:
@@ -182,24 +183,63 @@ def probe_source(source, read_frames=3, deadline=_DEFAULT_DEADLINE_S,
         height_value = _get_prop(capture, cv2.CAP_PROP_FRAME_HEIGHT)
         fps_value = _get_prop(capture, cv2.CAP_PROP_FPS)
         fourcc_value = _get_prop(capture, cv2.CAP_PROP_FOURCC)
+        if capture_factory is None:
+            read_timeout_prop = getattr(
+                cv2, "CAP_PROP_READ_TIMEOUT_MSEC", None
+            )
+            enforced_read_timeout = (
+                _get_prop(capture, read_timeout_prop)
+                if read_timeout_prop is not None else None
+            )
+            if (
+                enforced_read_timeout is None
+                or enforced_read_timeout < read_timeout_ms
+            ):
+                return SourceReport(
+                    source=source,
+                    kind=kind,
+                    opened=True,
+                    backend_used=backend_used,
+                    width=int(width_value) if width_value else None,
+                    height=int(height_value) if height_value else None,
+                    fps=float(fps_value) if fps_value else None,
+                    fourcc=_fourcc_str(fourcc_value),
+                    frames_ok=0,
+                    latency_ms=None,
+                    error_kind="timeout_unsupported",
+                    hint=(
+                        "A fonte abriu, mas o backend não confirmou o "
+                        "timeout de leitura solicitado. A sonda não vai "
+                        "ler quadros sem um limite para evitar bloqueio."
+                    ),
+                )
         frames_ok = 0
         first_frame_at = None
+        read_error = None
+        read_started = clock()
         while frames_ok < read_frames:
-            if clock() - start > deadline:
+            if clock() - read_started > deadline:
                 break
-            ok, frame = capture.read()
+            try:
+                ok, frame = capture.read()
+            except Exception as error:
+                read_error = error
+                break
             if ok and frame is not None:
                 if first_frame_at is None:
                     first_frame_at = clock()
                 frames_ok += 1
             else:
-                if clock() - start > deadline:
+                if clock() - read_started > deadline:
                     break
                 sleeper(_READ_SLEEP_S)
         latency_ms = None
         if first_frame_at is not None:
             latency_ms = int((first_frame_at - start) * 1000)
-        if frames_ok >= read_frames:
+        if read_error is not None:
+            error_kind = "read_error"
+            hint = f"Erro ao ler quadro da fonte: {read_error}."
+        elif frames_ok >= read_frames:
             error_kind = None
             hint = "Fonte abriu e entregou os quadros pedidos."
         elif frames_ok > 0:

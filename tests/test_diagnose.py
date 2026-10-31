@@ -93,6 +93,90 @@ def test_probe_three_frames_ok_records_backend_and_props():
     assert report.kind == "local"
 
 
+def test_probe_passes_open_and_read_timeouts_to_backend():
+    calls = []
+
+    def factory(source, backend=None, params=None):
+        calls.append((source, backend, params))
+        return _ok_factory(source, backend)
+
+    report = diagnose_module.probe_source(
+        "http://camera.local/video",
+        capture_factory=factory,
+        open_timeout_ms=1400,
+        read_timeout_ms=1800,
+    )
+
+    assert report.ok
+    assert calls == [(
+        "http://camera.local/video",
+        cv2.CAP_ANY,
+        [
+            cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 1400,
+            cv2.CAP_PROP_READ_TIMEOUT_MSEC, 1800,
+        ],
+    )]
+
+
+def test_probe_frame_deadline_starts_after_open():
+    clock = [0.0]
+
+    def factory(source, backend=None, params=None):
+        clock[0] = 10.0
+        return _ok_factory(source, backend)
+
+    report = diagnose_module.probe_source(
+        "recording.mp4",
+        read_frames=1,
+        deadline=0.1,
+        capture_factory=factory,
+        monotonic=lambda: clock[0],
+    )
+
+    assert report.ok
+
+
+def test_probe_does_not_read_when_backend_cannot_confirm_timeout(monkeypatch):
+    class UnboundedCapture(FakeCapture):
+        def __init__(self):
+            super().__init__("camera.mp4")
+            self.read_calls = 0
+
+        def read(self):
+            self.read_calls += 1
+            raise AssertionError("must not read without a timeout")
+
+    capture = UnboundedCapture()
+    monkeypatch.setattr(capture_module, "open_capture", lambda *args, **kwargs: capture)
+
+    report = diagnose_module.probe_source("camera.mp4")
+
+    assert report.error_kind == "timeout_unsupported"
+    assert "timeout de leitura" in report.hint
+    assert capture.read_calls == 0
+    assert capture.released is True
+
+
+def test_probe_does_not_retry_real_open_without_timeout_params(monkeypatch):
+    calls = []
+
+    def reject_timeout_params(source, backend=None, params=None):
+        calls.append((source, backend, params))
+        if params is not None:
+            raise TypeError("backend rejected timeout params")
+        return FakeCapture(source, backend)
+
+    monkeypatch.setattr(
+        diagnose_module.cv2, "VideoCapture", reject_timeout_params
+    )
+
+    report = diagnose_module.probe_source(0, read_timeout_ms=1000)
+
+    assert report.error_kind == "timeout_unsupported"
+    assert len(calls) == len(capture_module.backends_for_platform())
+    assert all(call[2] is not None for call in calls)
+
+
 def test_probe_opens_but_no_frames_reports_no_frames():
     report = diagnose_module.probe_source(
         0, deadline=0.05,
@@ -117,6 +201,23 @@ def test_probe_partial_frames_reports_no_frames():
     assert report.frames_ok == 1
     assert report.error_kind == "no_frames"
     assert report.ok is False
+
+
+def test_probe_read_exception_reports_failure_and_releases_capture():
+    class BrokenReadCapture(FakeCapture):
+        def read(self):
+            raise RuntimeError("read failed")
+
+    capture = BrokenReadCapture("recording.mp4")
+    report = diagnose_module.probe_source(
+        "recording.mp4",
+        capture_factory=lambda source, backend=None: capture,
+    )
+
+    assert report.opened is True
+    assert report.error_kind == "read_error"
+    assert "read failed" in report.hint
+    assert capture.released is True
 
 
 @pytest.mark.parametrize("kind,hint_fragment", [

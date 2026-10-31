@@ -2,8 +2,8 @@
 
 Caminho pedido (fiação atual do app, draw/app.py): com a flag de luz
 ligada, a detecção tenta "off" primeiro; se "off" já detectar, fica
-com "off"; senão tenta com "background". O resultado de "background"
-é descartado, voltando para a recusa de "off", quando (a) o interior
+com "off"; senão tenta "background". O resultado normalizado é
+descartado, voltando para a recusa de "off", quando (a) o interior
 do quad, medido no frame ORIGINAL, é majoritariamente saturado, ou
 (b) o quad é de quadro inteiro. A tinta continua seguindo a fiação
 atual do app: warp do frame original, normalização da folha
@@ -27,6 +27,7 @@ _MIN_UNSATURATED_FRACTION = 0.5
 _SATURATION_MAX = 60
 _FULL_FRAME_AREA_RATIO = 0.90
 _EDGE_FRACTION = 0.025
+LIGHT_GUARD_MODES = ("off", "background")
 
 
 def _interior_mask(frame, corners):
@@ -89,7 +90,7 @@ def is_full_frame_quad(frame_shape, corners):
 
 
 def guard_passes(frame, corners):
-    """True quando o resultado de background pode ser mantido."""
+    """True quando o resultado normalizado pode ser mantido."""
     if corners is None:
         return False
     if is_mostly_saturated(frame, corners):
@@ -100,23 +101,31 @@ def guard_passes(frame, corners):
 
 
 def detect_sheet_with_light_guard(frame, light_normalize="off"):
-    """Detecção com a guarda combinada. Devolve (cantos, veredito, modo).
+    """Detecção protegida. Devolve (cantos, veredito, modo aplicado).
 
     Com "off", é exatamente a detecção atual, modo vencedor "off".
     Com a flag ligada, tenta "off" primeiro; se "off" detectar
     (cantos não None, veredito "paper" ou "blank_maybe"), fica com
-    "off". Senão tenta "background": se passar na guarda, o modo
-    vencedor é "background"; se a guarda descartar, volta para o
+    "off". Senão tenta "background": se passar na guarda, ele vira o
+    modo vencedor; se a guarda descartar, volta para o
     resultado de "off", que é a recusa (None, None), com modo "off".
     O modo vencedor é o que a tinta deve usar, uma única vez, na
     folha retificada do frame original (ver draw/app.py).
     """
+    if light_normalize not in LIGHT_GUARD_MODES:
+        raise ValueError(
+            f"modo de guarda de luz inválido: {light_normalize!r}; "
+            f"use um de {LIGHT_GUARD_MODES}"
+        )
     corners, verdict = paper_module.detect_sheet_with_confidence(frame)
     if light_normalize == "off" or corners is not None:
         return corners, verdict, "off"
     bg_frame = light_module.normalize_light(frame, "background")
-    bg_corners, bg_verdict = paper_module.detect_sheet_with_confidence(
-        bg_frame)
-    if bg_corners is None or not guard_passes(frame, bg_corners):
+    normalized_corners, normalized_verdict = (
+        paper_module.detect_sheet_with_confidence(bg_frame)
+    )
+    if normalized_corners is None or not guard_passes(
+        frame, normalized_corners
+    ):
         return corners, verdict, "off"
-    return bg_corners, bg_verdict, "background"
+    return normalized_corners, normalized_verdict, "background"

@@ -60,7 +60,7 @@ def _apply_shadow(scene):
 def test_off_wins_when_it_already_detects():
     scene, _, corners_gt = selftest_module.build_markerless_scene()
     corners, verdict, mode = guard_module.detect_sheet_with_light_guard(
-        scene, "both"
+        scene, "background"
     )
     assert verdict == "paper" and mode == "off"
     assert float(np.linalg.norm(corners - corners_gt, axis=1).max()) <= 12.0
@@ -75,7 +75,7 @@ def test_background_rescues_shadow_and_low_light():
         corners_off, _ = paper_module.detect_sheet_with_confidence(variant)
         assert corners_off is None
         corners, verdict, mode = guard_module.detect_sheet_with_light_guard(
-            variant, "both"
+            variant, "background"
         )
         assert verdict == "paper" and mode == "background"
         assert float(np.linalg.norm(corners - corners_gt, axis=1).max()) <= 12.0
@@ -88,6 +88,30 @@ def test_off_flag_is_unchanged():
         variant, "off"
     )
     assert (corners, verdict, mode) == (None, None, "off")
+
+
+def test_fallback_uses_supported_normalization_mode(monkeypatch):
+    frame = np.zeros((10, 10, 3), dtype=np.uint8)
+    corners = np.zeros((4, 2), dtype=np.float32)
+    detections = iter(((None, None), (corners, "paper")))
+    modes = []
+    monkeypatch.setattr(
+        paper_module,
+        "detect_sheet_with_confidence",
+        lambda image: next(detections),
+    )
+    monkeypatch.setattr(
+        light_module,
+        "normalize_light",
+        lambda image, mode: modes.append(mode) or image,
+    )
+    monkeypatch.setattr(guard_module, "guard_passes", lambda image, quad: True)
+
+    result = guard_module.detect_sheet_with_light_guard(frame, "background")
+
+    assert result[0] is corners
+    assert result[1:] == ("paper", "background")
+    assert modes == ["background"]
 
 
 def test_kraft_detected_by_background_is_discarded():
@@ -105,7 +129,7 @@ def test_kraft_detected_by_background_is_discarded():
     assert guard_module.unsaturated_fraction(scene, BASE_DST) < 0.5
     assert not guard_module.guard_passes(scene, bg_corners)
     corners, verdict, mode = guard_module.detect_sheet_with_light_guard(
-        scene, "both"
+        scene, "background"
     )
     assert (corners, verdict, mode) == (None, None, "off")
 
@@ -174,7 +198,7 @@ def _assert_background_rescue(variant, corners_gt):
     corners_off, _ = paper_module.detect_sheet_with_confidence(variant)
     assert corners_off is None
     corners, verdict, mode = guard_module.detect_sheet_with_light_guard(
-        variant, "both"
+        variant, "background"
     )
     assert verdict == "paper" and mode == "background"
     assert float(np.linalg.norm(corners - corners_gt, axis=1).max()) <= 12.0
@@ -189,7 +213,7 @@ def test_nested_scene_recovered_via_off():
     )
     assert verdict_off == "paper" and corners_off is not None
     corners, verdict, mode = guard_module.detect_sheet_with_light_guard(
-        scene, "both"
+        scene, "background"
     )
     assert verdict == "paper" and mode == "off"
     assert float(np.linalg.norm(corners - corners_gt, axis=1).max()) <= 12.0
@@ -262,7 +286,7 @@ def test_full_frame_low_light_noisy_is_safe_refusal():
     assert guard_module.is_full_frame_quad(variant.shape, bg_corners)
     assert not guard_module.guard_passes(variant, bg_corners)
     corners, verdict, mode = guard_module.detect_sheet_with_light_guard(
-        variant, "both"
+        variant, "background"
     )
     assert (corners, verdict, mode) == (None, None, "off")
 
@@ -281,6 +305,6 @@ def test_negatives_have_no_new_false_positive_via_guard():
     }
     for name, negative in scenes.items():
         _, verdict, _ = guard_module.detect_sheet_with_light_guard(
-            negative, "both"
+            negative, "background"
         )
         assert verdict != "paper", f"falso positivo via guarda: {name}"

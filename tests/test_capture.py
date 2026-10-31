@@ -210,6 +210,38 @@ def test_open_capture_network_fails_closed_when_timeout_binding_is_missing(monke
     assert calls == []
 
 
+def test_open_capture_local_fails_closed_when_read_timeout_binding_is_missing(monkeypatch):
+    monkeypatch.delattr(cv2, "CAP_PROP_READ_TIMEOUT_MSEC")
+    calls = []
+
+    with pytest.raises(capture_module.CaptureError) as excinfo:
+        capture_module.open_capture(
+            0,
+            read_timeout_ms=5000,
+            capture_factory=lambda *args: calls.append(args),
+        )
+
+    assert excinfo.value.kind == "timeout_unsupported"
+    assert calls == []
+
+
+def test_open_capture_local_does_not_retry_without_requested_read_timeout():
+    calls = []
+
+    def factory(source, backend=None, params=None):
+        calls.append((source, backend, params))
+        raise TypeError("backend rejects timeout params")
+
+    with pytest.raises(capture_module.CaptureError) as excinfo:
+        capture_module.open_capture(
+            0, read_timeout_ms=5000, capture_factory=factory
+        )
+
+    assert excinfo.value.kind == "timeout_unsupported"
+    assert calls
+    assert all(call[2] is not None for call in calls)
+
+
 def test_open_capture_local_missing_node_reports_not_found(monkeypatch):
     monkeypatch.setattr(capture_module.sys, "platform", "linux")
     monkeypatch.setattr(capture_module, "is_wsl", lambda: False)
@@ -284,6 +316,61 @@ def test_reconnect_succeeds_on_second_attempt_and_fails_cleanly():
         0, open_func=open_never, attempts=0, delay_s=0, sleep=lambda seconds: None
     )
     assert off.try_reconnect() is False
+
+
+def test_latest_frame_capture_reconnects_after_read_exception(monkeypatch):
+    class ReconnectAfterReadError:
+        def __init__(self):
+            self.reconnected = False
+            self.reconnect_calls = 0
+            self.released = False
+
+        def read(self):
+            if not self.reconnected:
+                raise RuntimeError("camera disconnected")
+            return True, np.zeros((2, 2, 3), dtype=np.uint8)
+
+        def try_reconnect(self):
+            self.reconnect_calls += 1
+            self.reconnected = True
+            return True
+
+        def release(self):
+            self.released = True
+
+    monkeypatch.setattr(app_module, "_CAPTURE_MAX_FAILURES", 1)
+    capture = ReconnectAfterReadError()
+    source = app_module._LatestFrameCapture(capture).start()
+    try:
+        item = source.wait_next(0, timeout=1.0)
+        assert item is not None
+        assert item[0].shape == (2, 2, 3)
+        assert capture.reconnect_calls == 1
+    finally:
+        source.stop()
+    assert capture.released is True
+
+
+def test_latest_frame_capture_preserves_read_exception_when_reconnect_fails(
+    monkeypatch,
+):
+    class LostCapture:
+        def read(self):
+            raise RuntimeError("camera disconnected")
+
+        def try_reconnect(self):
+            return False
+
+        def release(self):
+            pass
+
+    monkeypatch.setattr(app_module, "_CAPTURE_MAX_FAILURES", 1)
+    source = app_module._LatestFrameCapture(LostCapture()).start()
+    try:
+        assert source.wait_next(0, timeout=1.0) is None
+        assert "camera disconnected" in str(source.last_error)
+    finally:
+        source.stop()
 
 
 def test_app_list_cameras_cli_exits_with_status(monkeypatch, capsys):

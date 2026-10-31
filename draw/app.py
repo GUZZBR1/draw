@@ -306,6 +306,7 @@ class _LatestFrameCapture:
         self._capture_ms = 0
         self._dropped = 0
         self._failures = 0
+        self._last_read_error = None
         self._dead = False
         self._stopped = False
 
@@ -327,7 +328,12 @@ class _LatestFrameCapture:
             with self._condition:
                 if self._stopped:
                     return
-            ok, frame = self._capture.read()
+            read_error = None
+            try:
+                ok, frame = self._capture.read()
+            except Exception as error:
+                read_error = error
+                ok, frame = False, None
             if ok and frame is not None:
                 capture_ms = int(time.monotonic() * 1000)
                 with self._condition:
@@ -339,13 +345,29 @@ class _LatestFrameCapture:
                     self._frame = frame
                     self._capture_ms = capture_ms
                     self._failures = 0
+                    self._last_read_error = None
                     self._condition.notify_all()
             else:
                 with self._condition:
                     if self._stopped:
                         return
                     self._failures += 1
-                    if self._failures >= _CAPTURE_MAX_FAILURES:
+                    if read_error is not None:
+                        self._last_read_error = read_error
+                    reconnect_needed = (
+                        self._failures >= _CAPTURE_MAX_FAILURES
+                    )
+                if reconnect_needed:
+                    reconnect = getattr(self._capture, "try_reconnect", None)
+                    if reconnect is not None and reconnect():
+                        with self._condition:
+                            if self._stopped:
+                                return
+                            self._failures = 0
+                        continue
+                    with self._condition:
+                        if self._stopped:
+                            return
                         self._dead = True
                         self._condition.notify_all()
                         return
@@ -384,6 +406,12 @@ class _LatestFrameCapture:
     def failures(self):
         with self._condition:
             return self._failures
+
+    @property
+    def last_error(self):
+        with self._condition:
+            read_error = self._last_read_error
+        return read_error or getattr(self._capture, "last_error", None)
 
     def stop(self):
         """Para a thread e libera a captura.
@@ -757,6 +785,23 @@ def _detect_sheet_combined(frame, neural_detector, classic_detect=None):
     return classic_detect(frame)
 
 
+def _detect_sheet_for_run(frame, neural_detector, light_normalize,
+                          winning_light):
+    """Detecta a folha e registra a normalização que a guarda aceitou."""
+    winning_light["mode"] = "off"
+
+    def classic_with_light_guard(candidate_frame):
+        corners, verdict, winning = detect_sheet_with_light_guard(
+            candidate_frame, light_normalize
+        )
+        winning_light["mode"] = winning
+        return corners, verdict
+
+    return _detect_sheet_combined(
+        frame, neural_detector, classic_with_light_guard
+    )
+
+
 def run(source=0, save_dir="captures", markers_mode=False, width=None,
         height=None, fps=None, backend=None, reconnect_attempts=3,
         open_timeout_ms=3000, neural_model=None, capture_all_frames=False,
@@ -822,22 +867,9 @@ def run(source=0, save_dir="captures", markers_mode=False, width=None,
     winning_light = {"mode": light_normalize}
 
     def detect_sheet(frame):
-        # Reserva classica do fork: a guarda de luz, em vez do
-        # classico puro do upstream. O portao de veto neural e a
-        # presenca sem quadrilatero vem de _detect_sheet_combined.
-        def classic_with_light_guard(frame):
-            corners, verdict, winning = detect_sheet_with_light_guard(
-                frame, light_normalize
-            )
-            winning_light["mode"] = winning
-            return corners, verdict
-
-        corners, verdict = _detect_sheet_combined(
-            frame, neural_detector, classic_with_light_guard
+        return _detect_sheet_for_run(
+            frame, neural_detector, light_normalize, winning_light
         )
-        if corners is not None:
-            winning_light["mode"] = light_normalize
-        return corners, verdict
     parsed = parse_source(source)
     # Captura latest-frame do upstream no lugar do laco de
     # reconexao do fork: a thread conta as falhas e declara a fonte
@@ -857,6 +889,12 @@ def run(source=0, save_dir="captures", markers_mode=False, width=None,
     if open_timeout_ms != 3000:
         open_kwargs["open_timeout_ms"] = open_timeout_ms
     capture = _open_capture(parsed, **open_kwargs)
+    if reconnect_attempts > 0:
+        capture = capture_module.ReconnectingCapture(
+            parsed,
+            attempts=reconnect_attempts,
+            **open_kwargs,
+        ).attach(capture)
     frame_source = _LatestFrameCapture(capture).start()
     png_writer = _PngWriter()
     save_path = Path(save_dir)

@@ -1,4 +1,4 @@
-"""Normalização de luz, atrás de flag, sem mudar o padrão.
+"""Normalização de luz experimental, atrás de flag, sem mudar o padrão.
 
 Problema medido (régua sintética do Senado, não chute): sombra e luz
 baixa falham no portão de textura, não na geometria. A fração de branco
@@ -28,11 +28,15 @@ Retinex multi-escala (log(I) − log(G∗I)) foi prototipado e descartado:
 resgatava a detecção, mas derrubava o recall para ~88% e transformava
 brilho em blank_maybe. Não está implementado, de propósito.
 
-Onde aplicar (ver draw/app.py): na detecção, o frame normalizado vai
-para detect_sheet_with_confidence; na tinta, a folha retificada (do
-frame original) é normalizada separadamente antes de extract_ink.
-Normalizar duas vezes a mesma imagem seria erro: o frame normalizado
-não é retificado de novo, e a folha retificada é normalizada uma vez.
+Fiação atual do app: somente "background" está exposto por
+--light-normalize, e a detecção passa por draw/light_guard.py. A guarda
+tenta primeiro o frame original e só conserva "background" se o
+candidato normalizado passar nas verificações de papel colorido e
+quadro inteiro. A tinta usa o modo vencedor na folha retificada do
+frame original. "clahe" e "both" continuam disponíveis nesta
+biblioteca para medições experimentais; não fazem parte da fiação do
+app nem da flag CLI. Os resultados desses modos nos testes são
+medições da biblioteca, não validação da fiação de produção.
 """
 
 import cv2

@@ -174,7 +174,7 @@ def apply_local_settings(capture, width=None, height=None, fps=None):
 
 
 def _timeout_parameters(open_timeout_ms=None, read_timeout_ms=None):
-    """Build the open-only timeout params supported by this cv2 binding."""
+    """Build timeout params supported by this cv2 binding."""
     params = []
     missing = []
     for name, value in (
@@ -224,6 +224,18 @@ def open_capture(source, width=None, height=None, fps=None, backend=None,
     timeout_params, missing_timeout_params = _timeout_parameters(
         open_timeout_ms, read_timeout_ms
     )
+    missing_required_timeouts = (
+        missing_timeout_params if read_timeout_ms is not None else []
+    )
+    if missing_required_timeouts:
+        raise CaptureError(
+            parsed,
+            "timeout_unsupported",
+            "Nao foi possivel testar a fonte com seguranca: esta build "
+            "do OpenCV nao expoe todos os timeouts pedidos "
+            f"({', '.join(missing_required_timeouts)}). A sonda nao vai "
+            "fazer uma abertura ou leitura que possa ficar bloqueada.",
+        )
     if not local_source and missing_timeout_params:
         missing = ", ".join(missing_timeout_params)
         raise CaptureError(
@@ -245,7 +257,7 @@ def open_capture(source, width=None, height=None, fps=None, backend=None,
                 except Exception as error:
                     timeout_error = error
                     _release_quietly(capture)
-                    if not local_source:
+                    if not local_source or read_timeout_ms is not None:
                         attempts.append(candidate)
                         continue
                     capture = factory(parsed, candidate)
@@ -253,6 +265,9 @@ def open_capture(source, width=None, height=None, fps=None, backend=None,
                 else:
                     if local_source and not opened:
                         _release_quietly(capture)
+                        if read_timeout_ms is not None:
+                            attempts.append(candidate)
+                            continue
                         capture = factory(parsed, candidate)
                         opened = bool(capture.isOpened())
             else:
@@ -281,6 +296,15 @@ def open_capture(source, width=None, height=None, fps=None, backend=None,
     else:
         kind = "not_found"
         hint = "Confira se o arquivo existe e se o caminho esta certo."
+    if read_timeout_ms is not None and timeout_error is not None:
+        raise CaptureError(
+            parsed,
+            "timeout_unsupported",
+            "Nao foi possivel abrir a fonte com timeout de leitura; "
+            "a sonda nao vai repetir a abertura sem esse limite. "
+            f"Detalhe: {timeout_error}",
+            attempts=attempts,
+        )
     if not local_source:
         hint += (
             " A abertura foi tentada com parametros de timeout e nao foi "
