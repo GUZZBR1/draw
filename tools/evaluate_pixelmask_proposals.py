@@ -102,7 +102,7 @@ def load_review_tags(path: Path) -> dict[tuple[str, str], set[str]]:
         }
 
 
-def infer_four_class(session, image_rgb: np.ndarray) -> np.ndarray:
+def infer_four_class(session, image_rgb: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     # This is the preprocessing written into training/train.py: square 512,
     # RGB, ImageNet normalization. Restore class IDs at original dimensions.
     from training.train import IMAGENET_MEAN, IMAGENET_STD
@@ -112,8 +112,63 @@ def infer_four_class(session, image_rgb: np.ndarray) -> np.ndarray:
     input_name = session.get_inputs()[0].name
     output_name = session.get_outputs()[0].name
     logits = session.run([output_name], {input_name: image.transpose(2, 0, 1)[None]})[0][0]
+    # Match training evaluation: bilinearly resize logits to input resolution,
+    # then classify. Upsampling argmax labels would change thin boundaries.
+    logits = np.stack([
+        cv2.resize(channel, (512, 512), interpolation=cv2.INTER_LINEAR)
+        for channel in logits
+    ])
     labels = logits.argmax(axis=0).astype(np.uint8)
-    return cv2.resize(labels, (image_rgb.shape[1], image_rgb.shape[0]), interpolation=cv2.INTER_NEAREST)
+    shifted = logits - logits.max(axis=0, keepdims=True)
+    probabilities = np.exp(shifted)
+    probabilities /= probabilities.sum(axis=0, keepdims=True)
+    confidence = probabilities.max(axis=0).astype(np.float32)
+    size = (image_rgb.shape[1], image_rgb.shape[0])
+    labels = cv2.resize(labels, size, interpolation=cv2.INTER_NEAREST)
+    confidence = cv2.resize(confidence, size, interpolation=cv2.INTER_NEAREST)
+    return labels, confidence
+
+
+def cascade_refine(
+    classical: np.ndarray,
+    neural: np.ndarray,
+    confidence: np.ndarray,
+    context: dict[str, np.ndarray | bool],
+    tags: set[str],
+    minimum_confidence: float,
+) -> np.ndarray:
+    """Fill a conservative subset of OpenCV unknown pixels with ML proposals.
+
+    Existing OpenCV decisions are immutable. Context from the first stage
+    bounds predicted background, paper, and hand pixels. Class 3 is disabled
+    on frames tagged with printed text because the model cannot separate print
+    from user ink reliably in this pilot.
+    """
+    if classical.shape != neural.shape or classical.shape != confidence.shape:
+        raise ValueError("cascade masks and confidence must have identical dimensions")
+    paper_region = np.asarray(context["paper_region"], dtype=bool)
+    paper_candidate = np.asarray(context["paper_candidate"], dtype=bool)
+    paper_core = np.asarray(context["paper_core"], dtype=bool)
+    likely_skin = np.asarray(context["likely_skin"], dtype=bool)
+    if any(region.shape != classical.shape for region in (paper_region, paper_candidate, paper_core, likely_skin)):
+        raise ValueError("OpenCV context masks must match the proposal dimensions")
+    out = classical.copy()
+    uncertain = classical == 255
+    high_confidence = confidence >= minimum_confidence
+    paper_detected = bool(context["paper_detected"])
+    hand_tagged = bool({"hand_on_paper", "hand_elsewhere"} & tags)
+    allowed = {
+        0: paper_detected & ~paper_region & ~likely_skin,
+        1: paper_candidate & ~likely_skin,
+        2: hand_tagged & likely_skin,
+        3: paper_core & ("user_added_ink" in tags) & ("printed_text" not in tags),
+    }
+    for class_id, region in allowed.items():
+        if not isinstance(region, np.ndarray):
+            region = np.full(classical.shape, bool(region), dtype=bool)
+        fill = uncertain & high_confidence & (neural == class_id) & region
+        out[fill] = class_id
+    return out
 
 
 def infer_ink(session, image_rgb: np.ndarray) -> np.ndarray:
@@ -151,11 +206,15 @@ def main() -> int:
     parser.add_argument("--no-segformer", action="store_true")
     parser.add_argument("--no-ink-model", action="store_true")
     parser.add_argument("--reuse-predictions", action="store_true", help="reuse existing prediction PNGs in output-dir")
+    parser.add_argument("--refine-confidence", type=float, default=0.90,
+                        help="minimum SegFormer softmax confidence to fill OpenCV unknown pixels (default: 0.90)")
     args = parser.parse_args()
     for name in ("pack", "review_tags", "segformer_model", "ink_model", "output_dir"):
         setattr(args, name, getattr(args, name).resolve())
     if not args.output_dir.is_relative_to(ROOT):
         parser.error("--output-dir must stay inside the repository")
+    if not 0.5 <= args.refine_confidence <= 1.0:
+        parser.error("--refine-confidence must be between 0.5 and 1")
     with (args.pack / "samples.csv").open(newline="", encoding="utf-8") as stream:
         rows = list(csv.DictReader(stream))
     if not rows:
@@ -191,6 +250,8 @@ def main() -> int:
         "ink_specialist": digest(args.ink_model) if ink_session is not None else None,
     }
     tool_hash = digest(Path(__file__))
+    proposer_hash = digest(ROOT / "tools/propose_semantic_masks.py")
+    preprocessing_hash = digest(ROOT / "training/train.py")
     input_hashes = {}
     for row in rows:
         image_path = (args.pack / row["image_path"]).resolve()
@@ -203,6 +264,8 @@ def main() -> int:
             cache_manifest.get("input_sha256") != input_hashes
             or cache_manifest.get("model_sha256") != model_hashes
             or cache_manifest.get("tool_sha256") != tool_hash
+            or cache_manifest.get("proposer_sha256") != proposer_hash
+            or cache_manifest.get("preprocessing_sha256") != preprocessing_hash
         ):
             parser.error("cached predictions do not match the current inputs, models, and tool version")
     metrics_by_method: dict[str, list[dict]] = defaultdict(list)
@@ -218,21 +281,45 @@ def main() -> int:
         if digest(image_path) != row["image_sha256"] or digest(reference_path) != row["mask_sha256"]:
             raise ValueError(f"pilot checksum mismatch at {row['session_id']} frame {row['frame_index']}")
         image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-        proposal_cv, _ = propose_mask(image_bgr, tags.get((row["session_id"], row["frame_index"]), set()))
+        frame_tags = tags.get((row["session_id"], row["frame_index"]), set())
+        proposal_cv, _, context = propose_mask(image_bgr, frame_tags, return_context=True)
         predictions = {"opencv": proposal_cv}
         stem = f"{row['session_id']}_frame_{int(row['frame_index']):08d}"
         if four_class is not None:
             cached = args.output_dir / f"{stem}_segformer.png"
+            confidence_cache = args.output_dir / f"{stem}_segformer_confidence.png"
             cached_mask = cv2.imread(str(cached), cv2.IMREAD_GRAYSCALE) if args.reuse_predictions else None
             if args.reuse_predictions and cached_mask is None:
                 raise FileNotFoundError(f"cached segmentation prediction missing: {cached}")
-            predictions["segformer"] = cached_mask if cached_mask is not None else infer_four_class(four_class, image_rgb)
+            cached_confidence = cv2.imread(str(confidence_cache), cv2.IMREAD_UNCHANGED) if args.reuse_predictions else None
+            if args.reuse_predictions and cached_confidence is None:
+                raise FileNotFoundError(f"cached segmentation confidence missing: {confidence_cache}")
+            if cached_mask is None:
+                segformer_mask, confidence = infer_four_class(four_class, image_rgb)
+            else:
+                segformer_mask = cached_mask
+                confidence_scale = 65535.0 if cached_confidence.dtype == np.uint16 else 255.0
+                cached_confidence = cached_confidence.astype(np.float32)
+                confidence = cached_confidence / confidence_scale
+            predictions["segformer"] = segformer_mask
+            confidence_path = args.output_dir / f"{stem}_segformer_confidence.png"
+            if not args.reuse_predictions:
+                encoded_confidence = np.clip(confidence * 65535.0, 0, 65535).astype(np.uint16)
+                if not cv2.imwrite(str(confidence_path), encoded_confidence):
+                    raise OSError(f"failed to write confidence map: {confidence_path}")
             # Abstaining proposal: accept only pixels where both methods
             # agree. It narrows review; it does not establish label truth.
             agreement = np.full(proposal_cv.shape, 255, dtype=np.uint8)
-            agree = (proposal_cv == predictions["segformer"]) & (proposal_cv != 255)
+            agree = (proposal_cv == segformer_mask) & (proposal_cv != 255)
             agreement[agree] = proposal_cv[agree]
             predictions["agreement"] = agreement
+            # Cascade: OpenCV is the first-stage mask and owns every pixel it
+            # labeled. SegFormer may only fill its 255 abstentions when its
+            # maximum softmax probability clears the requested threshold.
+            predictions["cascade"] = cascade_refine(
+                proposal_cv, segformer_mask, confidence, context,
+                frame_tags, args.refine_confidence,
+            )
         if ink_session is not None:
             proposal_hybrid = proposal_cv.copy()
             # Respect visible hand/unknown and only allow the specialist to
@@ -266,6 +353,11 @@ def main() -> int:
             review_rows.append({
                 "session_id": row["session_id"], "frame_index": row["frame_index"],
                 "method": method, "coverage": score["coverage"],
+                "filled_from_opencv_unknown_pixels": (
+                    int(((proposal_cv == 255) & (prediction != 255)).sum())
+                    if method == "cascade" else None
+                ),
+                "remaining_unknown_pixels": int((prediction == 255).sum()),
                 **{f"{cls}_iou": score["classes"][cls]["iou"] for cls in CLASSES},
                 **{f"{cls}_support_px": score["classes"][cls]["support_pixels"] for cls in CLASSES},
                 "proposal_path": str(prediction_path.relative_to(ROOT)),
@@ -289,10 +381,20 @@ def main() -> int:
             "ink_specialist_sha256": digest(args.ink_model) if ink_session is not None else None,
         },
         "tool_sha256": tool_hash,
+        "proposer_sha256": proposer_hash,
+        "preprocessing_sha256": preprocessing_hash,
         "metric_rule": "reference 255 excluded; proposal 255 also abstains and is excluded; coverage reported separately; scores measure agreement with the reviewed OpenCV-derived masks, not independent accuracy",
+        "cascade_rule": "OpenCV labels are preserved; SegFormer fills only OpenCV 255 pixels at or above refine_confidence within appearance-qualified paper/skin context; printed-text frames cannot receive new ink labels",
+        "refine_confidence": args.refine_confidence,
         "methods": {method: summarize(values) for method, values in metrics_by_method.items()},
     }
-    cache_manifest_path.write_text(json.dumps({"input_sha256": input_hashes, "model_sha256": model_hashes, "tool_sha256": tool_hash}, indent=2), encoding="utf-8")
+    cache_manifest_path.write_text(json.dumps({
+        "input_sha256": input_hashes,
+        "model_sha256": model_hashes,
+        "tool_sha256": tool_hash,
+        "proposer_sha256": proposer_hash,
+        "preprocessing_sha256": preprocessing_hash,
+    }, indent=2), encoding="utf-8")
     (args.output_dir / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
     with (args.output_dir / "per_frame_metrics.csv").open("w", newline="", encoding="utf-8") as stream:
         writer = csv.DictWriter(stream, fieldnames=list(review_rows[0]))

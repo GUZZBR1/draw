@@ -12,6 +12,15 @@ only pixels where OpenCV and the four-class model predict the same class. It
 marks disagreements as `255` (unknown), so it can reduce the area that needs
 review. Agreement is still only a proposal; correlated model errors can agree.
 
+The `cascade` mask follows the sequential design: OpenCV labels stay fixed;
+SegFormer may fill only OpenCV `255` pixels where confidence reaches
+`--refine-confidence` (default `0.90`). The candidate is additionally bounded
+by appearance-qualified paper and skin regions from the OpenCV stage. It does
+not propose ink over frames tagged with printed text, and unfilled pixels stay
+`255`. This is a review aid, not an automatic correction or final label.
+The confidence threshold is a raw softmax cutoff, not a calibrated 90% chance
+that the pixel is correct.
+
 ## Run
 
 ```bash
@@ -48,6 +57,13 @@ slightly, but this can reflect shared errors in the weak reference and
 proposal methods. These results do not justify promoting any generated mask to
 training data without per-frame review and a separately labeled evaluation
 set.
+
+The conservative cascade increased labeled-pixel coverage from **99.72%** to
+**99.86%** against this pilot reference at the default threshold. The average
+ink IoU against the same reference changed from **0.702** to **0.673**. Since
+the reference was copied from the older OpenCV method, these numbers cannot
+prove improved accuracy. The pilot only shows that the cascade fills a small
+number of uncertain pixels without overwriting first-stage labels.
 
 No raw captures, generated masks, model files, or pilot reports belong in Git.
 Keep them in the private local/Kaggle data store; commit only the tool and this

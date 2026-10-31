@@ -186,7 +186,8 @@ def propose_mask(
     tags: set[str],
     ink_darkness_threshold: int = 16,
     ink_open_kernel: int = 2,
-) -> tuple[np.ndarray, dict[str, str]]:
+    return_context: bool = False,
+) -> tuple[np.ndarray, dict[str, str]] | tuple[np.ndarray, dict[str, str], dict[str, np.ndarray | bool]]:
     h, w = frame.shape[:2]
     mask = np.full((h, w), 0, dtype=np.uint8)
     hand_core, hand_edge, likely_skin = _skin_masks(frame)
@@ -199,12 +200,21 @@ def propose_mask(
         hand_confirmed = bool({"hand_on_paper", "hand_elsewhere"} & tags)
         if hand_confirmed:
             mask[hand_core] = 2
-        return mask, {
+        methods = {
             "paper_method": paper_method,
             "paper_confidence": paper_confidence,
             "proposal_status": "partial_hand_only_no_paper_polygon" if hand_confirmed else "unknown_no_paper_polygon",
             "ink_method": "not_run",
         }
+        context = {
+            "paper_region": np.zeros((h, w), dtype=bool),
+            "paper_candidate": np.zeros((h, w), dtype=bool),
+            "paper_core": np.zeros((h, w), dtype=bool),
+            "hand_core": hand_core,
+            "likely_skin": likely_skin,
+            "paper_detected": False,
+        }
+        return (mask, methods, context) if return_context else (mask, methods)
 
     paper_fill = np.zeros((h, w), dtype=np.uint8)
     cv2.fillPoly(paper_fill, [polygon], 255)
@@ -265,7 +275,7 @@ def propose_mask(
     # Visible hand pixels override both paper and ink, per the project rule.
     mask[likely_skin & ~hand_core] = 255
     mask[hand_core] = 2
-    return mask, {
+    methods = {
         "paper_method": paper_method,
         "paper_confidence": paper_confidence,
         "paper_value_floor": str(value_floor),
@@ -275,6 +285,15 @@ def propose_mask(
         "proposal_status": "draft_requires_visual_review",
         "ink_method": ink_method,
     }
+    context = {
+        "paper_region": paper_region,
+        "paper_candidate": paper_candidate > 0,
+        "paper_core": paper_core,
+        "hand_core": hand_core,
+        "likely_skin": likely_skin,
+        "paper_detected": True,
+    }
+    return (mask, methods, context) if return_context else (mask, methods)
 
 
 def image_sha256(path: Path) -> str:
