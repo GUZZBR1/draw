@@ -48,6 +48,7 @@ import numpy as np
 
 CLASSES = {0: "background", 1: "paper", 2: "hand", 3: "ink"}
 NUM_CLASSES = 4
+IGNORE_INDEX = 255
 IMAGE_EXTS = {".png", ".jpg", ".jpeg"}
 # Mesma normalização de draw/neural.py (_MEAN/_STD).
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
@@ -108,16 +109,16 @@ def pair_images_masks(split_dir):
 
 
 def validate_mask(mask):
-    """Máscara válida: um canal, valores só em {0,1,2,3}."""
+    """Máscara válida: classes 0..3 e 255 para pixels sem rótulo."""
     values = np.unique(mask)
-    bad = [int(v) for v in values if v not in (0, 1, 2, 3)]
+    bad = [int(v) for v in values if v not in (0, 1, 2, 3, IGNORE_INDEX)]
     if bad:
         raise ValueError(f"máscara com valores inválidos: {bad}")
     return True
 
 
 def load_mask(mask_path):
-    """Lê máscara com cv2 (grayscale) e valida valores 0..3."""
+    """Lê máscara grayscale; 255 preserva pixels desconhecidos."""
     mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
     if mask is None:
         raise FileNotFoundError(f"máscara ilegível: {mask_path}")
@@ -158,23 +159,34 @@ def compute_class_weights(counts, cap=10.0):
 def per_class_metrics(pred, target):
     """IoU, Dice, precision, recall por classe (numpy, sem torch).
 
-    pred/target: arrays 2D de inteiros 0..3, mesmo shape.
+    pred/target: arrays 2D de inteiros 0..3, mesmo shape. Target 255 é ignorado.
     """
+    pred, target = np.asarray(pred), np.asarray(target)
+    if pred.shape != target.shape:
+        raise ValueError("pred e target precisam ter o mesmo formato")
+    validate_mask(pred)
+    validate_mask(target)
+    if np.any(np.asarray(pred) == IGNORE_INDEX):
+        raise ValueError("predição não pode conter pixels ignorados (255)")
+    valid = target != IGNORE_INDEX
     out = {}
     for c in range(NUM_CLASSES):
-        p = pred == c
-        t = target == c
+        p = (pred == c) & valid
+        t = (target == c) & valid
         tp = int((p & t).sum())
         fp = int((p & ~t).sum())
         fn = int((~p & t).sum())
         denom_iou = tp + fp + fn
         denom_dice = 2 * tp + fp + fn
+        supported = int(t.sum())
+        predicted = int(p.sum())
+        no_support = not valid.any() or (supported == 0 and predicted == 0)
         out[CLASSES[c]] = {
-            "iou": tp / denom_iou if denom_iou else 1.0,
-            "dice": 2 * tp / denom_dice if denom_dice else 1.0,
-            "precision": tp / (tp + fp) if (tp + fp) else 1.0,
-            "recall": tp / (tp + fn) if (tp + fn) else 1.0,
-            "support_px": int(t.sum()),
+            "iou": None if no_support else (tp / denom_iou if denom_iou else 0.0),
+            "dice": None if no_support else (2 * tp / denom_dice if denom_dice else 0.0),
+            "precision": None if no_support else (tp / (tp + fp) if (tp + fp) else 0.0),
+            "recall": None if no_support or supported == 0 else tp / (tp + fn),
+            "support_px": supported,
         }
     return out
 
@@ -188,8 +200,9 @@ def ink_tolerance_metrics(pred, target, radii=(2, 3)):
     a substitui, apenas a complementa.
     """
     out = {}
-    pred_ink = (pred == 3).astype(np.uint8)
-    target_ink = (target == 3).astype(np.uint8)
+    valid = np.asarray(target) != IGNORE_INDEX
+    pred_ink = ((np.asarray(pred) == 3) & valid).astype(np.uint8)
+    target_ink = ((np.asarray(target) == 3) & valid).astype(np.uint8)
     for r in radii:
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
         p_dil = cv2.dilate(pred_ink, kernel) > 0
@@ -198,9 +211,15 @@ def ink_tolerance_metrics(pred, target, radii=(2, 3)):
         # recall tolerante: traço real coberto por predição próxima.
         pred_n = int((pred_ink > 0).sum())
         target_n = int((target_ink > 0).sum())
+        if target_n == 0:
+            out[f"radius_{r}px"] = {
+                "precision": 0.0 if pred_n > 0 else None,
+                "recall": None,
+            }
+            continue
         out[f"radius_{r}px"] = {
-            "precision": int(((pred_ink > 0) & t_dil).sum()) / pred_n if pred_n else 1.0,
-            "recall": int(((target_ink > 0) & p_dil).sum()) / target_n if target_n else 1.0,
+            "precision": int(((pred_ink > 0) & t_dil & valid).sum()) / pred_n if pred_n else 0.0,
+            "recall": int(((target_ink > 0) & p_dil & valid).sum()) / target_n if target_n else 0.0,
         }
     return out
 
@@ -210,10 +229,14 @@ def dice_loss_numpy(prob, target, smooth=1e-6):
 
     prob: (C, H, W) probabilidades; target: (H, W) inteiros.
     """
+    target = np.asarray(target)
+    valid = target != IGNORE_INDEX
+    if not valid.any():
+        return 0.0
     losses = []
     for c in range(NUM_CLASSES):
-        p = prob[c].ravel()
-        t = (target == c).astype(np.float32).ravel()
+        p = np.asarray(prob[c])[valid]
+        t = (target[valid] == c).astype(np.float32)
         inter = float((p * t).sum())
         losses.append(1.0 - (2 * inter + smooth) / (p.sum() + t.sum() + smooth))
     return float(np.mean(losses))
@@ -286,18 +309,19 @@ def combined_loss(logits, target, class_weights, ce_weight=0.5, dice_weight=0.5)
     import torch
     import torch.nn.functional as F
 
-    ce = F.cross_entropy(logits, target, weight=class_weights)
+    valid = target != IGNORE_INDEX
+    if not bool(valid.any()):
+        # Differentiable neutral loss; no pixels in this batch provide supervision.
+        return logits.sum() * 0.0
+    ce = F.cross_entropy(logits, target, weight=class_weights, ignore_index=IGNORE_INDEX)
     prob = torch.softmax(logits, dim=1)
     dice = 0.0
     for c in range(NUM_CLASSES):
-        p = prob[:, c].reshape(prob.shape[0], -1)
+        p = (prob[:, c] * valid).reshape(prob.shape[0], -1)
         t = (target == c).float().reshape(target.shape[0], -1)
         inter = (p * t).sum(dim=1)
         dice = dice + (1.0 - (2 * inter + 1e-6) / (p.sum(dim=1) + t.sum(dim=1) + 1e-6))
     dice = dice / NUM_CLASSES
-    # Correção do reteste no Kaggle: sem esta média, dice tem shape [batch]
-    # e loss.backward() falha com "grad can be implicitly created only
-    # for scalar outputs". A loss tem que ser escalar.
     dice = dice.mean()
     return ce_weight * ce + dice_weight * dice
 
@@ -331,6 +355,7 @@ def evaluate(model, loader, device):
     model.eval()
     agg = {c: {"tp": 0, "fp": 0, "fn": 0} for c in range(NUM_CLASSES)}
     ink_pred_list, ink_target_list = [], []
+    valid_px = ignored_px = 0
     with torch.no_grad():
         for images, masks in loader:
             images = images.to(device)
@@ -341,8 +366,11 @@ def evaluate(model, loader, device):
                 logits = F.interpolate(logits, size=masks.shape[-2:], mode="bilinear", align_corners=False)
             pred = logits.argmax(dim=1).cpu().numpy()
             target = masks.numpy()
+            valid = target != IGNORE_INDEX
+            valid_px += int(valid.sum())
+            ignored_px += int((~valid).sum())
             for c in range(NUM_CLASSES):
-                p, t = pred == c, target == c
+                p, t = (pred == c) & valid, (target == c) & valid
                 agg[c]["tp"] += int((p & t).sum())
                 agg[c]["fp"] += int((p & ~t).sum())
                 agg[c]["fn"] += int((~p & t).sum())
@@ -351,21 +379,33 @@ def evaluate(model, loader, device):
     metrics = {}
     for c in range(NUM_CLASSES):
         tp, fp, fn = agg[c]["tp"], agg[c]["fp"], agg[c]["fn"]
+        support = tp + fn
+        predicted = tp + fp
+        no_support = valid_px == 0 or (support == 0 and predicted == 0)
         metrics[CLASSES[c]] = {
-            "iou": tp / (tp + fp + fn) if (tp + fp + fn) else 1.0,
-            "dice": 2 * tp / (2 * tp + fp + fn) if (2 * tp + fp + fn) else 1.0,
-            "precision": tp / (tp + fp) if (tp + fp) else 1.0,
-            "recall": tp / (tp + fn) if (tp + fn) else 1.0,
+            "iou": None if no_support else (tp / (tp + fp + fn) if (tp + fp + fn) else 0.0),
+            "dice": None if no_support else (2 * tp / (2 * tp + fp + fn) if (2 * tp + fp + fn) else 0.0),
+            "precision": None if no_support else (tp / predicted if predicted else 0.0),
+            "recall": None if no_support or support == 0 else tp / support,
+            "support_px": support,
         }
-    pred_all = np.concatenate([p.ravel() for p in ink_pred_list]) if ink_pred_list else np.array([])
-    target_all = np.concatenate([t.ravel() for t in ink_target_list]) if ink_target_list else np.array([])
     # Métrica de ink com tolerância precisa de imagem 2D; usa o primeiro
     # lote como amostra representativa (o relatório completo usa o
     # avaliador de cenários fixos, abaixo).
     metrics["ink_tolerance_sample"] = {}
     if ink_pred_list:
         metrics["ink_tolerance_sample"] = ink_tolerance_metrics(ink_pred_list[0][0], ink_target_list[0][0])
-    metrics["mean_iou"] = float(np.mean([metrics[CLASSES[c]]["iou"] for c in range(NUM_CLASSES)]))
+    metrics["valid_px"] = valid_px
+    metrics["ignored_px"] = ignored_px
+    supported_ious = [metrics[CLASSES[c]]["iou"] for c in range(NUM_CLASSES) if metrics[CLASSES[c]]["iou"] is not None]
+    metrics["mean_iou"] = float(np.mean(supported_ious)) if supported_ious else None
+    return metrics
+
+
+def require_valid_evaluation(metrics, split_name="val"):
+    """Fail before checkpoint selection if a split has no labeled pixels."""
+    if metrics.get("valid_px", 0) <= 0 or metrics.get("mean_iou") is None:
+        raise ValueError(f"split '{split_name}' não contém pixels rotulados válidos; não é possível selecionar checkpoint")
     return metrics
 
 
@@ -522,7 +562,7 @@ def main(argv=None):
     history = []
     for epoch in range(epochs):
         loss = train_one_epoch(model, train_loader, optimizer, class_weights, device)
-        metrics = evaluate(model, val_loader, device)
+        metrics = require_valid_evaluation(evaluate(model, val_loader, device), "val")
         scheduler.step()
         history.append({"epoch": epoch, "train_loss": loss, "val": metrics})
         print(f"época {epoch}: loss {loss:.4f}, val_mean_iou {metrics['mean_iou']:.4f}")

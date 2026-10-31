@@ -75,7 +75,11 @@ def test_ink_shifted_two_pixels_passes_tolerance_but_not_exact_iou():
 def test_ink_tolerance_empty_cases():
     empty = np.zeros((5, 5), dtype=np.int64)
     tol = seg_metrics.ink_tolerance_metrics(empty, empty)
-    assert tol["precision"] == 1.0 and tol["recall"] == 1.0
+    assert tol["precision"] is None and tol["recall"] is None and tol["f1"] is None
+    false_positive = empty.copy()
+    false_positive[2, 2] = 3
+    tol = seg_metrics.ink_tolerance_metrics(false_positive, empty)
+    assert tol["precision"] == 0.0 and tol["recall"] is None and tol["f1"] == 0.0
     gt = empty.copy()
     gt[2, 2] = 3
     tol = seg_metrics.ink_tolerance_metrics(empty, gt)
