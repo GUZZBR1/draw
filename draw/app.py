@@ -704,8 +704,27 @@ def detect_sheet_with_light_guard(frame, light_normalize="off"):
     )
 
 
-def _detection_frame(frame, light_normalize="off"):
-    return light_module.normalize_light(frame, light_normalize)
+def _detect_sheet_for_run(frame, neural_detector, light_normalize,
+                          winning_light):
+    """Detecta um quadro e guarda o modo que deve ser usado na tinta.
+
+    O detector neural recebe o frame original, portanto uma detecção
+    neural confirmada mantém a tinta sem normalização. Quando ele não
+    fecha os cantos, a reserva clássica pode selecionar o modo aceito
+    pela guarda de luz.
+    """
+    winning_light["mode"] = "off"
+
+    def classic_with_light_guard(candidate_frame):
+        corners, verdict, winning = detect_sheet_with_light_guard(
+            candidate_frame, light_normalize
+        )
+        winning_light["mode"] = winning
+        return corners, verdict
+
+    return _detect_sheet_combined(
+        frame, neural_detector, classic_with_light_guard
+    )
 
 
 def _ink_input(warped, light_normalize="off"):
@@ -780,19 +799,9 @@ def run(
     winning_light = {"mode": light_normalize}
 
     def detect_sheet(frame):
-        def classic_with_light_guard(candidate_frame):
-            corners, verdict, winning = detect_sheet_with_light_guard(
-                candidate_frame, light_normalize
-            )
-            winning_light["mode"] = winning
-            return corners, verdict
-
-        corners, verdict = _detect_sheet_combined(
-            frame, neural_detector, classic_with_light_guard
+        return _detect_sheet_for_run(
+            frame, neural_detector, light_normalize, winning_light
         )
-        if corners is not None and neural_detector is not None:
-            winning_light["mode"] = light_normalize
-        return corners, verdict
 
     parsed_source = parse_source(source)
     capture_kwargs = {

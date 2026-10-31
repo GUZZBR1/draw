@@ -1,11 +1,12 @@
-"""Testes da normalização de luz, só sintéticos, sem hardware.
+"""Medições sintéticas da normalização de luz, sem hardware.
 
 Variantes geradas por código a partir da cena sem marcadores do
 selftest, no mesmo padrão dos builders de lá: sombra (gradiente +
 mancha escura), gradiente, luz baixa (0,35x) e brilho (mancha clara).
-O pipeline testado é o da fiação real do app: detecção no frame
-normalizado, retificação do frame original, normalização da folha
-antes da tinta.
+"background" passa pela fiação do app: detecção protegida pela guarda,
+retificação do frame original e normalização da folha conforme o modo
+vencedor. "clahe" e "both" são comparações da biblioteca fora da
+fiação do app; a CLI não os expõe.
 
 Regras travadas aqui:
 - Com a flag desligada, sombra e luz baixa NÃO são detectadas (é o
@@ -34,6 +35,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from draw import app as app_module  # noqa: E402
 from draw import ink as ink_module  # noqa: E402
 from draw import light as light_module  # noqa: E402
+from draw import light_guard as guard_module  # noqa: E402
 from draw import paper as paper_module  # noqa: E402
 import selftest as selftest_module  # noqa: E402
 
@@ -77,16 +79,22 @@ def _apply_glare(scene):
 
 
 def _pipeline(scene, ground_truth, corners_gt, mode):
-    """Pipeline do app: detecção normalizada, warp do original, tinta
-    da folha normalizada. Retorna (veredito, erro, recall)."""
-    corners, verdict = paper_module.detect_sheet_with_confidence(
-        app_module._detection_frame(scene, mode)
-    )
+    """Retorna (veredito, erro, recall) para fiação ou experimento."""
+    if mode in guard_module.LIGHT_GUARD_MODES:
+        corners, verdict, ink_mode = (
+            app_module.detect_sheet_with_light_guard(scene, mode)
+        )
+    else:
+        # Comparação de biblioteca: estes modos não são aceitos pelo app.
+        corners, verdict = paper_module.detect_sheet_with_confidence(
+            light_module.normalize_light(scene, mode)
+        )
+        ink_mode = mode
     if corners is None:
         return verdict, None, None
     warped = paper_module.warp_sheet(scene, corners)
     recovered = ink_module.extract_ink(
-        app_module._ink_input(warped, mode)
+        light_module.normalize_light(warped, ink_mode)
     )
     error = float(np.linalg.norm(corners - corners_gt, axis=1).max())
     hits = int(
@@ -159,9 +167,10 @@ def test_negatives_stay_not_paper_with_both():
     scenes["folha lisa"] = selftest_module.build_blank_sheet_scene()
     for name, scene in scenes.items():
         # Veredito diferente de "paper" já basta: detect_sheet só
-        # devolve cantos quando o veredito é "paper".
+        # devolve cantos quando o veredito é "paper". "both" é uma
+        # medição da biblioteca, fora da fiação e da flag do app.
         _, verdict = paper_module.detect_sheet_with_confidence(
-            app_module._detection_frame(scene, "both")
+            light_module.normalize_light(scene, "both")
         )
         assert verdict != "paper", f"falso positivo com both: {name}"
 
@@ -170,6 +179,51 @@ def test_app_run_accepts_light_normalize():
     import inspect
     params = inspect.signature(app_module.run).parameters
     assert params["light_normalize"].default == "off"
-    assert app_module._detection_frame(
-        np.zeros((10, 10, 3), dtype=np.uint8), "off"
-    ).shape == (10, 10, 3)
+    assert guard_module.LIGHT_GUARD_MODES == ("off", "background")
+
+
+def test_neural_detection_keeps_ink_mode_off():
+    corners = np.zeros((4, 2), dtype=np.float32)
+
+    class NeuralDetector:
+        last_presence_logit = None
+
+        def detect_sheet_with_confidence(self, frame):
+            return corners, "paper"
+
+    winning_light = {"mode": "background"}
+    result = app_module._detect_sheet_for_run(
+        np.zeros((10, 10, 3), dtype=np.uint8),
+        NeuralDetector(),
+        "background",
+        winning_light,
+    )
+
+    assert result == (corners, "paper")
+    assert winning_light["mode"] == "off"
+
+
+def test_classic_fallback_keeps_guard_winner(monkeypatch):
+    corners = np.zeros((4, 2), dtype=np.float32)
+
+    class NeuralDetector:
+        last_presence_logit = None
+
+        def detect_sheet_with_confidence(self, frame):
+            return None, None
+
+    monkeypatch.setattr(
+        app_module,
+        "detect_sheet_with_light_guard",
+        lambda frame, mode: (corners, "paper", "background"),
+    )
+    winning_light = {"mode": "off"}
+    result = app_module._detect_sheet_for_run(
+        np.zeros((10, 10, 3), dtype=np.uint8),
+        NeuralDetector(),
+        "background",
+        winning_light,
+    )
+
+    assert result == (corners, "paper")
+    assert winning_light["mode"] == "background"
