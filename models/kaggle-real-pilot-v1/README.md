@@ -25,6 +25,29 @@ These are synthetic validation results, not a measurement on an independent
 real-camera holdout. ONNX-vs-PyTorch parity was not run in Kaggle
 (`onnx_validation: null`).
 
+## Maintainer review on real camera frames
+
+The repository maintainer also ran this pilot through the project's real-frame
+harness during review. On the 49-frame set (43 positive frames, 6 negative
+frames, with ground-truth page polygons for 11 frames), the pilot detected
+`42/43` positive frames and produced false positives on `6/6` negative frames.
+Its page-quadrilateral IoU averaged `0.478` (minimum `0.000`). The production
+v3 detector, run through this PR's `draw/neural.py`, scored `43/43` positives,
+`0/6` negative-frame false positives, and page-quadrilateral IoU `0.957`
+(minimum `0.845`) on the same harness, as reported by the maintainer.
+
+On all three frames containing a white box, the pilot classified the box as
+paper, with a predicted mask covering about `19%` of the frame and presence
+score `+1.00`; the production v3 detector did not declare a page on those
+frames. This is a serious regression for page detection. The pilot remains an
+experimental, opt-in artifact and is not a replacement candidate for v3.
+
+These figures are the maintainer's review-harness results on the author's
+recorded camera set, not an independent holdout or evidence of generalization
+to other cameras, desks, or lighting. The harness has only 6 negative frames
+and 11 annotated page polygons; treat the numbers as a regression warning for
+this set, not as a broad performance estimate.
+
 ## Artifact integrity
 
 `model.onnx` SHA-256:

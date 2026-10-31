@@ -87,4 +87,3 @@ def test_legacy_mask_and_presence_outputs_keep_their_contract():
     assert presence == 2.5
     assert mask[4, 4] == 255
     assert mask[0, 0] == 0
-
