@@ -17,10 +17,10 @@ Pipeline:
      epsilon parametrizável em pixels (padrão 1,5 px);
   5. saída SVG com viewBox em milímetros do papel A4.
 
-Escala: o espaço do papel tem 850 px = 210 mm no eixo x e
-1200 px = 297 mm no eixo y (0,24706 e 0,24750 mm/px). O SVG usa a
-escala por eixo; distâncias em mm usam a escala média 0,24727
-mm/px (a anisotropia entre eixos é de 0,18%, declarada aqui).
+Escala: a conversão física é compartilhada com ``draw.export`` e usa
+uma escala uniforme limitante, para preservar proporções sem exceder
+o papel nominal. No A4 padrão, 850 x 1200 px usam 0,247059 mm/px e
+produzem uma folha efetiva de 210,00 x 296,47 mm.
 
 Uso:
   python tools/vectorize.py canvas.png [--out saida.svg]
@@ -36,13 +36,18 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-PAPER_W_PX = 850
-PAPER_H_PX = 1200
-PAPER_W_MM = 210.0
-PAPER_H_MM = 297.0
-MM_PER_PX_X = PAPER_W_MM / PAPER_W_PX
-MM_PER_PX_Y = PAPER_H_MM / PAPER_H_PX
-MM_PER_PX = 0.5 * (MM_PER_PX_X + MM_PER_PX_Y)
+_PROJECT_ROOT = str(Path(__file__).resolve().parents[1])
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
+from draw import export as stroke_export
+
+SHEET_SCALE = stroke_export.sheet_scale(paper="A4")
+PAPER_W_PX = SHEET_SCALE.canvas_width_px
+PAPER_H_PX = SHEET_SCALE.canvas_height_px
+PAPER_W_MM = SHEET_SCALE.effective_width_mm
+PAPER_H_MM = SHEET_SCALE.effective_height_mm
+MM_PER_PX = SHEET_SCALE.mm_per_px
 
 THINNING_TYPES = {
     "zhangsuen": cv2.ximgproc.THINNING_ZHANGSUEN,
@@ -357,25 +362,26 @@ def distance_stats(ink, polylines):
 
 
 def write_svg(polylines, out_path, epsilon, thinning):
-    """Escreve o SVG com viewBox em mm do papel A4 (210x297)."""
+    """Escreve SVG usando a escala uniforme canônica de ``draw.export``."""
     lines = [
         '<?xml version="1.0" encoding="UTF-8"?>',
         f"<!-- Draw vectorize: epsilon={epsilon} px, thinning={thinning}, "
-        f"escala x={MM_PER_PX_X:.5f} mm/px, y={MM_PER_PX_Y:.5f} mm/px -->",
+        f"paper=A4, scale={MM_PER_PX:.6f} mm/px, "
+        f"effective={PAPER_W_MM:.2f}x{PAPER_H_MM:.2f} mm -->",
         f'<svg xmlns="http://www.w3.org/2000/svg" '
-        f'width="{PAPER_W_MM}mm" height="{PAPER_H_MM}mm" '
-        f'viewBox="0 0 {PAPER_W_MM} {PAPER_H_MM}">',
+        f'width="{PAPER_W_MM:.2f}mm" height="{PAPER_H_MM:.2f}mm" '
+        f'viewBox="0 0 {PAPER_W_MM:.2f} {PAPER_H_MM:.2f}">',
     ]
     for line in polylines:
         pts = line["points"]
         if len(pts) == 1:
-            cx, cy = pts[0][0] * MM_PER_PX_X, pts[0][1] * MM_PER_PX_Y
+            cx, cy = pts[0][0] * MM_PER_PX, pts[0][1] * MM_PER_PX
             lines.append(
                 f'<circle cx="{cx:.2f}" cy="{cy:.2f}" r="0.30" fill="#000"/>'
             )
             continue
         coords = " ".join(
-            f"{x * MM_PER_PX_X:.2f},{y * MM_PER_PX_Y:.2f}" for x, y in pts
+            f"{x * MM_PER_PX:.2f},{y * MM_PER_PX:.2f}" for x, y in pts
         )
         tag = "polygon" if line["closed"] else "polyline"
         lines.append(
