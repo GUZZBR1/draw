@@ -436,6 +436,150 @@ class _PngWriter:
         self._thread.join(timeout=_PNG_DRAIN_SECONDS)
 
 
+# Cadencia maxima da tinta: uma passada completa a cada ~250 ms.
+# A passada custa 168 ms no Ryzen com 8 threads (perfil em
+# draw-lab/page-clean-v0/PERF_BASELINE_RYZEN.md), entao quem manda
+# no ritmo do canvas e a cadencia, nao o modelo — e o laco
+# principal nao paga nenhum dos dois.
+_PAGE_CLEAN_INTERVAL_SECONDS = 0.25
+# Teto da espera pela trabalhadora de tinta na saida do app.
+_PAGE_CLEAN_STOP_TIMEOUT_SECONDS = 5.0
+
+
+class _PageCleanWorker:
+    """Tinta pagina->limpa em thread propria, latest-wins.
+
+    O laco principal entrega o warp mais recente com submit() e
+    segue: a fila tem tamanho 1 e um warp nao processado e
+    substituido pelo proximo, nunca acumulado. A trabalhadora roda
+    passadas completas do modelo com pelo menos
+    _PAGE_CLEAN_INTERVAL_SECONDS entre inicios, acumula a uniao
+    das mascaras da geracao corrente e publica (geracao, versao,
+    mascara); o laco colhe com poll() no seu ritmo e renderiza.
+
+    Geracao e o contrato de sessao da folha: folha nova ou folha
+    que sai chama new_generation(), que descarta pendente e
+    publicado da geracao anterior; a uniao da trabalhadora zera na
+    primeira passada da geracao nova. Resultado de geracao velha
+    nunca entra no canvas novo, mesmo com uma passada em voo na
+    troca. Blocos sujos por diff de pixels NAO entram aqui: medido
+    nesta webcam, o churn entre quadros consecutivos parados
+    (media de |diff| por bloco ~1,5-2,0 niveis; maximo pos-blur
+    4-6) empata ou supera o sinal de um traco novo no bloco
+    (lapis: maximo pos-blur 6-7), entao pular bloco por diff
+    arriscaria engolir justamente o lapis. A economia vem da
+    assincronia e da cadencia, nao de pular bloco.
+    """
+
+    def __init__(self, page_clean):
+        self._page_clean = page_clean
+        self._condition = threading.Condition()
+        self._thread = threading.Thread(
+            target=self._work, name="draw-page-clean", daemon=True
+        )
+        self._pending = None
+        self._generation = 0
+        self._published = None
+        self._version = 0
+        self._stopped = False
+        # Estado privado da trabalhadora (so ela toca):
+        self._worker_generation = -1
+        self._union = None
+        self._last_pass_start = None
+
+    def start(self):
+        self._thread.start()
+        return self
+
+    def new_generation(self):
+        """Invalida pendente/publicado e devolve a nova geracao."""
+        with self._condition:
+            self._generation += 1
+            self._pending = None
+            self._published = None
+            self._condition.notify_all()
+            return self._generation
+
+    def submit(self, warped, generation):
+        with self._condition:
+            if self._stopped or generation != self._generation:
+                return
+            self._pending = (warped, generation)
+            self._condition.notify_all()
+
+    def poll(self, generation, after_version):
+        """(versao, copia da mascara) se ha publicado novo da
+        geracao depois de after_version; senao None."""
+        with self._condition:
+            published = self._published
+            if (
+                published is None
+                or published[0] != generation
+                or published[1] <= after_version
+            ):
+                return None
+            return published[1], published[2].copy()
+
+    def _work(self):
+        while True:
+            with self._condition:
+                self._condition.wait_for(
+                    lambda: self._pending is not None or self._stopped
+                )
+                if self._stopped:
+                    return
+                # Cadencia: o intervalo corre com o pendente na
+                # mao; um submit durante a espera o substitui
+                # (latest-wins) e e ele que roda ao vencer. Se a
+                # geracao trocou, new_generation limpou o pendente
+                # e esta volta nao roda nada.
+                while self._last_pass_start is not None:
+                    remaining = _PAGE_CLEAN_INTERVAL_SECONDS - (
+                        time.monotonic() - self._last_pass_start
+                    )
+                    if remaining <= 0 or self._pending is None:
+                        break
+                    self._condition.wait(timeout=remaining)
+                    if self._stopped:
+                        return
+                if self._pending is None:
+                    continue
+                warped, generation = self._pending
+                self._pending = None
+                self._last_pass_start = time.monotonic()
+            mask = self._page_clean.ink_mask(warped)
+            with self._condition:
+                if self._stopped:
+                    return
+                if generation != self._generation:
+                    continue
+                if generation != self._worker_generation:
+                    self._worker_generation = generation
+                    self._union = None
+                if self._union is None:
+                    self._union = mask
+                else:
+                    np.maximum(self._union, mask, out=self._union)
+                self._version += 1
+                self._published = (
+                    generation,
+                    self._version,
+                    self._union.copy(),
+                )
+                self._condition.notify_all()
+
+    def stop(self):
+        # O teto cobre uma passada em voo: a trabalhadora so ve o
+        # stop entre passadas, e sair com ela dentro do ONNX
+        # derruba o processo na finalizacao (visto na bancada
+        # desta VM, passada de segundos). No Ryzen a passada e
+        # 168 ms e o join volta muito antes do teto.
+        with self._condition:
+            self._stopped = True
+            self._condition.notify_all()
+        self._thread.join(timeout=_PAGE_CLEAN_STOP_TIMEOUT_SECONDS)
+
+
 def parse_source(value):
     """'0'/'1' viram indice de webcam local; qualquer outra coisa e URL/arquivo."""
     if value is None:
@@ -819,6 +963,14 @@ def run(
             )
             legacy_ink = True
 
+    ink_worker = None
+    if page_clean is not None:
+        ink_worker = _PageCleanWorker(page_clean).start()
+        print(
+            "Tinta em thread propria: o laco principal nao espera "
+            "o modelo (passadas com cadencia de ~250 ms)."
+        )
+
     ink_extractor = None
     if ink_model is not None and not markers_mode:
         if ink_model_module is None:
@@ -933,6 +1085,11 @@ def run(
     # das mascaras do modelo pagina->limpa, sem acumulador temporal.
     # None enquanto nenhuma folha foi lida nesta sessao.
     clean_mask = None
+    # Geracao da tinta assincrona: acompanha a geracao da
+    # trabalhadora; folha nova ou folha que sai sobe a geracao e a
+    # versao aplicada volta a zero.
+    clean_generation = 0
+    clean_applied_version = 0
     # Buffers donos dos canvas renderizados no laco. O acumulado
     # mora em canvas_buffer de um frame de deteccao ao outro, e
     # view_canvas_buffer serve aos canvas transitorios de exibicao.
@@ -995,6 +1152,9 @@ def run(
                 session_corners = None
                 freeze_pending = False
                 clean_mask = None
+                if ink_worker is not None:
+                    clean_generation = ink_worker.new_generation()
+                    clean_applied_version = 0
 
             frame_number += 1
             # Presenca e o estado do rastreador: warp_sheet com
@@ -1011,6 +1171,9 @@ def run(
                     # Folha nova na cena: canvas e geometria recomecam.
                     ink_accumulator.reset()
                     clean_mask = None
+                    if ink_worker is not None:
+                        clean_generation = ink_worker.new_generation()
+                        clean_applied_version = 0
                     if session_ink is not None:
                         session_ink.reset()
                         baseline_armed = False
@@ -1043,18 +1206,13 @@ def run(
                 )
                 ink_warped = paper_module.warp_sheet(frame, warp_corners)
                 if page_clean is not None:
-                    # Caminho novo: o modelo classifica a pagina
-                    # inteira e a mascara entra no canvas por uniao.
+                    # Caminho novo: o warp vai para a trabalhadora
+                    # de tinta e o laco segue sem esperar o modelo.
                     # Sem referencia, sem pagina base, sem voto
-                    # temporal: o que o modelo viu como tinta fica.
-                    mask = page_clean.ink_mask(ink_warped)
-                    if clean_mask is None:
-                        clean_mask = mask
-                    else:
-                        np.maximum(clean_mask, mask, out=clean_mask)
-                    accumulated_canvas = ink_module.render_canvas(
-                        clean_mask, out=canvas_buffer
-                    )
+                    # temporal: a uniao das mascaras mora na
+                    # trabalhadora e entra no canvas pelo poll()
+                    # logo abaixo, quando uma versao nova publica.
+                    ink_worker.submit(ink_warped, clean_generation)
                 else:
                     visible = None
                     if hand_masker is not None:
@@ -1081,6 +1239,20 @@ def run(
                             t_capture_ms=frame_capture_ms
                         ),
                         out=canvas_buffer,
+                    )
+
+            if ink_worker is not None:
+                # Colhe a tinta assincrona: versao nova da geracao
+                # corrente vira o canvas; sem versao nova, o canvas
+                # exibido e o mesmo de antes, sem custo de modelo
+                # neste laco.
+                got = ink_worker.poll(
+                    clean_generation, clean_applied_version
+                )
+                if got is not None:
+                    clean_applied_version, clean_mask = got
+                    accumulated_canvas = ink_module.render_canvas(
+                        clean_mask, out=canvas_buffer
                     )
 
         status = frame.copy()
@@ -1153,6 +1325,12 @@ def run(
                 )
             elif accumulated_canvas is not None:
                 canvas = accumulated_canvas
+            elif page_clean is not None:
+                # Tinta assincrona: ate a trabalhadora publicar a
+                # primeira mascara desta folha, o painel e a folha
+                # em branco. Rodar o modelo aqui, sincrono, era o
+                # congelamento que a trabalhadora existe para tirar.
+                canvas = _blank_sheet()
             else:
                 ink_mask = ink_source(
                     paper_module.warp_sheet(frame, tracker.corners)
@@ -1183,6 +1361,8 @@ def run(
             break
 
     frame_source.stop()
+    if ink_worker is not None:
+        ink_worker.stop()
     png_writer.close()
     cv2.destroyAllWindows()
 
