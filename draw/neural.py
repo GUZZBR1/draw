@@ -52,6 +52,14 @@ A sessão ONNX é preguiçosa e o onnxruntime só é importado no primeiro
 uso. Importar este módulo nunca quebra em ambiente sem a dependência;
 usar o detector sem ela levanta um erro explícito.
 
+Além do contrato legado de dois outputs, o detector aceita o SegFormer
+de quatro classes com output `logits`: a classe 1 (`paper`) forma a
+máscara da folha, e a fração de pixels dessa classe fornece presença.
+
+Os dois contratos usam uma única imagem com o nome de entrada `image`.
+Modelos temporais pareados de tinta recebem `before/after` e pertencem a
+outro adaptador; não podem ser carregados como detector de folha.
+
 O arquivo do modelo fica fora do repositório (binário de 15 MB). O
 caminho chega por argumento ou pela variável de ambiente
 DRAW_NEURAL_MODEL.
@@ -71,12 +79,19 @@ _ENV_THREADS_VAR = "DRAW_ORT_THREADS"
 _MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 _STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 _MASK_THRESHOLD = 0.5
+_PAPER_CLASS = 1
 _MIN_CONTOUR_AREA_RATIO = 0.01
+_SEGMENTATION_PRESENCE_MIN_RATIO = _MIN_CONTOUR_AREA_RATIO
 _FIT_MAX_DISPLACE_PX = 100.0
 _FIT_MIN_EDGE_COVERAGE = 0.5
 _MEMORY_MIN_MASK_IOU = 0.7
 _MEMORY_MASK_STRIDE = 4
 _ENV_MODEL_VAR = "DRAW_NEURAL_MODEL"
+_PAPER_CLASS = 1
+_INK_CLASS = 3
+_SEGMENTATION_PRESENCE_MIN_RATIO = 0.01
+_SEGMENTATION_ABSENT_LOGIT = -10.0
+_SEGMENTATION_PRESENT_LOGIT = 1.0
 
 # Portão do caminho clássico (medido em 2026-10-30 no laboratório,
 # draw-lab/fp-gate-2026-10-30/): com um modelo neural carregado, um
@@ -161,9 +176,17 @@ def _load_session(model_path):
         )
     options = ort.SessionOptions()
     options.intra_op_num_threads = _ort_intra_threads()
-    return ort.InferenceSession(
+    session = ort.InferenceSession(
         str(path), sess_options=options, providers=["CPUExecutionProvider"]
     )
+    input_names = [item.name for item in session.get_inputs()]
+    if input_names != ["image"]:
+        raise ValueError(
+            "modelo incompatível com o detector de folha: esperava a "
+            "entrada única 'image'; recebi "
+            f"{input_names}. Modelos temporais de tinta usam outro contrato."
+        )
+    return session
 
 
 def _ort_intra_threads():
@@ -464,10 +487,10 @@ class NeuralSheetDetector:
 
     __call__(frame) devolve (cantos, veredito, máscara): o mesmo trio
     da interface dos detectores do harness de avaliação. O veredito é
-    "paper" quando o logit de presença é positivo e o quadrilátero
-    fecha; fora isso, (None, None, máscara). A máscara é uint8
-    0/255 no tamanho do frame, limiarizada em 0,5 como na avaliação
-    da fase 2.
+    "paper" quando há presença e o quadrilátero fecha; fora isso,
+    (None, None, máscara). A máscara é uint8 0/255 no tamanho do frame.
+    O modelo legado usa limiar 0,5; o SegFormer de quatro classes usa
+    argmax da classe paper.
 
     O detector guarda as retas confiáveis das arestas entre chamadas
     (a memória de arestas): quando uma aresta perde cobertura numa
@@ -478,10 +501,11 @@ class NeuralSheetDetector:
     máscaras reduzidas por _MEMORY_MASK_STRIDE. Cena nova recomeça
     sem herança.
 
-    O atributo last_presence_logit guarda o logit de presença da
+    O atributo last_presence_logit guarda o sinal de presença da
     última chamada a predict (None antes da primeira e após um frame
-    vazio): é ele que o portão PRESENCE_VETO_LOGIT lê no app para
-    decidir se a reserva clássica pode falar.
+    vazio): nos modelos legados é o logit treinado; no SegFormer de
+    quatro classes é um sinal derivado da área segmentada. O app usa-o
+    para decidir se a reserva clássica pode falar.
     """
 
     def __init__(self, model_path):
@@ -491,6 +515,7 @@ class NeuralSheetDetector:
         self._edge_lines = None
         self._memory_mask = None
         self.last_presence_logit = None
+        self.last_paper_fraction = None
 
     def _get_session(self):
         if self._session is None:
@@ -543,7 +568,13 @@ class NeuralSheetDetector:
         return corners
 
     def predict(self, frame):
-        """Roda o modelo. Retorna (logit de presença, máscara 0/255)."""
+        """Roda o modelo. Retorna (sinal de presença, máscara 0/255).
+
+        O contrato legado tem uma máscara binária e um logit de presença.
+        O SegFormer de quatro classes exporta apenas logits semânticos;
+        nesse caso, papel e tinta formam a região da folha (a mão continua
+        excluída) e a própria área prevista fornece um sinal de presença.
+        """
         session = self._get_session()
         if self._resolved_input_size is None:
             self._resolved_input_size = _session_input_size(session)
@@ -557,24 +588,56 @@ class NeuralSheetDetector:
         ).astype(np.float32)
         tensor = ((resized / 255.0 - _MEAN) / _STD).transpose(2, 0, 1)
         tensor = tensor[None].astype(np.float32)
-        logits, presence = session.run(
-            ["mask_logits", "presence_logit"], {"image": tensor}
-        )
-        channel_bg, channel_paper = logits[0, 0], logits[0, 1]
-        peak = np.maximum(channel_bg, channel_paper)
-        exp_bg = np.exp(channel_bg - peak)
-        exp_paper = np.exp(channel_paper - peak)
-        probability = exp_paper / (exp_bg + exp_paper)
-        mask_small = (probability > _MASK_THRESHOLD).astype(np.uint8)
+        output_names = [output.name for output in session.get_outputs()]
+        outputs = session.run(output_names, {"image": tensor})
+        by_name = dict(zip(output_names, outputs))
+
+        if "mask_logits" in by_name and "presence_logit" in by_name:
+            logits = by_name["mask_logits"]
+            channel_bg, channel_paper = logits[0, 0], logits[0, 1]
+            peak = np.maximum(channel_bg, channel_paper)
+            exp_bg = np.exp(channel_bg - peak)
+            exp_paper = np.exp(channel_paper - peak)
+            probability = exp_paper / (exp_bg + exp_paper)
+            mask_small = (probability > _MASK_THRESHOLD).astype(np.uint8)
+            presence = float(by_name["presence_logit"][0])
+            self.last_paper_fraction = float(mask_small.mean())
+        elif output_names == ["logits"]:
+            logits = by_name["logits"]
+            if logits.ndim != 4 or logits.shape[0] != 1 or logits.shape[1] != 4:
+                raise ValueError(
+                    "saída 'logits' precisa ter forma [1, 4, H, W] "
+                    "(fundo, papel, mão, tinta)"
+                )
+            if not np.isfinite(logits).all():
+                raise ValueError("saída 'logits' contém valores não finitos")
+            classes = np.argmax(logits[0], axis=0)
+            page = (classes == _PAPER_CLASS) | (classes == _INK_CLASS)
+            page_ratio = float(np.mean(page))
+            mask_small = page.astype(np.uint8)
+            self.last_paper_fraction = page_ratio
+            presence = (
+                _SEGMENTATION_PRESENT_LOGIT
+                if page_ratio >= _SEGMENTATION_PRESENCE_MIN_RATIO
+                else _SEGMENTATION_ABSENT_LOGIT
+            )
+        else:
+            raise ValueError(
+                "saídas ONNX incompatíveis: esperava 'mask_logits' e "
+                "'presence_logit' ou apenas 'logits' com quatro classes; "
+                f"recebi {output_names}"
+            )
+
         mask = cv2.resize(
             mask_small, (frame_w, frame_h), interpolation=cv2.INTER_NEAREST
         )
-        self.last_presence_logit = float(presence[0])
+        self.last_presence_logit = float(presence)
         return self.last_presence_logit, mask * 255
 
     def __call__(self, frame):
         if frame is None or frame.size == 0:
             self.last_presence_logit = None
+            self.last_paper_fraction = None
             return None, None, None
         presence, mask = self.predict(frame)
         if presence <= 0:

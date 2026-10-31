@@ -20,47 +20,139 @@ O limite honesto do momento é a generalização. A v3 foi julgada nos frames da
 
 ## Início rápido
 
-Pré-requisitos: Python (o autor roda 3.12), uma webcam e as dependências do projeto.
+## v0 — o que já faz
+
+- Detecta uma folha-modelo (A4 com marcadores ArUco nos cantos) pela webcam
+- Retifica a perspectiva em tempo real: gera uma "vista de cima" perfeita
+  da folha, como um scanner
+- Extrai a tinta do papel e mostra um **canvas digital** ao lado, ao vivo
+- Apagar com a borracha funciona naturalmente: a tinta sumiu do papel, ela
+  some do canvas
+- Salva o canvas como PNG com a tecla `s`
+- Salva os traços vetoriais como SVG e JSON com a tecla `v`
+
+## Como rodar
+
+Pré-requisitos: Python 3.10+ e uma webcam (o autor roda 3.12), além das dependências do projeto.
 
 ```bash
 pip install -r requirements.txt
+
+# Rodar com qualquer folha sobre a mesa
+python3 main.py
+
+# Outras fontes de vídeo: outro índice de webcam ou um stream de rede
+python3 main.py --source 1
+python3 main.py --source /dev/video2
+python3 main.py --source http://192.168.0.10:8080/video
 ```
 
-### Windows com WSL
+## Câmeras: listar, selecionar e diagnosticar
 
+A captura vive em `draw/capture.py`, separada do pipeline de visão.
+O pipeline continua recebendo só frames, seja a fonte uma webcam USB,
+uma câmera IP/MJPEG, um arquivo ou um índice alternativo.
+
+```bash
+# Lista as webcams locais que abrem, sem abrir janela (sai 1 se nenhuma abrir)
+python3 main.py --list-cameras
+
+# Escolhe a fonte sem editar código: índice, porta V4L2 ou stream
+python3 main.py --source 1
+python3 main.py --source /dev/video2
+python3 main.py --source rtsp://camera:554/stream
+
+# Tamanho e FPS só valem para webcam local; o padrão é MJPG 1280x720
+python3 main.py --source 1 --width 640 --height 480 --fps 30
+
+# Força um backend (Linux: v4l2; Windows: msmf, dshow; qualquer SO: any, ffmpeg)
+python3 main.py --source 1 --backend v4l2
+```
+
+Comportamento quando algo dá errado:
+
+- A abertura passa os timeouts do OpenCV no construtor da captura e tenta
+  backends na ordem do SO. O suporte aos timeouts depende da versão do
+  OpenCV e do backend: FFmpeg e GStreamer são os backends documentados.
+  Para URL/arquivo, se o backend rejeitar esses parâmetros, o Draw falha
+  com diagnóstico e não tenta uma abertura de rede sem limite. Para
+  webcam local, ele preserva a tentativa antiga sem parâmetros se o
+  backend não os aceitar.
+  No Linux é V4L2 e depois o genérico; no Windows é MSMF, DShow e
+  depois o genérico. Um backend pedido com `--backend` é o único tentado.
+- Erro com a causa e a ação: porta inexistente, falta de permissão no
+  grupo `video`, dispositivo ocupado por outro programa, ou stream de
+  rede fora do ar. O erro de abertura reutiliza o diagnóstico por
+  porta do `--check`, não o reinventa.
+- Se os quadros pararem no meio do uso, o app tenta reabrir a mesma
+  fonte (padrão: 3 tentativas; `--reconnect-attempts 0` desliga a
+  reconexão). Se voltar, continua; se não voltar, encerra limpo
+  avisando que foi desconexão.
+
+Plataformas, resumido: Linux usa V4L2 e `/dev/video*`; Windows usa
+MSMF/DShow direto; WSL2 continua sendo um caso separado, descrito na
+seção abaixo — para uma fonte local, `--check` diagnostica a porta
+selecionada e o script de setup cuida de `uvcvideo`, `usbipd`, grupo
+`video` e interop com PowerShell. Uma URL de rede também pode ser
+validada sem dispositivo `/dev/video*`. Nem toda câmera USB é compatível
+com passthrough; se o attach falhar, use a rota via rede ou a ponte de
+captura do Windows.
+
+Os testes dessa camada, em `tests/test_capture.py`, usam só mocks:
+parsing de fontes, listagem, ordem de backends, cada tipo de erro e
+reconexão que volta ou que desiste. Nenhum deles exige câmera física,
+então o CI roda todos sem hardware.
+
+O fluxo padrão usa uma folha solta ou uma página de caderno sob a webcam.
+Ele dispensa impressão. O Draw encontra os cantos da folha, retifica a
+imagem e mostra o canvas digital.
+### Windows com WSL
 O WSL2 não enxerga a webcam do Windows por padrão. Nenhum `/dev/video*` existe dentro dele até a câmera ser anexada.
 
 O guia completo fica em [docs/SETUP_WINDOWS.md](docs/SETUP_WINDOWS.md). O caminho curto roda de dentro do WSL.
 
 ```bash
 bash scripts/setup_camera_wsl.sh
-python main.py
+python3 main.py --check
+python3 main.py
 ```
 
-O script prepara o usbipd, anexa a câmera ao WSL e confere o resultado. Ele também corrige o grupo `video` do usuário e religa os serviços de áudio que ele mesmo parou.
+O script prepara o usbipd, anexa a câmera ao WSL e confere o resultado. Depois de reiniciar o WSL, rode o script de novo para reanexar a câmera. Ele encontra o PowerShell mesmo se o PATH do shell não incluir executáveis do Windows e preserva outros dispositivos USB/IP.
 
 Se algo falhar, rode o diagnóstico antes de mexer em outra coisa.
 
 ```bash
-python main.py --list-cameras --verbose
-python main.py --test-source 0
-python main.py --test-all --report json
+python3 main.py --check
+python3 main.py --check --source 1
+python3 main.py --check --source http://192.168.0.10:8080/video
 ```
 
-`--check` testa a fonte escolhida em `--source`. `--list-cameras` mostra quais webcams abrem; `--test-source` e `--test-all` também verificam quadros e propriedades negociadas e sugerem o que corrigir quando há falha. URLs só são testadas quando informadas explicitamente com `--include-urls`.
+O `--check` valida o OpenCV, a existência de `/dev/video*`, a permissão do processo sobre o dispositivo e a leitura de um quadro real. Cada falha sai nomeada, com a correção na linha seguinte.
 
 ### Linux com câmera USB
 
+Teclas dentro do app: `s` salva um PNG em `captures/` · `v` salva
+traços vetoriais em `captures/` (SVG + JSON) · `q` ou `Esc` sai.
 ```bash
-python main.py
+python3 main.py
 ```
+
+`--check` valida exatamente a fonte selecionada por `--source`, passa
+timeouts de abertura e leitura no construtor, tenta receber um frame por
+até 5 segundos e informa dimensões e FPS quando disponíveis. URLs e
+arquivos não dependem de `/dev/video*`. Em fontes locais, a falha
+identifica a porta e a permissão aplicável. O limite de leitura depende
+do backend: se `capture.read()` bloquear e o backend não aplicar o
+timeout, a chamada nativa pode ultrapassar os 5 segundos. Para URL ou
+arquivo sem suporte aos parâmetros, o diagnóstico falha sem tentar uma
+abertura sem timeout.
 
 ### Com o detector neural
 
 O repositório não publica arquivo de modelo. Um clone novo roda só com o detector clássico até alguém colocar um ONNX na pasta `models/`. Na máquina do autor, o comando do dia a dia é este.
 
 ```bash
-python main.py --neural models/draw_seg_v3_dyn.onnx
+python3 main.py --neural models/draw_seg_v3_dyn.onnx
 ```
 
 ## Uso
@@ -70,12 +162,10 @@ python main.py --neural models/draw_seg_v3_dyn.onnx
 | `--source N` ou URL | Webcam local por índice (padrão 0) ou stream MJPEG por URL |
 | `--neural [modelo.onnx]` | Detector neural como primário, com o clássico de reserva. Sem caminho, lê `DRAW_NEURAL_MODEL` |
 | `--ink-model [modelo.onnx]` | Modelo aprendido de tinta como fonte da máscara. Sem caminho, lê `DRAW_INK_MODEL`. Sem arquivo ou com erro de carga, o app avisa uma vez e segue com a heurística |
+| `--pair-ink-model [modelo.onnx]` | Modelo experimental que compara dois frames para detectar tinta nova. Sem caminho, lê `DRAW_PAIR_INK_MODEL` |
 | `--hand-model [modelo.task]` | Máscara de mão do MediaPipe para o canvas acumulativo. Sem caminho, lê `DRAW_HAND_MODEL` ou `models/hand_landmarker.task` |
 | `--markers` | Modo opcional com a folha-modelo impressa e marcadores ArUco |
-| `--check` | Testa a fonte escolhida em `--source` e sai, sem abrir janela |
-| `--list-cameras` | Lista webcams locais que abrem; `--verbose` mostra resolução, FPS e backend |
-| `--test-source FONTE` / `--test-all` | Diagnostica uma fonte ou todas as webcams locais; `--report json` gera JSON |
-| `--light-normalize MODO` | Usa a guarda medida de fundo (`background`); o padrão `off` mantém o comportamento atual |
+| `--check` | Valida a câmera porta por porta e sai, sem abrir janela |
 | `--save-dir pasta` | Pasta das capturas. O padrão é `captures` |
 
 A variável `DRAW_ORT_THREADS` troca o número de threads da sessão ONNX sem tocar no código. O padrão é 4, medido na máquina do autor.
@@ -83,6 +173,24 @@ A variável `DRAW_ORT_THREADS` troca o número de threads da sessão ONNX sem to
 A máscara de mão é opcional e pede um pacote fora da instalação padrão.
 
 ```bash
+# Modo padrão, sem marcadores, em qualquer folha ou página de caderno
+python3 main.py
+
+# Outra webcam local
+python3 main.py --source 1
+
+# Câmera via rede, por um stream MJPEG
+python3 main.py --source http://192.168.0.10:8080/video
+
+# Valida a fonte selecionada e sai, sem abrir janela
+python3 main.py --check
+python3 main.py --check --source http://192.168.0.10:8080/video
+
+# Modo opcional com a folha-modelo impressa
+python template/generate_template.py
+python3 main.py --markers
+
+# Pacote opcional da máscara de mão
 pip install mediapipe
 ```
 
@@ -135,7 +243,7 @@ O canvas não é uma foto do frame atual. Ele acumula evidência com histerese s
 
 Com a máscara de mão ligada, a região sob a mão vira desconhecida. Ela não ganha nem perde tinta enquanto está coberta.
 
-O app também aceita um modelo aprendido de tinta por `--ink-model`. A integração está pronta e testada com um ONNX da arquitetura. O treino do modelo de tinta ainda não rodou. Sem ele, vale o caminho heurístico descrito acima.
+O app também aceita o modelo de um frame por `--ink-model` e um modelo experimental que compara frames consecutivos por `--pair-ink-model`. O segundo passou por uma verificação local de CPU, mas ainda não foi validado com webcam e tem latência alta; sem esses modelos, vale o caminho heurístico descrito acima.
 
 ## Desempenho medido
 
@@ -177,7 +285,7 @@ O kernel da v3 levou 44,7 minutos numa T4. O kernel da v2 levou 3 horas e 51 min
 - `bridge/` tem a ponte de captura no Windows. Um `ffmpeg.exe` no Windows serve a webcam como stream MJPEG e o Draw consome pelo `--source`. O passo a passo fica em [bridge/README.md](bridge/README.md).
 - `scripts/` tem os scripts de instalação. Hoje guarda `setup_camera_wsl.sh`, o instalador da câmera do WSL.
 - `tests/` tem os testes sem webcam. Hoje guarda `selftest.py`, que valida detecção, homografia, extração de tinta e o portão de textura em cenas sintéticas.
-- `tools/` tem as ferramentas de apoio. `label_frames.py` rotula frames capturados. `eval_real_frames.py` é o harness dos frames reais, o portão de qualquer modelo neural.
+- `tools/` tem as ferramentas de apoio do projeto. As ferramentas de treino (`label_frames.py`, `eval_real_frames.py` e outras) ficaram na branch `training-zone`.
 - `verification/` é o registro da verificação formal limitada da v0. Ele guarda a skill do projeto e o script que prova propriedades da homografia com sondas numéricas. É um registro histórico de uma etapa concluída, não uma etapa do pipeline.
 - `docs/` tem a documentação de instalação, com o guia do Windows com WSL.
 - `main.py` é o ponto de entrada. Ele só chama o app.
@@ -189,7 +297,32 @@ Sem webcam por perto, o pipeline inteiro se valida com cenas sintéticas.
 
 ```bash
 python tests/selftest.py
+python -m pytest tests/ -q
+python verification/run_verification.py
 ```
+
+O CI do GitHub Actions roda esses três passos em todo push para a main
+e em todo pull request. A verificação geométrica cobre 108 sondas em
+12 posições da folha, e o modo `--sabotage` dela deve falhar, para
+provar que o verificador não ficou cego.
+
+## Estrutura
+
+```
+main.py                     ponto de entrada
+draw/
+  config.py                 tamanho da folha, marcadores, posições
+  paper.py                  detecção dos marcadores + homografia (perspectiva)
+  ink.py                    extração da tinta e renderização do canvas digital
+  strokes.py                traço vetorial: afinamento, rastreamento,
+                            suavização, SVG e JSON
+  app.py                    loop da webcam e janelas
+  capture.py                fontes, backends, listagem, erros e reconexao
+template/
+  generate_template.py      gera a folha-modelo imprimível (PNG)
+tests/
+  selftest.py               teste do pipeline sem webcam
+  test_capture.py           captura com mocks, sem camera fisica
 
 O selftest roda os casos com marcadores, sem marcadores, de folha aninhada e do portão de textura. Ele imprime o erro máximo de canto e o recall de tinta de cada caso. Todos precisam passar antes de qualquer publicação.
 
@@ -199,22 +332,54 @@ A verificação formal limitada roda com o comando abaixo.
 python verification/run_verification.py
 ```
 
-Para rotular frames capturados:
+Para rotular frames capturados, use a branch `training-zone`: ela guarda `tools/label_frames.py` e `captures/` fora da main.
 
-```bash
-python tools/label_frames.py captures/frames dataset/rotulos
-```
+## v0.2 — traço vetorial
 
-A saída é um `labels.json` com os frames rotulados e os rejeitados. Cada frame rotulado ganha uma imagem de revisão na subpasta `overlays`. Os frames de origem nunca são modificados.
+A máscara de tinta vira traços com `draw/strokes.py`: afinamento da
+tinta para um esqueleto de 1 pixel, rastreamento do esqueleto em
+caminhos ordenados, suavização por média móvel e exportação em SVG
+e JSON, com largura, altura, pontos, comprimento e marca de traço
+fechado.
+
+Dois limites são intencionais e documentados no módulo. Junções
+dividem traços: um X vira 4 segmentos que se encontram no centro.
+E a ordem dos traços é determinística, por centroide, de cima para
+baixo e da esquerda para a direita, e não a ordem temporal em que
+o traço foi desenhado. Rastrear a ordem temporal, frame a frame,
+é trabalho futuro.
+
+## v0.2 — traço vetorial
+
+A máscara de tinta vira traços com `draw/strokes.py`: afinamento da
+tinta para um esqueleto de 1 pixel, rastreamento do esqueleto em
+caminhos ordenados, suavização por média móvel e exportação em SVG
+e JSON, com largura, altura, pontos, comprimento e marca de traço
+fechado.
+
+Dois limites são intencionais e documentados no módulo. Junções
+dividem traços: um X vira 4 segmentos que se encontram no centro.
+E a ordem dos traços é determinística, por centroide, de cima para
+baixo e da esquerda para a direita, e não a ordem temporal em que
+o traço foi desenhado. Rastrear a ordem temporal, frame a frame,
+é trabalho futuro.
 
 ## Roadmap
+
+- [x] v0.1 — captura: folha retificada + canvas digital em tempo real
+- [x] v0.1.1 — fonte de vídeo flexível (`--source` índice ou URL) para rodar no WSL com câmera via rede
+- [x] v0.2 — traço vetorial: ordem, caminho e suavização dos traços
+- [ ] v0.3 — reprodução dos traços no Paint via controle do mouse
+- [ ] v1 — interpretação: formas, letras e diagramas a partir dos traços
+- [ ] v2 — integração com um primeiro sistema alvo (CAD / simulador)
+- [ ] v3 — feedback de simulação em tempo real
 
 Feito:
 
 - Captura em tempo real, com folha retificada, tinta extraída e canvas digital ao vivo
 - Fonte de vídeo flexível, por índice local ou por URL de stream
 - Câmera do Windows anexada ao WSL pelo script de instalação
-- Diagnóstico de câmera porta por porta com `--check`
+- Diagnóstico da fonte selecionada com `--check --source`
 - Detecção sem marcadores como modo padrão
 - Portão de textura com veredito de baixa confiança para folha lisa
 - Segmentação de papel treinada no Kaggle, com sinal de presença, nas versões v1, v2 e v3
@@ -230,6 +395,8 @@ Em andamento:
 
 Planejado:
 
+- Segmentação de papel treinada no Kaggle, com sinal de presença
+- Reprodução dos traços em aplicativos de desenho
 - Traço vetorial, com ordem, caminho e suavização dos traços
 - Interpretação de formas, letras e diagramas
 - Integração com um primeiro sistema alvo, CAD ou simulador

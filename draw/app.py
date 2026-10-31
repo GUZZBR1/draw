@@ -2,25 +2,31 @@
 
 Uso:
   python main.py                                  # webcam local (indice 0)
-  python main.py --check                          # valida a camera e sai
+  python main.py --check                          # valida a fonte e sai
+  python main.py --list-cameras                   # lista webcams que abrem
   python main.py --markers                        # folha-modelo impressa
   python main.py --neural modelo.onnx             # detector neural primario
   python main.py --ink-model modelo.onnx          # modelo aprendido de tinta
+  python main.py --pair-ink-model modelo.onnx     # modelo temporal before/after
   python main.py --hand-model modelo.task         # mascara de mao no canvas
   python main.py --source 1                       # outra webcam local
+  python main.py --source /dev/video2             # porta V4L2 especifica
   python main.py --source http://192.168.0.10:8080/video   # camera via rede
+  python main.py --light-normalize both   # sombra e luz baixa
 
 A fonte via rede (MJPEG/RTSP) e o caminho recomendado no WSL. O WSL nao
 enxerga webcams USB do Windows por padrao, mas enxerga streams de rede.
 Assim todo o processamento (e o ML futuro) fica no Linux. A camera so
 envia os frames. Ela pode ser um celular, outro computador ou uma camera IP.
 
-Teclas: s = salvar o canvas como PNG, f = capturar um frame cru,
+Teclas: s = salvar o canvas como PNG, v = salvar tracos vetoriais
+(SVG + JSON), f = capturar um frame cru,
 g = ligar ou desligar a captura automatica de frames,
 c = congelar a pagina base (so com --session-baseline), q/Esc = sair.
 """
 
 import argparse
+import csv
 import os
 import queue
 import sys
@@ -32,12 +38,13 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from . import hand as hand_module
-from . import ink as ink_module
 from . import capture as capture_module
 from . import diagnose as diagnose_module
+from . import hand as hand_module
+from . import ink as ink_module
 from . import light as light_module
 from . import light_guard as light_guard_module
+from . import pair_ink as pair_ink_module
 try:
     from . import ink_model as ink_model_module
 except ImportError:
@@ -47,6 +54,8 @@ except ImportError:
     ink_model_module = None
 from . import neural as neural_module
 from . import paper as paper_module
+from . import sequence as sequence_module
+from . import strokes as strokes_module
 
 
 _SHEET_NEAR_LIMIT_PX = 40.0
@@ -349,9 +358,7 @@ class _LatestFrameCapture:
                         self._failures >= _CAPTURE_MAX_FAILURES
                     )
                 if reconnect_needed:
-                    reconnect = getattr(
-                        self._capture, "try_reconnect", None
-                    )
+                    reconnect = getattr(self._capture, "try_reconnect", None)
                     if reconnect is not None and reconnect():
                         with self._condition:
                             if self._stopped:
@@ -363,7 +370,7 @@ class _LatestFrameCapture:
                             return
                         self._dead = True
                         self._condition.notify_all()
-                    return
+                        return
                 time.sleep(_READ_RETRY_SECONDS)
 
     def wait_next(self, after_seq, timeout=None):
@@ -460,25 +467,57 @@ class _PngWriter:
 
 
 def parse_source(value):
-    """Delega para draw/capture.py, mantendo a CLI compatível."""
+    """Delega para draw/capture.py, mantendo o mesmo comportamento."""
     return capture_module.parse_source(value)
 
 
 def is_wsl():
+    """Detecta WSL pelo nome do kernel em /proc."""
     return capture_module.is_wsl()
 
 
 def _configure_local_capture(capture, width=None, height=None, fps=None):
+    """MJPG 720p por padrao; ver draw/capture.apply_local_settings."""
     capture_module.apply_local_settings(
         capture, width=width, height=height, fps=fps
     )
 
 
 def _local_open_hint(source):
+    """Diagnostico por porta, o mesmo criterio do --check."""
     return capture_module.diagnose_local(source)[1]
 
 
+def _detection_frame(frame, light_normalize="off"):
+    """Frame que vai para a detecção da folha.
+
+    Com a flag desligada devolve o frame sem tocar nele. Com ela ligada,
+    devolve o frame normalizado (ver draw/light.py). A detecção por
+    marcadores não usa este caminho: ela continua no frame original,
+    para não mudar o comportamento do modo com marcadores.
+    """
+    return light_module.normalize_light(frame, light_normalize)
+
+
+def _ink_input(warped, light_normalize="off"):
+    """Folha retificada que vai para a extração de tinta.
+
+    Passo separado da detecção: a folha retificada é a do frame
+    original, normalizada uma única vez aqui. Com a flag desligada
+    devolve a folha sem tocar nela.
+    """
+    return light_module.normalize_light(warped, light_normalize)
+
+
+def detect_sheet_with_light_guard(frame, light_normalize="off"):
+    """Delega para draw/light_guard.py (off primeiro, background depois)."""
+    return light_guard_module.detect_sheet_with_light_guard(
+        frame, light_normalize
+    )
+
+
 def _open_capture(source, **kwargs):
+    """Abre via draw/capture.py, com backends, timeout e erro especifico."""
     return capture_module.open_capture(source, **kwargs)
 
 
@@ -487,14 +526,18 @@ def _video_nodes():
 
 
 def _read_first_frame(capture, timeout_s):
+    """Tenta obter um frame até o prazo; capture.read() pode bloquear."""
     deadline = time.monotonic() + max(0.0, timeout_s)
     while True:
         try:
             ok, frame = capture.read()
         except Exception as error:
             return None, error
+        if time.monotonic() > deadline:
+            return None, TimeoutError("nenhum frame recebido dentro do prazo")
         if ok and frame is not None:
             return frame, None
+
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return None, TimeoutError("nenhum frame recebido dentro do prazo")
@@ -506,6 +549,7 @@ def run_check(source=0, open_timeout_ms=3000, first_frame_timeout_s=5.0):
     parsed = parse_source(source)
     print(f"PASS: OpenCV disponivel. Versao {cv2.__version__}.")
     print(f"Testando fonte: {parsed!r}.")
+
     capture = None
     try:
         read_timeout_ms = max(1, int(first_frame_timeout_s * 1000))
@@ -517,6 +561,7 @@ def run_check(source=0, open_timeout_ms=3000, first_frame_timeout_s=5.0):
         if not capture.isOpened():
             print(f"FAIL: a fonte {parsed!r} nao abriu.")
             return 1
+
         print(f"PASS: fonte {parsed!r} aberta.")
         frame, read_error = _read_first_frame(capture, first_frame_timeout_s)
         if read_error is not None:
@@ -530,16 +575,14 @@ def run_check(source=0, open_timeout_ms=3000, first_frame_timeout_s=5.0):
             else:
                 print(f"FAIL: erro ao ler frame da fonte {parsed!r}: {read_error}")
             return 1
-        height_px, width_px = frame.shape[:2]
+
+        height, width = frame.shape[:2]
         try:
-            fps_value = float(capture.get(cv2.CAP_PROP_FPS))
+            fps = float(capture.get(cv2.CAP_PROP_FPS))
         except Exception:
-            fps_value = 0.0
-        fps_text = f"{fps_value:g} FPS" if fps_value > 0 else "FPS indisponivel"
-        print(
-            f"PASS: primeiro frame recebido: {width_px}x{height_px}, "
-            f"{fps_text}."
-        )
+            fps = 0.0
+        fps_text = f"{fps:g} FPS" if fps > 0 else "FPS indisponivel"
+        print(f"PASS: primeiro frame recebido: {width}x{height}, {fps_text}.")
         return 0
     except capture_module.CaptureError as error:
         print(f"FAIL: {error}")
@@ -561,6 +604,51 @@ def _fit(image, max_h=700):
         return image
     scale = max_h / h
     return cv2.resize(image, (int(w * scale), max_h))
+
+
+def resolve_neural_model(argument, env_model, markers_mode=False):
+    """Resolve the single-frame page detector path."""
+    if markers_mode:
+        if argument is not None:
+            raise ValueError("--neural nao combina com --markers")
+        return None
+    model_path = argument or env_model or None
+    if argument == "" and not model_path:
+        raise ValueError(
+            "--neural sem caminho: passe o arquivo .onnx ou defina "
+            "a variavel DRAW_NEURAL_MODEL"
+        )
+    return model_path
+
+
+def resolve_ink_model(argument, env_model, markers_mode=False):
+    """Resolve the existing single-frame ink model path."""
+    if markers_mode:
+        if argument is not None:
+            raise ValueError("--ink-model nao combina com --markers")
+        return None
+    model_path = argument or env_model or None
+    if argument == "" and not model_path:
+        raise ValueError(
+            "--ink-model sem caminho: passe o arquivo .onnx ou defina "
+            "a variavel DRAW_INK_MODEL"
+        )
+    return model_path
+
+
+def resolve_pair_ink_model(argument, env_model, markers_mode=False):
+    """Resolve the temporal before/after ink model path."""
+    if markers_mode:
+        if argument is not None:
+            raise ValueError("--pair-ink-model nao combina com --markers")
+        return None
+    model_path = argument or env_model or None
+    if argument == "" and not model_path:
+        raise ValueError(
+            "--pair-ink-model sem caminho: passe o arquivo .onnx ou "
+            "defina a variavel DRAW_PAIR_INK_MODEL"
+        )
+    return model_path
 
 
 _BLANK_SHEET = None
@@ -697,22 +785,9 @@ def _detect_sheet_combined(frame, neural_detector, classic_detect=None):
     return classic_detect(frame)
 
 
-def detect_sheet_with_light_guard(frame, light_normalize="off"):
-    """Usa luz normalizada só quando a guarda confirma o candidato."""
-    return light_guard_module.detect_sheet_with_light_guard(
-        frame, light_normalize
-    )
-
-
 def _detect_sheet_for_run(frame, neural_detector, light_normalize,
                           winning_light):
-    """Detecta um quadro e guarda o modo que deve ser usado na tinta.
-
-    O detector neural recebe o frame original, portanto uma detecção
-    neural confirmada mantém a tinta sem normalização. Quando ele não
-    fecha os cantos, a reserva clássica pode selecionar o modo aceito
-    pela guarda de luz.
-    """
+    """Detecta a folha e registra a normalização que a guarda aceitou."""
     winning_light["mode"] = "off"
 
     def classic_with_light_guard(candidate_frame):
@@ -727,26 +802,11 @@ def _detect_sheet_for_run(frame, neural_detector, light_normalize,
     )
 
 
-def _ink_input(warped, light_normalize="off"):
-    return light_module.normalize_light(warped, light_normalize)
-
-
-def run(
-    source=0,
-    save_dir="captures",
-    markers_mode=False,
-    neural_model=None,
-    hand_model=None,
-    ink_model=None,
-    session_baseline=False,
-    width=None,
-    height=None,
-    fps=None,
-    backend=None,
-    reconnect_attempts=3,
-    open_timeout_ms=3000,
-    light_normalize="off",
-):
+def run(source=0, save_dir="captures", markers_mode=False, width=None,
+        height=None, fps=None, backend=None, reconnect_attempts=3,
+        open_timeout_ms=3000, neural_model=None, capture_all_frames=False,
+        light_normalize="off", session_mode=False, hand_model=None,
+        ink_model=None, pair_ink_model=None, session_baseline=False):
     neural_detector = None
     if neural_model is not None and not markers_mode:
         neural_detector = neural_module.NeuralSheetDetector(neural_model)
@@ -771,6 +831,14 @@ def run(
                     f"Modelo de tinta ativo: {ink_model}. "
                     "A heuristica segue como reserva por frame."
                 )
+
+    pair_ink_detector = None
+    if pair_ink_model is not None and not markers_mode:
+        pair_ink_detector = pair_ink_module.PairInkDetector(pair_ink_model).load()
+        print(
+            f"Modelo temporal de tinta ativo: {pair_ink_model}. "
+            "Ele complementa a heuristica e ainda e experimental."
+        )
 
     session_ink = None
     if session_baseline and not markers_mode:
@@ -802,33 +870,74 @@ def run(
         return _detect_sheet_for_run(
             frame, neural_detector, light_normalize, winning_light
         )
-
-    parsed_source = parse_source(source)
-    capture_kwargs = {
-        "width": width,
-        "height": height,
-        "fps": fps,
-        "backend": backend,
-        "open_timeout_ms": open_timeout_ms,
-    }
-    capture = _open_capture(parsed_source, **capture_kwargs)
+    parsed = parse_source(source)
+    # Captura latest-frame do upstream no lugar do laco de
+    # reconexao do fork: a thread conta as falhas e declara a fonte
+    # morta no limite, o equivalente declarado do comportamento
+    # antigo. Os parametros de camera do fork seguem valendo, mas
+    # so viajam quando alguem os definiu: com os padroes, a chamada
+    # fica igual a do upstream, de um so argumento.
+    open_kwargs = {}
+    if width is not None:
+        open_kwargs["width"] = width
+    if height is not None:
+        open_kwargs["height"] = height
+    if fps is not None:
+        open_kwargs["fps"] = fps
+    if backend is not None:
+        open_kwargs["backend"] = backend
+    if open_timeout_ms != 3000:
+        open_kwargs["open_timeout_ms"] = open_timeout_ms
+    capture = _open_capture(parsed, **open_kwargs)
     if reconnect_attempts > 0:
         capture = capture_module.ReconnectingCapture(
-            parsed_source,
+            parsed,
             attempts=reconnect_attempts,
-            **capture_kwargs,
+            **open_kwargs,
         ).attach(capture)
     frame_source = _LatestFrameCapture(capture).start()
     png_writer = _PngWriter()
     save_path = Path(save_dir)
+    dataset_path = None
+    dataset_writer = None
+    dataset_manifest = None
+    if capture_all_frames:
+        session_name = (
+            f"session_{time.strftime('%Y%m%d_%H%M%S')}_"
+            f"{time.time_ns() % 1_000_000:06d}"
+        )
+        dataset_path = save_path / "training" / session_name
+        dataset_path.mkdir(parents=True, exist_ok=False)
+        dataset_manifest = (dataset_path / "frames.csv").open(
+            "w", newline="", encoding="utf-8", buffering=1
+        )
+        dataset_writer = csv.writer(dataset_manifest)
+        dataset_writer.writerow(
+            ["frame_index", "timestamp_ns", "filename", "width", "height"]
+        )
+        print(f"Salvando todos os frames em {dataset_path}.")
     if markers_mode:
         print("Draw v0 rodando. Mostre a folha-modelo para a camera.")
     else:
         print("Draw v0 rodando. Mostre uma folha para a camera.")
     print(
-        "Teclas: s = salvar canvas, f = capturar frame, "
+        "Teclas: s = salvar canvas, v = salvar tracos vetoriais, "
+        "f = capturar frame, "
         "g = captura automatica (desligada), q/Esc = sair."
     )
+    # Modo sessão (etapa 5 do Senado): rastreia a ordem temporal
+    # dos traços enquanto o desenho acontece. Desligado por padrão;
+    # a tecla v continua exportando o snapshot por centroide, e a
+    # tecla o exporta a sessão ordenada, só neste modo.
+    session_tracker = (
+        sequence_module.SequenceTracker() if session_mode else None
+    )
+    session_counter = 0
+    if session_mode:
+        print(
+            "Modo sessao ligado: a ordem dos tracos e registrada "
+            "enquanto eles aparecem (tecla o = salvar sessao ordenada)."
+        )
 
     frames_path = save_path / "frames"
     frames_saved = 0
@@ -881,6 +990,7 @@ def run(
     ink_accumulator = ink_module.InkAccumulator()
     corner_history = deque(maxlen=_INK_CORNER_HISTORY)
     ink_session_open = False
+    pair_previous_frame = None
     accumulated_canvas = None
     # Buffers donos dos canvas renderizados no laco. O acumulado
     # mora em canvas_buffer de um frame de deteccao ao outro, e
@@ -904,13 +1014,10 @@ def run(
             # a janela, sobre a ultima vista, e fica _DEAD_NOTICE_MS
             # ou ate uma tecla: so o console seria um congelamento
             # silencioso para quem esta olhando a janela.
-            message = (
+            print(
                 "A camera abriu, mas parou de entregar quadros. "
                 "Feche outros programas usando a camera e tente de novo."
             )
-            if frame_source.last_error is not None:
-                message += f" Erro mais recente: {frame_source.last_error}"
-            print(message)
             cv2.imshow("Draw", _dead_source_view(last_view))
             cv2.waitKey(_DEAD_NOTICE_MS)
             break
@@ -922,6 +1029,21 @@ def run(
         # no acumulador, como fazia o carimbo tirado no laco.
 
         loop_frames += 1
+        if dataset_writer is not None:
+            frame_name = f"frame_{loop_frames:08d}.jpg"
+            frame_path = dataset_path / frame_name
+            if not cv2.imwrite(
+                str(frame_path), frame, [cv2.IMWRITE_JPEG_QUALITY, 95]
+            ):
+                print(f"Erro ao salvar frame: {frame_path}")
+                break
+            height_px, width_px = frame.shape[:2]
+            dataset_writer.writerow(
+                [loop_frames, time.time_ns(), frame_name, width_px, height_px]
+            )
+            dataset_manifest.flush()
+            if loop_frames % 100 == 0:
+                print(f"Frames salvos nesta sessao: {loop_frames}.")
         if auto_capture and loop_frames % 10 == 0:
             save_raw_frame(frame)
 
@@ -946,6 +1068,7 @@ def run(
                 ink_session_open = False
                 session_corners = None
                 freeze_pending = False
+                pair_previous_frame = None
 
             frame_number += 1
             # Presenca e o estado do rastreador: warp_sheet com
@@ -955,6 +1078,8 @@ def run(
             # de tinta e o fallback de exibicao, que retifica sob
             # demanda.
             sheet_present = tracker.corners is not None
+            if not sheet_present:
+                pair_previous_frame = None
             warped = None
 
             if ran_detection and tracker.corners is not None:
@@ -967,6 +1092,7 @@ def run(
                         session_corners = None
                         freeze_pending = False
                     corner_history.clear()
+                    pair_previous_frame = None
                     ink_session_open = True
                 if restart_reference:
                     # Tecla C: novo ponto zero da sessao. O canvas
@@ -978,6 +1104,7 @@ def run(
                     session_ink.reset()
                     baseline_armed = True
                     freeze_pending = True
+                    pair_previous_frame = None
                 corner_history.append(tracker.corners.copy())
                 ink_corners = np.median(
                     np.stack(corner_history), axis=0
@@ -991,10 +1118,7 @@ def run(
                     and session_corners is not None
                     else ink_corners
                 )
-                ink_warped = _ink_input(
-                    paper_module.warp_sheet(frame, warp_corners),
-                    winning_light["mode"],
-                )
+                ink_warped = paper_module.warp_sheet(frame, warp_corners)
                 visible = None
                 if hand_masker is not None:
                     camera_mask = hand_masker.mask(frame)
@@ -1014,6 +1138,26 @@ def run(
                             ink_warped, visible)
                 else:
                     observed = ink_source(ink_warped)
+                if (
+                    pair_ink_detector is not None
+                    and pair_previous_frame is not None
+                    and ink_warped is not None
+                    and (session_ink is None or session_ink.ready)
+                ):
+                    before_warped = paper_module.warp_sheet(
+                        pair_previous_frame, warp_corners
+                    )
+                    if before_warped is not None:
+                        before_gray = cv2.cvtColor(
+                            before_warped, cv2.COLOR_BGR2GRAY
+                        )
+                        after_gray = cv2.cvtColor(
+                            ink_warped, cv2.COLOR_BGR2GRAY
+                        )
+                        new_ink = pair_ink_detector.predict(
+                            after_gray, before_gray
+                        )
+                        observed = cv2.bitwise_or(observed, new_ink)
                 accumulated_canvas = ink_module.render_canvas(
                     ink_accumulator.update(
                         observed, visible,
@@ -1084,21 +1228,47 @@ def run(
                     2,
                 )
             if markers_mode:
-                ink_mask = ink_module.extract_ink(
-                    warped, clear_markers=True
+                display_warped = warped
+            else:
+                # Retifica sob demanda: o warp por quadro sumiu com
+                # a presenca sem warp do upstream, e a exibicao, a
+                # amostragem da sessao e a tecla v precisam da folha
+                # retificada deste quadro.
+                display_warped = paper_module.warp_sheet(
+                    frame, tracker.corners
                 )
+            # ink_mask ja veio de extract_ink sobre a entrada com
+            # luz normalizada; o modelo de tinta do upstream so o
+            # substitui quando esta ativo.
+            if ink_extractor is not None:
+                ink_mask = ink_source(display_warped)
+            else:
+                ink_mask = ink_module.extract_ink(
+                    _ink_input(display_warped, winning_light["mode"]),
+                    clear_markers=markers_mode,
+                )
+            if session_tracker is not None:
+                # Amostragem reduzida: uma amostra a cada 5 quadros
+                # retificados, não a cada quadro — o thinning e o
+                # rastreamento a cada quadro são custo sem ganho.
+                session_counter += 1
+                if session_counter % 5 == 1:
+                    session_tracker.update(
+                        strokes_module.extract_strokes(ink_mask),
+                        frame_index=loop_frames,
+                        timestamp_ms=int(time.time() * 1000),
+                        corners=(
+                            None if markers_mode else tracker.corners
+                        ),
+                        sheet_locked=True,
+                    )
+            if markers_mode:
                 canvas = ink_module.render_canvas(
                     ink_mask, out=view_canvas_buffer
                 )
             elif accumulated_canvas is not None:
                 canvas = accumulated_canvas
             else:
-                ink_mask = ink_source(
-                    _ink_input(
-                        paper_module.warp_sheet(frame, tracker.corners),
-                        winning_light["mode"],
-                    )
-                )
                 canvas = ink_module.render_canvas(
                     ink_mask, out=view_canvas_buffer
                 )
@@ -1114,9 +1284,28 @@ def run(
                     canvas,
                     lambda path: print(f"Canvas salvo em {path}"),
                 )
+            if key == ord("v"):
+                save_path.mkdir(parents=True, exist_ok=True)
+                base = save_path / f"strokes_{int(time.time())}"
+                strokes = strokes_module.extract_strokes(ink_mask)
+                svg_path, json_path = strokes_module.export_strokes(
+                    strokes, base
+                )
+                print(f"{len(strokes)} tracos salvos em {svg_path} "
+                      f"e {json_path}")
+            if key == ord("o") and session_tracker is not None:
+                save_path.mkdir(parents=True, exist_ok=True)
+                base = save_path / f"session_{int(time.time())}"
+                svg_path, json_path = sequence_module.export_session(
+                    session_tracker, base
+                )
+                print(f"sessao com {len(session_tracker.ordered)} tracos "
+                      f"ordenados salva em {svg_path} e {json_path}")
             handle_capture_key(key, frame)
             if key in (ord("q"), 27):
                 break
+            if pair_ink_detector is not None:
+                pair_previous_frame = frame.copy()
             continue
 
         key = cv2.waitKey(1) & 0xFF
@@ -1126,6 +1315,8 @@ def run(
 
     frame_source.stop()
     png_writer.close()
+    if dataset_manifest is not None:
+        dataset_manifest.close()
     cv2.destroyAllWindows()
 
 
@@ -1165,6 +1356,15 @@ def main():
         "heuristica",
     )
     parser.add_argument(
+        "--pair-ink-model",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="MODELO.onnx",
+        help="modelo temporal before/after de tinta nova; pode usar "
+        "DRAW_PAIR_INK_MODEL sem esta flag",
+    )
+    parser.add_argument(
         "--hand-model",
         nargs="?",
         const="",
@@ -1180,66 +1380,80 @@ def main():
     parser.add_argument(
         "--check",
         action="store_true",
-        help="testa a fonte selecionada com --source e sai",
+        help="valida a fonte escolhida com --source e sai, sem abrir janela",
     )
     parser.add_argument(
         "--list-cameras",
         action="store_true",
-        help="lista webcams locais que abrem e sai",
+        help="lista as webcams locais que abrem e sai, sem abrir janela",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="com --list-cameras, acrescenta backend e props negociadas",
     )
     parser.add_argument(
         "--test-source",
         default=None,
         metavar="FONTE",
-        help="faz um diagnóstico detalhado da fonte e sai",
+        help="sonda uma fonte (indice, /dev/videoN, arquivo ou URL) "
+        "e sai, sem abrir janela e sem acao no sistema",
     )
     parser.add_argument(
         "--test-all",
         action="store_true",
-        help="diagnostica todas as webcams locais e sai",
+        help="sonda as webcams locais que abrem e sai, sem abrir janela",
     )
     parser.add_argument(
         "--include-urls",
         nargs="*",
         default=[],
-        help="com --test-all, diagnostica também estas URLs",
+        help="com --test-all, sonda tambem estas URLs explicitamente",
     )
     parser.add_argument(
         "--report",
-        choices=("text", "json"),
+        choices=["text", "json"],
         default="text",
-        help="formato do diagnóstico de --test-source/--test-all",
+        help="formato do relatorio de --test-source/--test-all",
     )
     parser.add_argument(
-        "--verbose",
+        "--width", type=int, default=None,
+        help="largura pedida para webcam local (padrao: 1280)",
+    )
+    parser.add_argument(
+        "--height", type=int, default=None,
+        help="altura pedida para webcam local (padrao: 720)",
+    )
+    parser.add_argument(
+        "--fps", type=float, default=None,
+        help="FPS pedido para webcam local (padrao: o da camera)",
+    )
+    parser.add_argument(
+        "--backend", default=None,
+        help="backend OpenCV: any, v4l2, msmf, dshow, ffmpeg, "
+        "avfoundation, gstreamer (padrao: o do SO, para webcam local)",
+    )
+    parser.add_argument(
+        "--reconnect-attempts", type=int, default=3,
+        help="tentativas de reabrir a camera quando os quadros param",
+    )
+    parser.add_argument(
+        "--open-timeout-ms", type=int, default=3000,
+        help="timeout de abertura da fonte, em milissegundos",
+    )
+    parser.add_argument(
+        "--light-normalize", default="off",
+        choices=list(light_module.LIGHT_MODES),
+        help="normalizacao de luz: off (padrao, sem mudanca), "
+        "background (fundo + divisao), clahe (contraste local) ou "
+        "both (fundo + CLAHE, o melhor medido em sombra e luz baixa)",
+    )
+    parser.add_argument(
+        "--session",
         action="store_true",
-        help="com --list-cameras, mostra detalhes da câmera",
-    )
-    parser.add_argument("--width", type=int, default=None)
-    parser.add_argument("--height", type=int, default=None)
-    parser.add_argument("--fps", type=float, default=None)
-    parser.add_argument(
-        "--backend",
-        default=None,
-        help="backend OpenCV (any, v4l2, msmf, dshow, ffmpeg, avfoundation, gstreamer)",
-    )
-    parser.add_argument(
-        "--reconnect-attempts",
-        type=int,
-        default=3,
-        help="tentativas de reabrir a câmera quando os quadros param",
-    )
-    parser.add_argument(
-        "--open-timeout-ms",
-        type=int,
-        default=3000,
-        help="limite para abrir a fonte, em milissegundos",
-    )
-    parser.add_argument(
-        "--light-normalize",
-        choices=list(light_guard_module.LIGHT_GUARD_MODES),
-        default="off",
-        help="normalização de fundo protegida: off (padrão) ou background",
+        help="modo sessao: registra a ordem temporal dos tracos "
+        "enquanto eles aparecem (tecla o = salvar sessao ordenada); "
+        "sem ele, v continua exportando o snapshot por centroide",
     )
     parser.add_argument(
         "--session-baseline",
@@ -1251,37 +1465,31 @@ def main():
         "Incompativel com --markers",
     )
     parser.add_argument("--save-dir", default="captures")
+    parser.add_argument(
+        "--capture-all-frames",
+        action="store_true",
+        help="salva cada frame JPEG e seu timestamp para coleta de dados",
+    )
     args = parser.parse_args()
     if args.test_source is not None or args.test_all or args.include_urls:
         reports = []
         if args.test_source is not None:
-            reports.append(
-                diagnose_module.probe_source(
-                    args.test_source, open_timeout_ms=args.open_timeout_ms
-                )
-            )
+            reports.append(diagnose_module.probe_source(args.test_source))
         if args.test_all:
-            reports.extend(
-                diagnose_module.probe_all(
-                    include_urls=args.include_urls,
-                    open_timeout_ms=args.open_timeout_ms,
-                )
-            )
+            reports.extend(diagnose_module.probe_all(
+                include_urls=args.include_urls
+            ))
         elif args.include_urls:
-            reports.extend(
-                diagnose_module.probe_all(
-                    include_urls=args.include_urls,
-                    list_fn=lambda: [],
-                    open_timeout_ms=args.open_timeout_ms,
-                )
-            )
+            reports.extend(diagnose_module.probe_all(
+                include_urls=args.include_urls,
+                list_fn=lambda: [],
+            ))
         if args.report == "json":
             import json
 
             print(json.dumps(
                 [report.to_dict() for report in reports],
-                indent=2,
-                default=str,
+                indent=2, default=str,
             ))
         else:
             for report in reports:
@@ -1292,60 +1500,52 @@ def main():
     if args.list_cameras:
         results = capture_module.list_cameras()
         if args.verbose:
+            probed = {}
             for item in results:
-                detail = ""
                 if item["opened"]:
-                    report = diagnose_module.probe_source(
-                        item["index"], read_frames=1,
-                        open_timeout_ms=args.open_timeout_ms,
+                    probed[item["index"]] = diagnose_module.probe_source(
+                        item["index"], read_frames=1
                     )
+            lines = []
+            for item in results:
+                status = "ok" if item["opened"] else "nao abriu"
+                node = f" ({item['node']})" if item.get("node") else ""
+                detail = ""
+                report = probed.get(item["index"])
+                if report is not None:
                     props = []
                     if report.width and report.height:
                         props.append(f"{report.width}x{report.height}")
                     if report.fps:
-                        props.append(f"{report.fps:g}fps")
+                        props.append(f"@{report.fps}fps")
                     if report.fourcc:
                         props.append(str(report.fourcc))
                     if report.backend_used:
                         props.append(str(report.backend_used))
                     if props:
                         detail = f" [{', '.join(props)}]"
-                node = f" ({item['node']})" if item.get("node") else ""
-                status = "ok" if item["opened"] else "não abriu"
-                print(f"  {item['index']}{node}: {status}{detail}")
+                lines.append(f"  {item['index']}{node}: {status}{detail}")
+            print("\n".join(lines))
         else:
             print(capture_module.format_camera_list(results))
         sys.exit(0 if any(item["opened"] for item in results) else 1)
     if args.check:
-        sys.exit(run_check(args.source, args.open_timeout_ms))
-    if args.reconnect_attempts < 0:
-        parser.error("--reconnect-attempts precisa ser >= 0")
-    if args.open_timeout_ms <= 0:
-        parser.error("--open-timeout-ms precisa ser > 0")
+        parsed = parse_source(args.source)
+        sys.exit(run_check(parsed, open_timeout_ms=args.open_timeout_ms))
     try:
-        backend = capture_module.backend_from_name(args.backend)
+        neural_model = resolve_neural_model(
+            args.neural, os.environ.get("DRAW_NEURAL_MODEL"), args.markers
+        )
+        ink_model = resolve_ink_model(
+            args.ink_model, os.environ.get("DRAW_INK_MODEL"), args.markers
+        )
+        pair_ink_model = resolve_pair_ink_model(
+            args.pair_ink_model,
+            os.environ.get("DRAW_PAIR_INK_MODEL"),
+            args.markers,
+        )
     except ValueError as error:
         parser.error(str(error))
-    neural_model = None
-    if args.neural is not None:
-        if args.markers:
-            parser.error("--neural nao combina com --markers")
-        neural_model = args.neural or os.environ.get("DRAW_NEURAL_MODEL")
-        if not neural_model:
-            parser.error(
-                "--neural sem caminho: passe o arquivo .onnx ou defina "
-                "a variavel DRAW_NEURAL_MODEL"
-            )
-    ink_model = None
-    if args.ink_model is not None:
-        if args.markers:
-            parser.error("--ink-model nao combina com --markers")
-        ink_model = args.ink_model or os.environ.get("DRAW_INK_MODEL")
-        if not ink_model:
-            parser.error(
-                "--ink-model sem caminho: passe o arquivo .onnx ou "
-                "defina a variavel DRAW_INK_MODEL"
-            )
     if args.session_baseline and args.markers:
         parser.error("--session-baseline nao combina com --markers")
     hand_model = None
@@ -1356,23 +1556,30 @@ def main():
             args.hand_model or os.environ.get("DRAW_HAND_MODEL") or ""
         )
     try:
+        backend = capture_module.backend_from_name(args.backend)
+    except ValueError as error:
+        parser.error(str(error))
+    try:
         run(
             source=args.source,
             save_dir=args.save_dir,
             markers_mode=args.markers,
-            neural_model=neural_model,
-            hand_model=hand_model,
-            ink_model=ink_model,
-            session_baseline=args.session_baseline,
             width=args.width,
             height=args.height,
             fps=args.fps,
             backend=backend,
             reconnect_attempts=args.reconnect_attempts,
             open_timeout_ms=args.open_timeout_ms,
+            neural_model=neural_model,
+            capture_all_frames=args.capture_all_frames,
             light_normalize=args.light_normalize,
+            session_mode=args.session,
+            hand_model=hand_model,
+            ink_model=ink_model,
+            pair_ink_model=pair_ink_model,
+            session_baseline=args.session_baseline,
         )
-    except (RuntimeError, FileNotFoundError) as error:
+    except (RuntimeError, FileNotFoundError, ValueError) as error:
         print(f"Erro: {error}")
         sys.exit(2)
 

@@ -28,18 +28,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from draw import ink as ink_new  # noqa: E402
 
+# Baseline da regressao: draw/ink.py antes dos carimbos (upstream
+# ca51fce). O carregamento e preguicoso para a coleta do pytest nao
+# morrer: este script e standalone (ver "Uso" acima) e nao define
+# testes pytest; sem a baseline, main() falha com a mesma mensagem
+# de antes, so que ao rodar, nao ao importar.
 _PRE_STAMP = Path("/tmp/ink_pre_stamp.py")
-if not _PRE_STAMP.exists():
-    print(
-        "ERRO: /tmp/ink_pre_stamp.py nao existe; copie draw/ink.py "
-        "para la antes de mudar o acumulador."
+ink_old = None
+if _PRE_STAMP.exists():
+    _spec = importlib.util.spec_from_file_location(
+        "draw._ink_pre_stamp", _PRE_STAMP
     )
-    sys.exit(2)
-_spec = importlib.util.spec_from_file_location(
-    "draw._ink_pre_stamp", _PRE_STAMP
-)
-ink_old = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(ink_old)
+    ink_old = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(ink_old)
 
 H, W = 1200, 850
 N_FRAMES = 60
@@ -79,6 +80,12 @@ def build_sequence():
 
 
 def main():
+    if ink_old is None:
+        print(
+            "ERRO: /tmp/ink_pre_stamp.py nao existe; copie draw/ink.py "
+            "para la antes de mudar o acumulador."
+        )
+        sys.exit(2)
     frames = build_sequence()
     acc_old = ink_old.InkAccumulator()
     acc_new = ink_new.InkAccumulator()
