@@ -4,11 +4,20 @@ Uso:
   python main.py                                  # webcam local (indice 0)
   python main.py --check                          # valida a camera e sai
   python main.py --markers                        # folha-modelo impressa
-  python main.py --neural modelo.onnx             # detector neural primario
-  python main.py --ink-model modelo.onnx          # modelo aprendido de tinta
-  python main.py --hand-model modelo.task         # mascara de mao no canvas
+  python main.py --legacy-ink                     # pilha antiga de tinta
+  python main.py --neural modelo.onnx             # outro detector de folha
+  python main.py --page-clean modelo.onnx         # outro modelo de tinta
   python main.py --source 1                       # outra webcam local
   python main.py --source http://192.168.0.10:8080/video   # camera via rede
+
+Sem nenhuma flag, o caminho e o do reinicio de 2026-10-31: folha
+pelo detector neural v3 (models/draw_seg_v3_dyn.onnx, com o classico
+de reserva) e tinta pelo modelo pagina->limpa
+(models/page_clean_unet.onnx), acumulada por uniao simples no
+canvas. A pilha antiga de tinta (heuristica, --ink-model,
+--session-baseline com a tecla C, --hand-model) so roda atras de
+--legacy-ink; passar qualquer uma dessas flags liga o legado com
+aviso.
 
 A fonte via rede (MJPEG/RTSP) e o caminho recomendado no WSL. O WSL nao
 enxerga webcams USB do Windows por padrao, mas enxerga streams de rede.
@@ -43,6 +52,7 @@ except ImportError:
     # --ink-model avisa e o app segue so com a heuristica.
     ink_model_module = None
 from . import neural as neural_module
+from . import page_clean as page_clean_module
 from . import paper as paper_module
 
 
@@ -745,7 +755,37 @@ def run(
     hand_model=None,
     ink_model=None,
     session_baseline=False,
+    page_clean_model=None,
+    legacy_ink=False,
 ):
+    # A pilha antiga de tinta so existe atras do legado. Pedir
+    # qualquer peca dela (modelo de tinta, pagina base na tecla C,
+    # mascara de mao) liga o legado com aviso, para nenhuma flag
+    # ficar silenciosamente sem efeito no caminho novo.
+    if not legacy_ink and (
+        ink_model is not None or session_baseline or hand_model is not None
+    ):
+        legacy_ink = True
+        print(
+            "Flags da pilha antiga de tinta detectadas: rodando com "
+            "--legacy-ink (heuristica/sessao). O caminho padrao novo "
+            "e o modelo pagina->limpa."
+        )
+
+    if neural_model is None and not markers_mode:
+        # Padrao do reinicio, tambem para quem chama run() direto:
+        # a variavel de ambiente ou o modelo v3 no lugar de sempre.
+        # main() resolve o mesmo padrao para a linha de comando.
+        default_sheet = (
+            Path(__file__).resolve().parent.parent
+            / "models"
+            / "draw_seg_v3_dyn.onnx"
+        )
+        if default_sheet.exists():
+            neural_model = str(default_sheet)
+        else:
+            neural_model = os.environ.get("DRAW_NEURAL_MODEL")
+
     neural_detector = None
     if neural_model is not None and not markers_mode:
         neural_detector = neural_module.NeuralSheetDetector(neural_model)
@@ -754,6 +794,30 @@ def run(
             f"Detector neural ativo: {neural_model}. "
             "O classico cobre os frames em que o neural nao ve folha."
         )
+    elif not markers_mode:
+        print(
+            "Aviso: sem detector neural de folha (modelo nao "
+            "encontrado); usando so o detector classico, que nao "
+            "enxerga a folha em varias mesas."
+        )
+
+    page_clean = None
+    if not markers_mode and not legacy_ink:
+        candidate = page_clean_module.PageCleanInk(page_clean_model)
+        try:
+            candidate.load()
+            page_clean = candidate
+            print(
+                f"Tinta pagina->limpa ativa: {candidate.model_path} "
+                f"(limiar {candidate.threshold}). Canvas por uniao "
+                "simples das mascaras."
+            )
+        except (RuntimeError, FileNotFoundError) as error:
+            print(
+                f"Aviso: modelo pagina->limpa nao carregou ({error}). "
+                "Seguindo com a pilha antiga de tinta."
+            )
+            legacy_ink = True
 
     ink_extractor = None
     if ink_model is not None and not markers_mode:
@@ -781,6 +845,8 @@ def run(
         )
 
     def ink_source(warped_img):
+        if page_clean is not None:
+            return page_clean.ink_mask(warped_img)
         if ink_extractor is not None:
             mask = ink_extractor.ink_mask(warped_img)
             if mask is not None:
@@ -863,6 +929,10 @@ def run(
     corner_history = deque(maxlen=_INK_CORNER_HISTORY)
     ink_session_open = False
     accumulated_canvas = None
+    # Canvas do caminho novo: a mascara acumulada e a uniao simples
+    # das mascaras do modelo pagina->limpa, sem acumulador temporal.
+    # None enquanto nenhuma folha foi lida nesta sessao.
+    clean_mask = None
     # Buffers donos dos canvas renderizados no laco. O acumulado
     # mora em canvas_buffer de um frame de deteccao ao outro, e
     # view_canvas_buffer serve aos canvas transitorios de exibicao.
@@ -924,6 +994,7 @@ def run(
                 ink_session_open = False
                 session_corners = None
                 freeze_pending = False
+                clean_mask = None
 
             frame_number += 1
             # Presenca e o estado do rastreador: warp_sheet com
@@ -939,6 +1010,7 @@ def run(
                 if not ink_session_open:
                     # Folha nova na cena: canvas e geometria recomecam.
                     ink_accumulator.reset()
+                    clean_mask = None
                     if session_ink is not None:
                         session_ink.reset()
                         baseline_armed = False
@@ -970,32 +1042,46 @@ def run(
                     else ink_corners
                 )
                 ink_warped = paper_module.warp_sheet(frame, warp_corners)
-                visible = None
-                if hand_masker is not None:
-                    camera_mask = hand_masker.mask(frame)
-                    if camera_mask is not None:
-                        hand_warped = paper_module.warp_sheet(
-                            camera_mask, warp_corners
-                        )
-                        visible = hand_warped == 0
-                if session_ink is not None:
-                    if not session_ink.ready:
-                        if baseline_armed:
-                            session_ink.add_sample(ink_warped, visible)
-                        observed = np.zeros(
-                            ink_warped.shape[:2], dtype=np.uint8)
+                if page_clean is not None:
+                    # Caminho novo: o modelo classifica a pagina
+                    # inteira e a mascara entra no canvas por uniao.
+                    # Sem referencia, sem pagina base, sem voto
+                    # temporal: o que o modelo viu como tinta fica.
+                    mask = page_clean.ink_mask(ink_warped)
+                    if clean_mask is None:
+                        clean_mask = mask
                     else:
-                        observed = session_ink.observe(
-                            ink_warped, visible)
+                        np.maximum(clean_mask, mask, out=clean_mask)
+                    accumulated_canvas = ink_module.render_canvas(
+                        clean_mask, out=canvas_buffer
+                    )
                 else:
-                    observed = ink_source(ink_warped)
-                accumulated_canvas = ink_module.render_canvas(
-                    ink_accumulator.update(
-                        observed, visible,
-                        t_capture_ms=frame_capture_ms
-                    ),
-                    out=canvas_buffer,
-                )
+                    visible = None
+                    if hand_masker is not None:
+                        camera_mask = hand_masker.mask(frame)
+                        if camera_mask is not None:
+                            hand_warped = paper_module.warp_sheet(
+                                camera_mask, warp_corners
+                            )
+                            visible = hand_warped == 0
+                    if session_ink is not None:
+                        if not session_ink.ready:
+                            if baseline_armed:
+                                session_ink.add_sample(ink_warped, visible)
+                            observed = np.zeros(
+                                ink_warped.shape[:2], dtype=np.uint8)
+                        else:
+                            observed = session_ink.observe(
+                                ink_warped, visible)
+                    else:
+                        observed = ink_source(ink_warped)
+                    accumulated_canvas = ink_module.render_canvas(
+                        ink_accumulator.update(
+                            observed, visible,
+                            t_capture_ms=frame_capture_ms
+                        ),
+                        out=canvas_buffer,
+                    )
 
         status = frame.copy()
         if markers_mode:
@@ -1121,8 +1207,26 @@ def main():
         default=None,
         metavar="MODELO.onnx",
         help="detector neural (ONNX) como primario, com o classico de "
-        "reserva. Sem caminho, usa a variavel de ambiente "
+        "reserva. Sem a flag, o padrao e models/draw_seg_v3_dyn.onnx "
+        "se o arquivo existir, senao a variavel de ambiente "
         "DRAW_NEURAL_MODEL",
+    )
+    parser.add_argument(
+        "--page-clean",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="MODELO.onnx",
+        help="modelo pagina->limpa (ONNX) como fonte da tinta no "
+        "caminho padrao. Sem caminho, usa a variavel de ambiente "
+        "DRAW_PAGE_CLEAN_MODEL ou models/page_clean_unet.onnx",
+    )
+    parser.add_argument(
+        "--legacy-ink",
+        action="store_true",
+        help="pilha antiga de tinta (heuristica, --ink-model, "
+        "--session-baseline, --hand-model) no lugar do modelo "
+        "pagina->limpa",
     )
     parser.add_argument(
         "--ink-model",
@@ -1178,6 +1282,28 @@ def main():
                 "--neural sem caminho: passe o arquivo .onnx ou defina "
                 "a variavel DRAW_NEURAL_MODEL"
             )
+    elif not args.markers:
+        # Padrao do reinicio: a folha e neural sempre que o modelo
+        # v3 estiver no lugar de sempre. Sem o arquivo, neural_model
+        # fica None e run() avisa que caiu no classico puro.
+        default_sheet = (
+            Path(__file__).resolve().parent.parent
+            / "models"
+            / "draw_seg_v3_dyn.onnx"
+        )
+        if default_sheet.exists():
+            neural_model = str(default_sheet)
+        else:
+            neural_model = os.environ.get("DRAW_NEURAL_MODEL")
+    page_clean_model = None
+    if args.page_clean is not None:
+        if args.markers:
+            parser.error("--page-clean nao combina com --markers")
+        page_clean_model = (
+            args.page_clean
+            or os.environ.get("DRAW_PAGE_CLEAN_MODEL")
+            or str(page_clean_module.DEFAULT_MODEL_PATH)
+        )
     ink_model = None
     if args.ink_model is not None:
         if args.markers:
@@ -1206,6 +1332,8 @@ def main():
             hand_model=hand_model,
             ink_model=ink_model,
             session_baseline=args.session_baseline,
+            page_clean_model=page_clean_model,
+            legacy_ink=args.legacy_ink,
         )
     except (RuntimeError, FileNotFoundError) as error:
         print(f"Erro: {error}")
