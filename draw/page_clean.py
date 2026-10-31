@@ -17,13 +17,20 @@ rodar a página em meia resolução e ampliar a máscara — foi medida e
 reprovada nesta VM: IoU 0,85 → 0,22, porque o modelo aprendeu traço
 fino na resolução cheia e a redução apaga o traço antes da rede. O
 mosaico custa ~1,36 s por página de 864×1200 nesta VM (mediana de 20
-páginas, 4 threads); no app ele roda nos quadros de detecção, não em
-todos os quadros, e o canvas é união, então página já lida não
+páginas, 4 threads) e 168 ms no Ryzen do Lucas com 8 threads; no app
+ele roda numa thread trabalhadora própria (draw.app._PageCleanWorker),
+fora do laço principal, e o canvas é união, então página já lida não
 precisa ser relida.
 
-A sessão é preguiçosa e segue a convenção de draw.neural: threads
-intra-op por DRAW_ORT_THREADS, onnxruntime importado no primeiro
-uso, erro explícito sem a dependência ou sem o arquivo.
+A sessão é preguiçosa: onnxruntime importado no primeiro uso,
+erro explícito sem a dependência ou sem o arquivo. As threads
+intra-op têm env própria (DRAW_PAGE_CLEAN_THREADS), separada da
+do detector de folha: a passada completa mediu 205 ms com 4
+threads e 168 ms com 8 no Ryzen do Lucas (perfil em
+draw-lab/page-clean-v0/PERF_BASELINE_RYZEN.md), então o padrão
+desta sessão é 8 e o detector segue no 4 provado dele.
+DRAW_ORT_THREADS continua valendo como reserva, para as
+ferramentas de perfil varrerem as duas sessões juntas.
 """
 
 import os
@@ -33,15 +40,36 @@ import numpy as np
 
 _PATCH = 256
 _ENV_MODEL_VAR = "DRAW_PAGE_CLEAN_MODEL"
+_ENV_THREADS_VAR = "DRAW_PAGE_CLEAN_THREADS"
+_ENV_THREADS_FALLBACK_VAR = "DRAW_ORT_THREADS"
 DEFAULT_MODEL_PATH = (
     Path(__file__).resolve().parent.parent
     / "models"
     / "page_clean_unet.onnx"
 )
 DEFAULT_THRESHOLD = 0.7
+# Medido no Ryzen (passada completa 205 -> 168 ms); ver docstring.
+DEFAULT_THREADS = 8
 
 
-def _load_session(model_path):
+def _page_clean_threads(explicit=None):
+    """Threads intra-op desta sessão: argumento > env própria >
+    DRAW_ORT_THREADS > DEFAULT_THREADS. Inválido volta ao padrão."""
+    if explicit:
+        return int(explicit)
+    for var in (_ENV_THREADS_VAR, _ENV_THREADS_FALLBACK_VAR):
+        raw = os.environ.get(var)
+        if raw:
+            try:
+                value = int(raw)
+            except ValueError:
+                value = 0
+            if value > 0:
+                return value
+    return DEFAULT_THREADS
+
+
+def _load_session(model_path, threads=None):
     try:
         import onnxruntime as ort
     except ImportError as error:
@@ -55,12 +83,8 @@ def _load_session(model_path):
             f"modelo ONNX nao encontrado: {path}. Passe o caminho do "
             f"arquivo .onnx ou defina a variavel {_ENV_MODEL_VAR}."
         )
-    # Mesma convencao de threads do detector de folha (draw.neural):
-    # 4 intra-op por padrao, DRAW_ORT_THREADS sobrescreve.
-    from .neural import _ort_intra_threads
-
     options = ort.SessionOptions()
-    options.intra_op_num_threads = _ort_intra_threads()
+    options.intra_op_num_threads = _page_clean_threads(threads)
     return ort.InferenceSession(
         str(path), sess_options=options, providers=["CPUExecutionProvider"]
     )
@@ -69,19 +93,21 @@ def _load_session(model_path):
 class PageCleanInk:
     """Máscara de tinta da página retificada, por mosaico de 256."""
 
-    def __init__(self, model_path=None, threshold=DEFAULT_THRESHOLD):
+    def __init__(self, model_path=None, threshold=DEFAULT_THRESHOLD,
+                 threads=None):
         self.model_path = str(
             model_path
             or os.environ.get(_ENV_MODEL_VAR)
             or DEFAULT_MODEL_PATH
         )
         self.threshold = float(threshold)
+        self.threads = _page_clean_threads(threads)
         self._session = None
         self._input_name = None
 
     def load(self):
         """Carrega a sessão ONNX. Retorna True; erro sobe explícito."""
-        self._session = _load_session(self.model_path)
+        self._session = _load_session(self.model_path, self.threads)
         self._input_name = self._session.get_inputs()[0].name
         return True
 
