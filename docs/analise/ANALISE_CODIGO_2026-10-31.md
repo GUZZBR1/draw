@@ -407,7 +407,10 @@ cadência de 250 ms e união de máscaras.
 
 - `pytest tests/` → `INTERNALERROR` na coleta (dois arquivos com `sys.exit(2)`).
 - `pytest tools/runner/tests` → erro de import (`/opt/muse/...`).
-- Nenhum CI, nenhum `pyproject.toml`, nenhum requisito de desenvolvimento.
+- Nenhum CI que rode no `main`: o único workflow que o GitHub lista
+  (`.github/workflows/ci.yml`) não existe na árvore do repositório — foi
+  disparado de um ramo que nunca foi mesclado. Também não havia
+  `pyproject.toml` nem requisito de desenvolvimento.
 - `ruff` com o conjunto padrão (`E4,E7,E9,F`): **6 erros** (imports e variáveis
   mortas).
 - Testes de contrato do ONNX inexistentes; o adaptador só era exercitado com o
@@ -427,6 +430,9 @@ O que entrou:
 
 - `pyproject.toml` com `testpaths` (`tests` + `tools/runner/tests`) e a
   seleção do `ruff`;
+- `.github/workflows/tests.yml`, com o YAML validado com `yaml.safe_load`
+  antes do commit (o nome de um passo com `:` sem aspas derrubou o primeiro
+  disparo, com zero jobs);
 - `requirements-dev.txt` (pytest, ruff, onnx para gerar as fixtures);
 - `.github/workflows/tests.yml` (matriz 3.11/3.12, `libgl1`, lint, suíte,
   selftest);
