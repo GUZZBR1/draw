@@ -28,10 +28,14 @@ Métricas obrigatórias (nunca só accuracy global):
   acerta todo o fundo e erra toda a tinta pode ter accuracy alta e
   ser inútil, por isso ela nunca é o critério de aceite.
 
-Pixels 255 no ground truth significam desconhecido e são excluídos das
-métricas. Uma classe sem suporte conhecido recebe ``None`` (JSON
-``null``), em vez de uma pontuação artificial; médias usam apenas
-classes avaliáveis.
+Pixels ground-truth com valor ``255`` são desconhecidos e excluídos de
+todas as contagens, inclusive accuracy e tolerância de tinta. Predições
+com ``255`` são inválidas. Uma classe sem suporte nos pixels válidos
+recebe ``None`` (NA), não uma pontuação perfeita. ``mean_iou`` e
+``mean_dice`` usam classes com união não vazia; assim, uma classe só
+prevista incorretamente continua penalizada, enquanto uma classe ausente
+dos dois lados não melhora a média. ``mean_iou_present`` é a média das
+classes presentes no ground truth, incluindo falsos negativos.
 
 Métrica específica de ink com tolerância espacial
 --------------------------------------------------
@@ -117,7 +121,10 @@ SCENARIO_IDS = tuple(s["id"] for s in SCENARIOS)
 
 
 def _validate_masks(pred, gt):
-    """Valida forma e valores de duas máscaras de classes."""
+    """Valida máscaras e devolve também a região supervisionada.
+
+    ``255`` é aceito apenas no ground truth e representa pixel ignorado.
+    """
     pred = np.asarray(pred)
     gt = np.asarray(gt)
     if pred.shape != gt.shape:
@@ -127,104 +134,142 @@ def _validate_masks(pred, gt):
         )
     if pred.ndim != 2 or gt.ndim != 2:
         raise ValueError("máscaras devem ser 2D (H, W) com valores de classe")
-    for name, mask in (("pred", pred), ("gt", gt)):
-        allowed = np.isin(mask, range(NUM_CLASSES)) if name == "pred" else np.isin(mask, (*range(NUM_CLASSES), IGNORE_INDEX))
-        if not allowed.all():
-            raise ValueError(
-                f"{name} contém classe inválida; classes válidas: {list(CLASSES)}"
-                + (f" e {IGNORE_INDEX} (ignorado)" if name == "gt" else "")
-            )
-    return pred, gt
+    if pred.size == 0:
+        raise ValueError("máscaras não podem ser vazias")
+    if pred.min() < 0 or pred.max() >= NUM_CLASSES:
+        raise ValueError(
+            f"pred contém classe fora de 0..{NUM_CLASSES - 1}; "
+            f"classes válidas: {list(CLASSES)}"
+        )
+    invalid_gt = (gt < 0) | ((gt >= NUM_CLASSES) & (gt != 255))
+    if np.any(invalid_gt):
+        invalid = np.unique(gt[invalid_gt]).tolist()
+        raise ValueError(
+            f"gt contém valores inválidos {invalid}; classes válidas: "
+            f"0..{NUM_CLASSES - 1} e 255 (ignorado)"
+        )
+    return pred, gt, gt != 255
 
 
-def _tp_fp_fn(pred, gt):
-    """Conta TP/FP/FN por classe. Retorna arrays de tamanho NUM_CLASSES."""
-    valid = gt != IGNORE_INDEX
+def _tp_fp_fn(pred, gt, valid):
+    """Conta TP/FP/FN por classe, ignorando pixels fora de ``valid``."""
     tp = np.zeros(NUM_CLASSES, dtype=np.int64)
     fp = np.zeros(NUM_CLASSES, dtype=np.int64)
     fn = np.zeros(NUM_CLASSES, dtype=np.int64)
     for cls in range(NUM_CLASSES):
         p = (pred == cls) & valid
-        g = (gt == cls) & valid
+        g = gt == cls
         tp[cls] = int(np.count_nonzero(p & g))
-        fp[cls] = int(np.count_nonzero(p & ~g))
+        fp[cls] = int(np.count_nonzero(p & ~g & valid))
         fn[cls] = int(np.count_nonzero(~p & g))
     return tp, fp, fn
 
 
 def _safe_div(num, den):
-    """Divisão com convenção de classe ausente: 0/0 vale 1.0."""
-    return 1.0 if den == 0 else float(num) / float(den)
+    """Divisão; denominador zero significa métrica indefinida (NA)."""
+    return None if den == 0 else float(num) / float(den)
+
+
+def _per_class_counts(pred, gt, valid):
+    tp, fp, fn = _tp_fp_fn(pred, gt, valid)
+    return {
+        CLASSES[cls]: {
+            "tp": int(tp[cls]),
+            "fp": int(fp[cls]),
+            "fn": int(fn[cls]),
+            "gt_pixels": int(tp[cls] + fn[cls]),
+            "pred_pixels": int(tp[cls] + fp[cls]),
+            "union_pixels": int(tp[cls] + fp[cls] + fn[cls]),
+        }
+        for cls in range(NUM_CLASSES)
+    }
 
 
 def iou_per_class(pred, gt):
-    """IoU por classe. Retorna dict {nome_da_classe: valor}."""
-    pred, gt = _validate_masks(pred, gt)
-    tp, fp, fn = _tp_fp_fn(pred, gt)
-    return {CLASSES[cls]: (float(tp[cls]) / (tp[cls] + fp[cls] + fn[cls])
-            if (tp[cls] + fp[cls] + fn[cls]) else None)
-            for cls in range(NUM_CLASSES)}
+    """IoU por classe; ``None`` indica que a classe não tem suporte válido."""
+    pred, gt, valid = _validate_masks(pred, gt)
+    tp, fp, fn = _tp_fp_fn(pred, gt, valid)
+    return {
+        CLASSES[cls]: _safe_div(tp[cls], tp[cls] + fp[cls] + fn[cls])
+        for cls in range(NUM_CLASSES)
+    }
 
 
 def dice_per_class(pred, gt):
-    """Dice (F1) por classe. Retorna dict {nome_da_classe: valor}."""
-    pred, gt = _validate_masks(pred, gt)
-    tp, fp, fn = _tp_fp_fn(pred, gt)
-    return {CLASSES[cls]: (float(2 * tp[cls]) / (2 * tp[cls] + fp[cls] + fn[cls])
-            if (2 * tp[cls] + fp[cls] + fn[cls]) else None)
-            for cls in range(NUM_CLASSES)}
+    """Dice (F1) por classe; ``None`` indica classe sem suporte válido."""
+    pred, gt, valid = _validate_masks(pred, gt)
+    tp, fp, fn = _tp_fp_fn(pred, gt, valid)
+    return {
+        CLASSES[cls]: _safe_div(2 * tp[cls], 2 * tp[cls] + fp[cls] + fn[cls])
+        for cls in range(NUM_CLASSES)
+    }
 
 
 def precision_recall_per_class(pred, gt):
-    """Precision e Recall por classe.
-
-    Retorna {"precision": {classe: valor}, "recall": {classe: valor}}.
-    """
-    pred, gt = _validate_masks(pred, gt)
-    tp, fp, fn = _tp_fp_fn(pred, gt)
+    """Precision/recall por classe; métricas sem suporte retornam ``None``."""
+    pred, gt, valid = _validate_masks(pred, gt)
+    tp, fp, fn = _tp_fp_fn(pred, gt, valid)
     precision, recall = {}, {}
     for cls in range(NUM_CLASSES):
-        p_den, g_den = tp[cls] + fp[cls], tp[cls] + fn[cls]
-        # 0/0 só vale 1.0 quando a classe está ausente dos dois lados;
-        # predição vazia com ground truth presente vale 0.0 (ver módulo).
-        precision[CLASSES[cls]] = float(tp[cls]) / p_den if p_den else (0.0 if g_den else None)
-        recall[CLASSES[cls]] = float(tp[cls]) / g_den if g_den else None
+        predicted = int(tp[cls] + fp[cls])
+        actual = int(tp[cls] + fn[cls])
+        # Uma classe presente no GT mas nunca prevista tem precision 0,
+        # seguindo a convenção histórica do projeto; se ambos os lados
+        # não têm suporte, a métrica é NA.
+        precision[CLASSES[cls]] = (
+            float(tp[cls]) / predicted if predicted else (0.0 if actual else None)
+        )
+        recall[CLASSES[cls]] = float(tp[cls]) / actual if actual else None
     return {"precision": precision, "recall": recall}
 
 
 def evaluate(pred, gt):
-    """Avaliação completa de uma predição contra o ground truth.
+    """Avaliação completa; pixels ``255`` no GT são excluídos.
 
-    Retorna dict com ``iou``, ``dice``, ``precision``, ``recall``
-    (todos por classe), ``mean_iou``, ``mean_iou_present`` (média só
-    sobre classes presentes no ground truth), ``mean_dice`` e
-    ``accuracy`` (contexto apenas, nunca critério único).
+    Retorna métricas por classe, contagens TP/FP/FN, suporte, matriz de
+    confusão e agregados. As médias usam classes com união não vazia;
+    classes sem suporte têm métricas ``None``.
     """
-    pred, gt = _validate_masks(pred, gt)
+    pred, gt, valid = _validate_masks(pred, gt)
+    counts = _per_class_counts(pred, gt, valid)
     iou = iou_per_class(pred, gt)
     dice = dice_per_class(pred, gt)
     pr = precision_recall_per_class(pred, gt)
-    present = [CLASSES[cls] for cls in range(NUM_CLASSES) if np.any(gt == cls)]
-    supported_ious = [value for value in iou.values() if value is not None]
-    supported_dice = [value for value in dice.values() if value is not None]
-    present_ious = [iou[c] for c in present if iou[c] is not None]
-    valid = gt != IGNORE_INDEX
-    valid_px = int(valid.sum())
-    class_support = {CLASSES[cls]: int(np.count_nonzero(gt == cls)) for cls in range(NUM_CLASSES)}
+    supported = [name for name in CLASSES if counts[name]["union_pixels"] > 0]
+    present = [name for name in CLASSES if counts[name]["gt_pixels"] > 0]
+    mean_iou = float(np.mean([iou[c] for c in supported])) if supported else None
+    mean_dice = float(np.mean([dice[c] for c in supported])) if supported else None
+    mean_iou_present = (
+        float(np.mean([iou[c] for c in present])) if present else None
+    )
+    valid_pixels = int(np.count_nonzero(valid))
+    accuracy = (
+        float(np.count_nonzero((pred == gt) & valid) / valid_pixels)
+        if valid_pixels else None
+    )
+    confusion = np.zeros((NUM_CLASSES, NUM_CLASSES), dtype=np.int64)
+    if valid_pixels:
+        np.add.at(confusion, (gt[valid], pred[valid]), 1)
     return {
         "iou": iou,
         "dice": dice,
         "precision": pr["precision"],
         "recall": pr["recall"],
-        "mean_iou": float(np.mean(supported_ious)) if supported_ious else None,
-        "mean_iou_present": (
-            float(np.mean(present_ious)) if present_ious else None
-        ),
-        "mean_dice": float(np.mean(supported_dice)) if supported_dice else None,
-        "accuracy": float(np.mean(pred[valid] == gt[valid])) if valid_px else None,
-        "valid_px": valid_px,
-        "ignored_px": int((~valid).sum()),
-        "class_support_px": class_support,
+        "counts": counts,
+        "confusion_matrix": confusion.tolist(),
+        "valid_pixels": valid_pixels,
+        "ignored_pixels": int(gt.size - valid_pixels),
+        # Preserve keys consumed by the existing training-zone smoke checks.
+        "valid_px": valid_pixels,
+        "ignored_px": int(gt.size - valid_pixels),
+        "class_support_px": {
+            name: counts[name]["gt_pixels"] for name in CLASSES
+        },
+        "supported_classes": supported,
+        "mean_iou": mean_iou,
+        "mean_iou_present": mean_iou_present,
+        "mean_dice": mean_dice,
+        "accuracy": accuracy,
     }
 
 
@@ -244,45 +289,58 @@ def _dilate_disk(mask, radius):
             if dx * dx + dy * dy > radius * radius:
                 continue
             shifted = np.zeros_like(mask)
-            y_src = slice(max(0, -dy), mask.shape[0] - max(0, dy))
-            y_dst = slice(max(0, dy), mask.shape[0] - max(0, -dy))
-            x_src = slice(max(0, -dx), mask.shape[1] - max(0, dx))
-            x_dst = slice(max(0, dx), mask.shape[1] - max(0, -dx))
+            y0, y1 = max(0, -dy), min(mask.shape[0], mask.shape[0] - dy)
+            x0, x1 = max(0, -dx), min(mask.shape[1], mask.shape[1] - dx)
+            if y0 >= y1 or x0 >= x1:
+                continue
+            y_src, y_dst = slice(y0, y1), slice(y0 + dy, y1 + dy)
+            x_src, x_dst = slice(x0, x1), slice(x0 + dx, x1 + dx)
             shifted[y_dst, x_dst] = mask[y_src, x_src]
             dilated |= shifted
     return dilated
 
 
 def ink_tolerance_metrics(pred, gt, tolerance_px=3):
-    """Precision/Recall de ink com tolerância espacial.
+    """Precision/Recall de tinta com tolerância, ignorando GT=255.
 
-    ``tolerance_px`` em pixels (padrão 3, dentro da faixa 2-3 px do
-    projeto). Um pixel de ink previsto conta como acerto se estiver
-    a no máximo ``tolerance_px`` de um pixel de ink real, e vice-versa
-    para o recall. Ver a metodologia no docstring do módulo.
-
-    Retorna dict com ``tolerance_px``, ``precision``, ``recall`` e
-    ``f1``, mais as contagens ``pred_ink``, ``gt_ink`` e
-    ``matched`` (pixels previstos dentro da tolerância).
+    Métricas sem denominador ou sem qualquer pixel válido retornam
+    ``None``; quando só um lado tem tinta, F1 vale 0.
     """
-    pred, gt = _validate_masks(pred, gt)
-    valid = gt != IGNORE_INDEX
+    pred, gt, valid = _validate_masks(pred, gt)
     pred_ink = (pred == INK) & valid
-    gt_ink = (gt == INK) & valid
+    gt_ink = gt == INK
     n_pred = int(np.count_nonzero(pred_ink))
     n_gt = int(np.count_nonzero(gt_ink))
-    if n_gt == 0:
-        precision = 0.0 if n_pred > 0 else None
-        return {"tolerance_px": tolerance_px, "recall": None,
-                "f1": 0.0 if n_pred > 0 else None,
-                "precision": precision, "pred_ink": n_pred, "gt_ink": 0, "matched": 0}
+    if not np.any(valid):
+        return {
+            "tolerance_px": tolerance_px,
+            "precision": None,
+            "recall": None,
+            "f1": None,
+            "pred_ink": 0,
+            "gt_ink": 0,
+            "matched": 0,
+        }
+    if n_pred == 0 and n_gt == 0:
+        return {
+            "tolerance_px": tolerance_px,
+            "precision": None,
+            "recall": None,
+            "f1": None,
+            "pred_ink": 0,
+            "gt_ink": 0,
+            "matched": 0,
+        }
     matched_pred = int(np.count_nonzero(pred_ink & _dilate_disk(gt_ink, tolerance_px)))
     matched_gt = int(np.count_nonzero(gt_ink & _dilate_disk(pred_ink, tolerance_px)))
-    # Sem tinta anotada não há suporte para esta métrica. Com tinta
-    # anotada e predição vazia, precision/recall valem zero.
-    precision = float(matched_pred) / n_pred if n_pred else 0.0
-    recall = float(matched_gt) / n_gt
-    f1 = 0.0 if (precision + recall) == 0 else 2 * precision * recall / (precision + recall)
+    precision = matched_pred / n_pred if n_pred else (0.0 if n_gt else None)
+    recall = matched_gt / n_gt if n_gt else None
+    if n_pred == 0 or n_gt == 0:
+        f1 = 0.0
+    elif precision + recall == 0:
+        f1 = 0.0
+    else:
+        f1 = 2 * precision * recall / (precision + recall)
     return {
         "tolerance_px": tolerance_px,
         "precision": precision,
@@ -327,8 +385,8 @@ def evaluate_scenarios(predictions, ground_truths):
             tol = ink_tolerance_metrics(predictions[sid], ground_truths[sid])
             entry["metrics"] = metrics
             entry["ink_tolerance"] = tol
-            if metrics["mean_iou_present"] is not None:
-                ious.append(metrics["mean_iou_present"])
+            if metrics["mean_iou"] is not None:
+                ious.append(metrics["mean_iou"])
             if tol["f1"] is not None:
                 ink_f1s.append(tol["f1"])
         else:
@@ -341,6 +399,7 @@ def evaluate_scenarios(predictions, ground_truths):
             "mean_iou": float(np.mean(ious)) if ious else None,
             "mean_ink_tolerance_f1": float(np.mean(ink_f1s)) if ink_f1s else None,
             "n_evaluated": len(ious),
+            "n_ink_evaluated": len(ink_f1s),
         },
     }
 

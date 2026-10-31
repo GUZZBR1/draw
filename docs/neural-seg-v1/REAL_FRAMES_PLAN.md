@@ -4,6 +4,21 @@
 > Escopo: só decidir COMO esta sessão entra (ou não entra) no treino
 > do modelo de segmentação 4 classes. Sem inventar rótulos.
 
+## Decisão atualizada — 2026-10-30
+
+Por solicitação do usuário, os **719 frames produtivos** selecionados das duas
+sessões reais serão preparados como `real_train`, mantendo cada sessão inteira
+no treino. A recomendação histórica abaixo de preservar holdout continua sendo
+uma orientação metodológica, mas foi substituída para esta tranche pelo pedido
+explícito de treinar com os dados reais. A validação/teste permanece sintética;
+não há holdout real independente nestas duas sessões. Reserve uma nova sessão
+para a próxima avaliação real.
+
+As tags de imagem já revisadas não são máscaras pixel a pixel. Só inclua um
+frame no pacote de treino depois de parear sua máscara aprovada, conferir
+dimensões/checksum e validar valores `{0,1,2,3,255}`; `255` só pode ser usado
+como ignorado porque o treinador agora o exclui da loss e das métricas.
+
 ## 1. O que a sessão realmente é (verificado, não presumido)
 
 - **Origem:** `origin/main`, commit `38d6293` ("Update camera capture and
@@ -204,7 +219,9 @@ amostragem, e não a anotação total, é o plano.
   (66 MB). **Sessões futuras não devem ir para o git cru** — o repo
   incha a cada tomada. O caminho é dataset privado no Kaggle (como
   já se faz com o sintético) ou outro armazenamento de dataset, com
-  o repo guardando só o manifesto e os metadados. Este documento
+  o repo guardando só CSVs, manifesto e checksums. Siga o procedimento
+  em [`REAL_CAPTURE_PUBLISHING.md`](REAL_CAPTURE_PUBLISHING.md) para
+  dividir, publicar e verificar as partes. Este documento
   está na branch `feature/neural-seg-v1`; ao mesclar, reconciliar
   o caminho `captures/` com o que estiver em `main`.
 

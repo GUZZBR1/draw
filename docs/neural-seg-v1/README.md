@@ -1,5 +1,11 @@
 # Segmentação neural v1 do Draw — background / paper / hand / ink
 
+> **Contexto atual:** este documento registra o plano original do modelo
+> single-frame de quatro classes. O app tem um adaptador para esse contrato
+> em `draw/neural.py`. O modelo temporal de tinta pareada tem um caminho
+> experimental opt-in próprio e continua aguardando validação de runtime e
+> webcam. Consulte [`INDEX.md`](INDEX.md) para navegar os documentos.
+
 Modelo de segmentação semântica com 4 classes, treinado no Kaggle,
 para o pipeline do Draw:
 
@@ -53,9 +59,9 @@ dados
 
 ## O que está explicitamente FORA (e quem fará depois)
 
-Tudo abaixo é trabalho posterior, do **Codex**, não deste projeto.
-Nada disso é implementado aqui, nem nesta pasta, nem neste branch,
-além da documentação de interface:
+Os itens abaixo estavam fora do escopo original de treino e validação
+registrado neste documento. O estado atual do app e da integração está no
+README raiz e no índice desta pasta:
 
 - webcam
 - integração do modelo no aplicativo (`draw/neural.py`, `draw/app.py`)
@@ -66,10 +72,8 @@ além da documentação de interface:
 - CAD
 - simuladores
 
-A única ponte para esse trabalho futuro é
-[`INTEGRATION.md`](INTEGRATION.md), que documenta como o Codex
-deverá trocar o detector neural atual pelo modelo v1, sem que o
-Muse implemente essa troca.
+[`INTEGRATION.md`](INTEGRATION.md) documenta o contrato de saída do modelo
+single-frame; ele não descreve o modelo temporal pareado.
 
 ## Classes
 
@@ -179,7 +183,8 @@ treino, não por este documento.
 
 ## Estado
 
-Documentação de interface criada, sem código alterado, sem
-commit, sem push, sem merge. O modelo v1 em si, o gerador, o
-notebook e as métricas são entregues pelos outros agentes deste
-projeto, nesta mesma branch (`feature/neural-seg-v1`).
+Este documento começou como plano de treino e interface. O status e o código
+avançaram desde então: `draw/neural.py` aceita o contrato single-frame de
+quatro classes; o modelo pareado de tinta tem integração experimental opt-in,
+sem validação local. Use [`INDEX.md`](INDEX.md) e os relatórios para o estado atual;
+este README preserva o escopo e as decisões originais do modelo v1.

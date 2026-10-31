@@ -1,0 +1,29 @@
+{
+  "id": "guzzbr/draw-segformer-v1-4class",
+  "title": "Draw SegFormer v1 4class",
+  "code_file": "train_segformer_kaggle.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_tpu": false,
+  "enable_internet": false,
+  "machine_shape": "NvidiaTeslaT4",
+  "dataset_sources": [
+    "guzzbr/draw-training-code",
+    "guzzbr/draw-synthetic-v1-part1",
+    "guzzbr/draw-synthetic-v1-part2",
+    "guzzbr/draw-synthetic-v1-part3",
+    "guzzbr/draw-synthetic-v1-part4",
+    "guzzbr/draw-synthetic-v1-part5",
+    "guzzbr/draw-synthetic-v1-part6",
+    "guzzbr/draw-synthetic-v1-part7",
+    "guzzbr/draw-synthetic-v1-part8",
+    "guzzbr/mit-b0-cache",
+    "danieldelro/freihand",
+    "guzzbr/draw-real-seg-pilot-v1"
+  ],
+  "competition_sources": [],
+  "kernel_sources": [],
+  "model_sources": []
+}

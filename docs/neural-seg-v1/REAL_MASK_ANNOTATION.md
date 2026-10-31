@@ -1,18 +1,25 @@
 # Real-frame masks for training
 
-## Current status
+## Scope and split
 
-This branch does not contain a reviewed, dense real-frame mask package. Its
-`255` ignore-index path is implemented in the trainer and metrics, but this
-environment has no PyTorch installation, so the real PyTorch loss test is
-skipped. Run that test and a small training-data preflight in a PyTorch
-environment before using partial masks for training.
+The first real-data tranche is the 719 frames marked `keep_productive` in
+`captures/triage/classified_all_candidates.csv`. The 41 frames marked
+`exclude_clear_duplicate` are not included. Original captures remain immutable.
 
-The two capture sessions must remain intact when assigning data splits. Record
-one split role per complete session before expanding annotations. With only two
-sessions, using one for real training and the other for real evaluation is a
-limited near-domain comparison, not a broad independent validation and test
-set.
+The retained frames come from two sessions: 297 at 640×480 and 422 at
+1280×720. Per the user's request to train on these captures, both complete
+sessions belong to the real training split. Keep session membership intact;
+use the synthetic validation/test sets for model selection and reserve a new
+real session for an independent real holdout. Do not describe these two
+training sessions as a real test set.
+
+The generated package at `captures/triage/pseudo_training_candidate/` is an
+**experimental training candidate**, not an accepted ground-truth dataset.
+All 719 source/mask pairs received contact-sheet visual triage and 21 clear
+large-region errors were corrected. Fine ink boundaries were not reviewed at
+full resolution, so the masks remain pseudo-labels. The trainer can consume
+them, but any model trained with them must be treated as exploratory.
+Structural trainability does not establish semantic correctness.
 
 ## Pixel-label contract
 
@@ -24,32 +31,46 @@ Each mask is a single-channel PNG at the source image's original dimensions:
 | 1 | Visible paper, including printed text |
 | 2 | Visible hand; this overrides ink when a hand covers a stroke |
 | 3 | Clearly visible user-added ink only |
-| 255 | Deliberately unknown pixel, excluded from loss and metrics |
+| 255 | Deliberately unknown pixel, excluded by training loss and metrics |
 
-Never map unknown pixels to background or paper. A mask with no supervised
-pixels is not a usable example. Image-level tags such as `user_added_ink` only
-guide mask proposals; they do not define pixel labels. SAM, OpenCV,
-color-threshold, and interpolated masks remain drafts until a reviewer checks
-each frame against its source image.
+The trainer now ignores `255` in cross-entropy, Dice loss, pixel counts, and
+evaluation. Never map unknown pixels to background or paper. Unknown areas
+must remain limited to genuinely ambiguous boundaries, faint marks, and
+printed-versus-handwritten regions that cannot be adjudicated. A mask with no
+supervised pixels is not a usable example.
 
-## Dataset acceptance
+Image-level tags such as `user_added_ink` only guide mask proposals; they do
+not define pixel labels. SAM/OpenCV/color-threshold/interpolated masks are
+drafts until each frame's overlay is checked against its original image. The
+current package records thumbnail review separately from pixel-label approval.
 
-Keep experimental masks and generated packages under ignored
-`captures/triage/`. For every candidate pair, record the session/frame ID,
-source path and checksum, mask path and checksum, original dimensions, split,
-annotation method/version, reviewer status, and per-class/unknown pixel counts.
+## Required outputs and acceptance
 
-Do not call a mask package training-ready until all of these checks pass:
+Keep the experimental candidate under ignored
+`captures/triage/pseudo_training_candidate/`. A fully reviewed release belongs under
+ignored `captures/triage/training_ready/`. Each record must link the session/frame ID, original path
+and SHA-256, mask path and SHA-256, original width/height, split, annotation
+method/version, reviewer status, and per-class/unknown pixel counts.
 
-1. Every selected ID has exactly one decodable source image and one mask.
-2. Image and mask dimensions match; masks are single-channel and contain only
+The tranche is **reviewed training-ready** only when:
+
+1. All 719 retained IDs have exactly one decodable source image and one mask.
+2. Image and mask dimensions match; masks are one channel and contain only
    `0, 1, 2, 3, 255`.
-3. Every released mask has been reviewed at full resolution, with targeted
-   review of ink, printed text, hand-over-ink, and uncertain boundaries.
-4. No mask is entirely ignored. Report class support and unknown-pixel counts.
-5. Tests for the PyTorch loss, evaluation metrics, and dataset preflight pass in
-   the actual training environment before a GPU run.
+3. Every mask overlay has been visually reviewed; all ink-positive, printed
+   text, hand-over-ink, and uncertain-boundary cases receive targeted review.
+4. No mask is entirely ignored; class support for paper, hand, and ink is
+   reported from supervised pixels. Unknown-pixel counts are included in the
+   manifest and metrics.
+5. The trainer smoke path passes with `255`, and a dataset preflight confirms
+   that every pair is accepted before a GPU training run.
 
-Passing these data checks establishes usable training input; it does not prove
-real-world model accuracy. Report real-session results separately from
-synthetic results.
+The current pseudo-label candidate passes structural preflight and is accepted
+by `training/train.py`, including its ignore-index behavior. It passed
+thumbnail-level visual triage, but not full-resolution pixel review; use it
+only for exploratory training, not for quality claims or model release.
+
+These are pixel masks, not just image-level frame categories. Passing the
+data gate makes the frames usable as training input; it does not establish
+real-world model accuracy. Report real training and synthetic validation
+results separately.

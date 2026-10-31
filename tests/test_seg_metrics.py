@@ -17,6 +17,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tools import seg_metrics, validate_onnx  # noqa: E402
+from training import train as training  # noqa: E402
 
 
 def _mask_with_all_classes():
@@ -75,7 +76,8 @@ def test_ink_shifted_two_pixels_passes_tolerance_but_not_exact_iou():
 def test_ink_tolerance_empty_cases():
     empty = np.zeros((5, 5), dtype=np.int64)
     tol = seg_metrics.ink_tolerance_metrics(empty, empty)
-    assert tol["precision"] is None and tol["recall"] is None and tol["f1"] is None
+    assert tol["precision"] is None and tol["recall"] is None
+    assert tol["f1"] is None
     false_positive = empty.copy()
     false_positive[2, 2] = 3
     tol = seg_metrics.ink_tolerance_metrics(false_positive, empty)
@@ -84,6 +86,46 @@ def test_ink_tolerance_empty_cases():
     gt[2, 2] = 3
     tol = seg_metrics.ink_tolerance_metrics(empty, gt)
     assert tol["precision"] == 0.0 and tol["recall"] == 0.0
+
+
+def test_ignore_index_excludes_pixels_and_absent_classes_are_na():
+    gt = np.zeros((4, 4), dtype=np.uint8)
+    gt[0, 0] = 3
+    gt[2:, 2:] = 255
+    pred = gt.copy()
+    pred[2:, 2:] = 2
+
+    metrics = seg_metrics.evaluate(pred, gt)
+    assert metrics["valid_pixels"] == 12
+    assert metrics["ignored_pixels"] == 4
+    assert metrics["accuracy"] == 1.0
+    assert metrics["iou"]["ink"] == 1.0
+    assert metrics["iou"]["paper"] is None
+    assert metrics["iou"]["hand"] is None
+    assert metrics["mean_iou"] == 1.0
+
+    train_metrics = training.per_class_metrics(pred.astype(np.int64), gt.astype(np.int64))
+    assert train_metrics["ink"]["iou"] == 1.0
+    assert train_metrics["paper"]["iou"] is None
+    assert train_metrics["hand"]["iou"] is None
+
+
+def test_all_ignored_ground_truth_has_no_metric():
+    gt = np.full((3, 3), 255, dtype=np.uint8)
+    pred = np.zeros_like(gt)
+    metrics = seg_metrics.evaluate(pred, gt)
+    assert metrics["valid_pixels"] == 0
+    assert metrics["mean_iou"] is None
+    assert all(value is None for value in metrics["iou"].values())
+
+
+def test_training_metrics_do_not_reward_absent_classes():
+    gt = np.zeros((3, 3), dtype=np.int64)
+    metrics = training.per_class_metrics(gt, gt)
+    assert metrics["background"]["iou"] == 1.0
+    assert metrics["ink"]["iou"] is None
+    assert metrics["ink"]["precision"] is None
+    assert metrics["ink"]["recall"] is None
 
 
 def test_invalid_masks_raise():
@@ -165,6 +207,15 @@ def test_compare_model_outputs_shape_mismatch_raises():
     logits = _logits_from_mask(mask)
     with pytest.raises(ValueError):
         validate_onnx.compare_model_outputs(logits, logits[:, :, :5, :])
+
+
+@pytest.mark.parametrize("bad_value", [np.nan, np.inf, -np.inf])
+def test_compare_model_outputs_rejects_non_finite_logits(bad_value):
+    logits = _logits_from_mask(_mask_with_all_classes())
+    invalid = logits.copy()
+    invalid[0, 0, 0, 0] = bad_value
+    with pytest.raises(ValueError, match="NaN ou infinitos"):
+        validate_onnx.compare_model_outputs(invalid, logits)
 
 
 def _install_fake_torch_and_ort(onnx_logits):

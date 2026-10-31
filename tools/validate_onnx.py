@@ -80,22 +80,31 @@ def compare_model_outputs(torch_output, onnx_output):
         raise ValueError(
             f"shapes diferentes: PyTorch {torch_arr.shape} != ONNX {onnx_arr.shape}"
         )
+    if not np.isfinite(torch_arr).all():
+        raise ValueError("saída PyTorch contém logits NaN ou infinitos")
+    if not np.isfinite(onnx_arr).all():
+        raise ValueError("saída ONNX contém logits NaN ou infinitos")
     diff = np.abs(torch_arr - onnx_arr)
     torch_mask = np.argmax(torch_arr, axis=1)
     onnx_mask = np.argmax(onnx_arr, axis=1)
-    # IoU argmax por imagem, agregada por classe sobre o batch.
-    iou_acc = {c: [] for c in CLASSES}
-    for i in range(torch_mask.shape[0]):
-        per_class = iou_per_class(onnx_mask[i], torch_mask[i])
-        for c in CLASSES:
-            iou_acc[c].append(per_class[c])
-    argmax_iou = {c: float(np.mean(iou_acc[c])) for c in CLASSES}
+    # Agrega os pixels do lote antes de calcular IoU. Uma classe ausente
+    # em ambos os lados recebe NA e não aumenta artificialmente o mínimo.
+    # Classes previstas por apenas um modelo continuam com IoU 0.
+    onnx_batch = np.concatenate(list(onnx_mask), axis=0)
+    torch_batch = np.concatenate(list(torch_mask), axis=0)
+    argmax_iou = iou_per_class(onnx_batch, torch_batch)
+    supported_classes = [name for name, value in argmax_iou.items() if value is not None]
+    min_argmax_iou = (
+        float(min(argmax_iou[name] for name in supported_classes))
+        if supported_classes else None
+    )
     return {
         "max_abs_diff": float(np.max(diff)) if diff.size else 0.0,
         "mean_abs_diff": float(np.mean(diff)) if diff.size else 0.0,
         "argmax_agreement": float(np.mean(torch_mask == onnx_mask)),
         "argmax_iou": argmax_iou,
-        "min_argmax_iou": float(min(argmax_iou.values())),
+        "supported_argmax_classes": supported_classes,
+        "min_argmax_iou": min_argmax_iou,
     }
 
 
@@ -174,6 +183,7 @@ def validate_onnx(torch_model, onnx_path, dummy_input,
     comparison = compare_model_outputs(torch_out, onnx_out)
     degraded = bool(
         comparison["max_abs_diff"] > max_diff_tol
+        or comparison["min_argmax_iou"] is None
         or comparison["min_argmax_iou"] < min_argmax_iou
     )
     return {

@@ -1,0 +1,38 @@
+[{"stream_name":"stdout","time":4.12853443,"data":"[     3.5s] dataset em /kaggle/input/datasets/guzzbr/draw-ink-pairs-v1\n"}
+,{"stream_name":"stdout","time":10.775616688,"data":"[    10.2s] device: cuda\n"}
+,{"stream_name":"stdout","time":10.812998221,"data":"[    10.2s] pares: 14000 treino, 2000 eval\n"}
+,{"stream_name":"stdout","time":10.813020418,"data":"[    10.2s] aumento de desalinhamento: p=0.5, modulo 2.0-3.0 px, after+rotulo contra o before, so no treino\n"}
+,{"stream_name":"stdout","time":151.005183672,"data":"[   150.4s] frequencias [0.9669, 0.0234, 0.0097] pesos [0.17000000178813934, 1.1100000143051147, 1.7200000286102295]\n"}
+,{"stream_name":"stdout","time":151.358438267,"data":"[   150.7s] U-Net base 16 pareada: 0.48M parametros\n"}
+,{"stream_name":"stdout","time":1670.056312834,"data":"[  1669.4s] epoca 0: loss 0.7669 (1514s)\n"}
+,{"stream_name":"stdout","time":2512.904353035,"data":"[  2512.3s] epoca 1: loss 0.3950 (2357s)\n"}
+,{"stream_name":"stdout","time":2701.488718156,"data":"[  2700.9s] eval epoca 1: IoU2 0.8410 P 0.8830 R 0.9453 (n=213)\n"}
+,{"stream_name":"stdout","time":2701.510508686,"data":"[  2700.9s] novo melhor snapshot: IoU2 0.8410\n"}
+,{"stream_name":"stdout","time":3348.890766831,"data":"[  3348.3s] epoca 2: loss 0.3037 (3193s)\n"}
+,{"stream_name":"stdout","time":3988.872125245,"data":"[  3988.3s] epoca 3: loss 0.1874 (3833s)\n"}
+,{"stream_name":"stdout","time":4032.291239255,"data":"[  4031.7s] eval epoca 3: IoU2 0.8373 P 0.8726 R 0.9526 (n=213)\n"}
+,{"stream_name":"stdout","time":4671.766911572,"data":"[  4671.2s] epoca 4: loss 0.1661 (4516s)\n"}
+,{"stream_name":"stdout","time":5311.080319904,"data":"[  5310.5s] epoca 5: loss 0.1555 (5155s)\n"}
+,{"stream_name":"stdout","time":5354.966325011,"data":"[  5354.4s] eval epoca 5: IoU2 0.8472 P 0.8840 R 0.9521 (n=213)\n"}
+,{"stream_name":"stdout","time":5354.974401851,"data":"[  5354.4s] novo melhor snapshot: IoU2 0.8472\n"}
+,{"stream_name":"stdout","time":5994.452218714,"data":"[  5993.8s] epoca 6: loss 0.1509 (5838s)\n"}
+,{"stream_name":"stdout","time":6634.200577697,"data":"[  6633.6s] epoca 7: loss 0.1499 (6478s)\n"}
+,{"stream_name":"stdout","time":6677.980587574,"data":"[  6677.4s] eval epoca 7: IoU2 0.8507 P 0.8844 R 0.9562 (n=213)\n"}
+,{"stream_name":"stdout","time":6677.988564495,"data":"[  6677.4s] novo melhor snapshot: IoU2 0.8507\n"}
+,{"stream_name":"stderr","time":6678.042203889,"data":"/kaggle/src/script.py:328: DeprecationWarning: You are using the legacy TorchScript-based ONNX export. Starting in PyTorch 2.9, the new torch.export-based ONNX exporter has become the default. Learn more about the new export logic: https://docs.pytorch.org/docs/stable/onnx_export.html. For exporting control flow: https://pytorch.org/tutorials/beginner/onnx/export_control_flow_model_to_onnx_tutorial.html\n"}
+,{"stream_name":"stderr","time":6678.042245556,"data":"  torch.onnx.export(\n"}
+,{"stream_name":"stdout","time":6678.759053764,"data":"[  6678.1s] ONNX exportado: /kaggle/working/draw_ink_pairs_v3.onnx (1.97 MB)\n"}
+,{"stream_name":"stderr","time":6678.760399993,"data":"Traceback (most recent call last):\n"}
+,{"stream_name":"stderr","time":6678.761055477,"data":"  File \"/kaggle/src/script.py\", line 376, in \u003cmodule\u003e\n"}
+,{"stream_name":"stderr","time":6678.761075232,"data":"    main()\n"}
+,{"stream_name":"stderr","time":6678.761080984,"data":"    ~~~~^^\n"}
+,{"stream_name":"stderr","time":6678.761085397,"data":"  File \"/kaggle/src/script.py\", line 338, in main\n"}
+,{"stream_name":"stderr","time":6678.761090429,"data":"    import onnxruntime as ort\n"}
+,{"stream_name":"stderr","time":6678.761094714,"data":"ModuleNotFoundError: No module named 'onnxruntime'\n"}
+,{"stream_name":"stderr","time":6684.104403819,"data":"/usr/local/lib/python3.13/dist-packages/mistune.py:435: SyntaxWarning: invalid escape sequence '\\|'\n"}
+,{"stream_name":"stderr","time":6684.104462117,"data":"  cells[i][c] = re.sub('\\\\\\\\\\|', '|', cell)\n"}
+,{"stream_name":"stderr","time":6684.371088892,"data":"/usr/local/lib/python3.13/dist-packages/nbconvert/filters/filter_links.py:36: SyntaxWarning: invalid escape sequence '\\_'\n"}
+,{"stream_name":"stderr","time":6684.371121694,"data":"  text = re.sub(r'_', '\\_', text) # Escape underscores in display text\n"}
+,{"stream_name":"stderr","time":6685.274739256,"data":"[NbConvertApp] Converting notebook __script__.ipynb to html\n"}
+,{"stream_name":"stderr","time":6686.197613273,"data":"[NbConvertApp] Writing 355748 bytes to __results__.html\n"}
+]
