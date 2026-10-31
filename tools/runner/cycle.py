@@ -23,8 +23,6 @@ import os
 import sys
 import time
 
-sys.path.insert(0, "/opt/muse/skills/custom-connector-setup/bin")
-
 from .archive import Archive
 from .collect import collect
 from .recipe import Recipe

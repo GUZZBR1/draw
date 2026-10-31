@@ -245,6 +245,7 @@ def main(argv=None):
     parser.add_argument("--onnx", help="caminho do modelo ONNX a validar")
     args = parser.parse_args(argv)
     print(
+        f"Modelo pedido: {args.onnx or '(nenhum)'}. "
         "Uso programático: from tools.validate_onnx import validate_onnx; "
         "validate_onnx(modelo_torch, caminho_onnx, entrada). "
         "Esta CLI não carrega checkpoints sozinha, para não adivinhar "

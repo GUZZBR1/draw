@@ -1,0 +1,239 @@
+"""Estado de sessão do app: folha nova, falha da tinta e epílogo.
+
+Três comportamentos que só aparecem no laço de `run()` e que não
+tinham teste: o canvas da folha anterior vazando para a folha nova,
+a trabalhadora de tinta morrendo calada e o epílogo (liberar a
+captura, parar as threads, drenar os PNGs) rodando só no caminho
+feliz.
+
+O harness é o mesmo de tests/test_capture_thread.py: captura falsa,
+`cv2.imshow`/`waitKey` "espias" e a GUI nunca abre janela.
+"""
+
+import sys
+import tempfile
+import threading
+import time
+from pathlib import Path
+
+import cv2
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from draw import app as app_module  # noqa: E402
+from selftest import build_markerless_scene  # noqa: E402
+
+INK_RECT = (slice(300, 500), slice(300, 500))
+
+
+class _SpyGui:
+    def __init__(self):
+        self.shown = []
+
+    def imshow(self, _title, frame):
+        self.shown.append(frame.copy())
+
+    def waitKey(self, _delay):
+        return -1
+
+    def destroyAllWindows(self):
+        pass
+
+
+class _ScriptedCapture:
+    """Quadros roteirizados: folha, mesa vazia, folha de novo."""
+
+    def __init__(self, sheet, blank, plan, period_s=0.006):
+        self._sheet = sheet
+        self._blank = blank
+        self._plan = plan
+        self._index = 0
+        self._period = period_s
+        self.released = False
+
+    def read(self):
+        if self._index >= len(self._plan):
+            return False, None
+        kind = self._plan[self._index]
+        self._index += 1
+        time.sleep(self._period)
+        frame = self._sheet if kind == "sheet" else self._blank
+        return True, frame.copy()
+
+    def release(self):
+        self.released = True
+
+
+def _run_headless(plan, fake_ink_factory, period_s=0.006):
+    """Roda run() com GUI espia. Devolve (spy, capture, erro do run)."""
+    sheet, _gt, _dst = build_markerless_scene()
+    sheet = cv2.resize(sheet, (1280, 720), interpolation=cv2.INTER_AREA)
+    blank = np.full((720, 1280, 3), 40, dtype=np.uint8)
+    capture = _ScriptedCapture(sheet, blank, plan, period_s)
+    spy = _SpyGui()
+
+    real_open = app_module._open_capture
+    real_page_clean = app_module.page_clean_module.PageCleanInk
+    real_imshow, real_wait = cv2.imshow, cv2.waitKey
+    real_destroy = cv2.destroyAllWindows
+    errors = []
+
+    def target():
+        try:
+            app_module.run(source=0, save_dir=tempfile.mkdtemp())
+        except Exception as error:  # noqa: BLE001 - o teste le o erro
+            errors.append(error)
+
+    app_module._open_capture = lambda _source: capture
+    app_module.page_clean_module.PageCleanInk = fake_ink_factory
+    cv2.imshow, cv2.waitKey = spy.imshow, spy.waitKey
+    cv2.destroyAllWindows = spy.destroyAllWindows
+    try:
+        thread = threading.Thread(target=target, daemon=True)
+        thread.start()
+        thread.join(timeout=120.0)
+        finished = not thread.is_alive()
+    finally:
+        app_module._open_capture = real_open
+        app_module.page_clean_module.PageCleanInk = real_page_clean
+        cv2.imshow, cv2.waitKey = real_imshow, real_wait
+        cv2.destroyAllWindows = real_destroy
+    return spy, capture, errors, finished
+
+
+def _panels(view):
+    """(esquerda = câmera, direita = canvas) da vista composta."""
+    width = view.shape[1]
+    return view[:, : int(width * 0.69)], view[:, int(width * 0.72):]
+
+
+def _marked(panel):
+    """Pixels do contorno verde (a folha detectada) na câmera."""
+    blue, green, red = panel[:, :, 0], panel[:, :, 1], panel[:, :, 2]
+    return int(np.count_nonzero(
+        (green > 180) & (red < 120) & (blue < 120)
+    ))
+
+
+def _ink(panel):
+    """Pixels escuros no painel do canvas."""
+    return int(np.count_nonzero(np.all(panel < 60, axis=2)))
+
+
+def _fake_ink_class(generations, blob_only_first=True, fail=False):
+    """Classe falsa de tinta; conta gerações para saber qual folha é."""
+
+    class _FakeInk:
+        model_path = "fake.onnx"
+        threshold = 0.7
+
+        def __init__(self, _path=None):
+            self.calls = 0
+
+        def load(self):
+            return True
+
+        def ink_mask(self, _warped):
+            if fail:
+                raise RuntimeError("modelo explodiu de proposito")
+            self.calls += 1
+            mask = np.zeros(
+                (app_module.ink_module.config.PAPER_H,
+                 app_module.ink_module.config.PAPER_W), dtype=np.uint8,
+            )
+            show = (generations[0] <= 1) if blob_only_first else True
+            if show:
+                mask[INK_RECT] = 255
+            return mask
+
+    return _FakeInk
+
+
+def _patched_generation_counter(monkeypatch, generations):
+    original = app_module._PageCleanWorker.new_generation
+
+    def counted(self):
+        generations[0] += 1
+        return original(self)
+
+    monkeypatch.setattr(app_module._PageCleanWorker, "new_generation", counted)
+
+
+def test_new_sheet_does_not_inherit_the_previous_canvas(monkeypatch):
+    """A tinta da folha anterior não pode reaparecer na folha nova.
+
+    Regressão do `accumulated_canvas` esquecido: depois do drop e da
+    volta da folha, o painel exibia o canvas da sessão anterior até
+    a trabalhadora publicar a primeira máscara da geração nova.
+    """
+    generations = [0]
+    _patched_generation_counter(monkeypatch, generations)
+    plan = ["sheet"] * 50 + ["blank"] * 130 + ["sheet"] * 70
+    spy, capture, errors, finished = _run_headless(
+        plan, _fake_ink_class(generations)
+    )
+
+    assert finished and not errors, errors
+    assert capture.released, "o epílogo precisa liberar a captura"
+    assert spy.shown, "nenhum quadro foi exibido"
+
+    # Divisor: o contorno verde diz quando o app voltou a ver folha.
+    marked = [_marked(_panels(view)[0]) for view in spy.shown]
+    assert max(marked) > 0, "a folha nunca foi marcada"
+
+    # Primeiro quadro marcado depois do trecho sem marcação.
+    gap = [i for i, count in enumerate(marked) if count == 0]
+    assert gap, "não houve trecho sem folha"
+    last_gap = max(gap)
+    after_return = [
+        i for i, count in enumerate(marked)
+        if count > 0 and i > last_gap
+    ]
+    assert after_return, "a folha não voltou a ser detectada"
+
+    with_ink = [
+        index for index in after_return
+        if _ink(_panels(spy.shown[index])[1]) > 0
+    ]
+    assert not with_ink, (
+        f"{len(with_ink)} quadros mostraram tinta da folha anterior "
+        f"depois de a folha nova ser detectada: {with_ink[:5]}"
+    )
+
+
+def test_page_clean_failure_is_reported_instead_of_freezing(monkeypatch):
+    """Exceção na trabalhadora de tinta não pode morrer calada."""
+    generations = [0]
+    _patched_generation_counter(monkeypatch, generations)
+    plan = ["sheet"] * 40
+    spy, capture, errors, finished = _run_headless(
+        plan, _fake_ink_class(generations, fail=True)
+    )
+
+    assert finished and not errors, errors
+    assert capture.released
+    # O aviso de falha aparece na janela e o laço termina em vez de
+    # congelar no último quadro.
+    assert len(spy.shown) >= 1
+    assert len(spy.shown) < len(plan), (
+        "o laço deveria encerrar no aviso de falha, não rodar até o fim"
+    )
+
+
+def test_epilogue_runs_when_the_loop_raises(monkeypatch):
+    """Exceção no laço não pode vazar a câmera aberta."""
+    plan = ["sheet"] * 30
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("falha de propósito no meio do laço")
+
+    monkeypatch.setattr(app_module, "_compose_view", boom)
+    spy, capture, errors, finished = _run_headless(
+        plan, _fake_ink_class([0], blob_only_first=False)
+    )
+
+    assert finished
+    assert errors and isinstance(errors[0], RuntimeError)
+    assert capture.released, "o finally precisa liberar a captura"
