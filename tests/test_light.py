@@ -227,3 +227,29 @@ def test_classic_fallback_keeps_guard_winner(monkeypatch):
 
     assert result == (corners, "paper")
     assert winning_light["mode"] == "background"
+
+
+def test_classic_fallback_keeps_guard_off_winner(monkeypatch):
+    corners = np.zeros((4, 2), dtype=np.float32)
+
+    class NeuralDetector:
+        last_presence_logit = None
+
+        def detect_sheet_with_confidence(self, frame):
+            return None, None
+
+    monkeypatch.setattr(
+        app_module,
+        "detect_sheet_with_light_guard",
+        lambda frame, mode: (corners, "paper", "off"),
+    )
+    winning_light = {"mode": "background"}
+    result = app_module._detect_sheet_for_run(
+        np.zeros((10, 10, 3), dtype=np.uint8),
+        NeuralDetector(),
+        "background",
+        winning_light,
+    )
+
+    assert result == (corners, "paper")
+    assert winning_light["mode"] == "off"
