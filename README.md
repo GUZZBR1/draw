@@ -39,12 +39,12 @@ Pré-requisitos: Python 3.10+ e uma webcam (o autor roda 3.12), além das depend
 pip install -r requirements.txt
 
 # Rodar com qualquer folha sobre a mesa
-python main.py
+python3 main.py
 
 # Outras fontes de vídeo: outro índice de webcam ou um stream de rede
-python main.py --source 1
-python main.py --source /dev/video2
-python main.py --source http://192.168.0.10:8080/video
+python3 main.py --source 1
+python3 main.py --source /dev/video2
+python3 main.py --source http://192.168.0.10:8080/video
 ```
 
 ## Câmeras: listar, selecionar e diagnosticar
@@ -55,18 +55,18 @@ uma câmera IP/MJPEG, um arquivo ou um índice alternativo.
 
 ```bash
 # Lista as webcams locais que abrem, sem abrir janela (sai 1 se nenhuma abrir)
-python main.py --list-cameras
+python3 main.py --list-cameras
 
 # Escolhe a fonte sem editar código: índice, porta V4L2 ou stream
-python main.py --source 1
-python main.py --source /dev/video2
-python main.py --source rtsp://camera:554/stream
+python3 main.py --source 1
+python3 main.py --source /dev/video2
+python3 main.py --source rtsp://camera:554/stream
 
 # Tamanho e FPS só valem para webcam local; o padrão é MJPG 1280x720
-python main.py --source 1 --width 640 --height 480 --fps 30
+python3 main.py --source 1 --width 640 --height 480 --fps 30
 
 # Força um backend (Linux: v4l2; Windows: msmf, dshow; qualquer SO: any, ffmpeg)
-python main.py --source 1 --backend v4l2
+python3 main.py --source 1 --backend v4l2
 ```
 
 Comportamento quando algo dá errado:
@@ -113,17 +113,18 @@ O guia completo fica em [docs/SETUP_WINDOWS.md](docs/SETUP_WINDOWS.md). O caminh
 
 ```bash
 bash scripts/setup_camera_wsl.sh
-python main.py
+python3 main.py --check
+python3 main.py
 ```
 
-O script prepara o usbipd, anexa a câmera ao WSL e confere o resultado. Ele também corrige o grupo `video` do usuário e religa os serviços de áudio que ele mesmo parou.
+O script prepara o usbipd, anexa a câmera ao WSL e confere o resultado. Depois de reiniciar o WSL, rode o script de novo para reanexar a câmera. Ele encontra o PowerShell mesmo se o PATH do shell não incluir executáveis do Windows e preserva outros dispositivos USB/IP.
 
 Se algo falhar, rode o diagnóstico antes de mexer em outra coisa.
 
 ```bash
-python main.py --check
-python main.py --check --source 1
-python main.py --check --source http://192.168.0.10:8080/video
+python3 main.py --check
+python3 main.py --check --source 1
+python3 main.py --check --source http://192.168.0.10:8080/video
 ```
 
 O `--check` valida o OpenCV, a existência de `/dev/video*`, a permissão do processo sobre o dispositivo e a leitura de um quadro real. Cada falha sai nomeada, com a correção na linha seguinte.
@@ -133,7 +134,7 @@ O `--check` valida o OpenCV, a existência de `/dev/video*`, a permissão do pro
 Teclas dentro do app: `s` salva um PNG em `captures/` · `v` salva
 traços vetoriais em `captures/` (SVG + JSON) · `q` ou `Esc` sai.
 ```bash
-python main.py
+python3 main.py
 ```
 
 `--check` valida exatamente a fonte selecionada por `--source`, passa
@@ -151,7 +152,7 @@ abertura sem timeout.
 O repositório não publica arquivo de modelo. Um clone novo roda só com o detector clássico até alguém colocar um ONNX na pasta `models/`. Na máquina do autor, o comando do dia a dia é este.
 
 ```bash
-python main.py --neural models/draw_seg_v3_dyn.onnx
+python3 main.py --neural models/draw_seg_v3_dyn.onnx
 ```
 
 ## Uso
@@ -161,6 +162,7 @@ python main.py --neural models/draw_seg_v3_dyn.onnx
 | `--source N` ou URL | Webcam local por índice (padrão 0) ou stream MJPEG por URL |
 | `--neural [modelo.onnx]` | Detector neural como primário, com o clássico de reserva. Sem caminho, lê `DRAW_NEURAL_MODEL` |
 | `--ink-model [modelo.onnx]` | Modelo aprendido de tinta como fonte da máscara. Sem caminho, lê `DRAW_INK_MODEL`. Sem arquivo ou com erro de carga, o app avisa uma vez e segue com a heurística |
+| `--pair-ink-model [modelo.onnx]` | Modelo experimental que compara dois frames para detectar tinta nova. Sem caminho, lê `DRAW_PAIR_INK_MODEL` |
 | `--hand-model [modelo.task]` | Máscara de mão do MediaPipe para o canvas acumulativo. Sem caminho, lê `DRAW_HAND_MODEL` ou `models/hand_landmarker.task` |
 | `--markers` | Modo opcional com a folha-modelo impressa e marcadores ArUco |
 | `--check` | Valida a câmera porta por porta e sai, sem abrir janela |
@@ -172,21 +174,21 @@ A máscara de mão é opcional e pede um pacote fora da instalação padrão.
 
 ```bash
 # Modo padrão, sem marcadores, em qualquer folha ou página de caderno
-python main.py
+python3 main.py
 
 # Outra webcam local
-python main.py --source 1
+python3 main.py --source 1
 
 # Câmera via rede, por um stream MJPEG
-python main.py --source http://192.168.0.10:8080/video
+python3 main.py --source http://192.168.0.10:8080/video
 
 # Valida a fonte selecionada e sai, sem abrir janela
-python main.py --check
-python main.py --check --source http://192.168.0.10:8080/video
+python3 main.py --check
+python3 main.py --check --source http://192.168.0.10:8080/video
 
 # Modo opcional com a folha-modelo impressa
 python template/generate_template.py
-python main.py --markers
+python3 main.py --markers
 
 # Pacote opcional da máscara de mão
 pip install mediapipe
@@ -241,7 +243,7 @@ O canvas não é uma foto do frame atual. Ele acumula evidência com histerese s
 
 Com a máscara de mão ligada, a região sob a mão vira desconhecida. Ela não ganha nem perde tinta enquanto está coberta.
 
-O app também aceita um modelo aprendido de tinta por `--ink-model`. A integração está pronta e testada com um ONNX da arquitetura. O treino do modelo de tinta ainda não rodou. Sem ele, vale o caminho heurístico descrito acima.
+O app também aceita o modelo de um frame por `--ink-model` e um modelo experimental que compara frames consecutivos por `--pair-ink-model`. O segundo passou por uma verificação local de CPU, mas ainda não foi validado com webcam e tem latência alta; sem esses modelos, vale o caminho heurístico descrito acima.
 
 ## Desempenho medido
 

@@ -1,30 +1,49 @@
 # Backlog do Draw
 
-Backlog preparado em 2026-10-28, a partir da v0.1. Cada item abaixo é um
-rascunho de issue, pronto para abrir no GitHub. Nada aqui foi mergeado:
-o fluxo é branch, PR e revisão antes de mergear na main.
+Backlog revisado em 2026-10-31. Os itens abaixo são trabalho pendente ou
+registro de entrega; confira o estado do código antes de abrir uma issue.
 
 Prioridade: P0 é o próximo passo do roadmap, P1 é robustez e MVP,
 P2 é o futuro.
 
+## Concluído
+
+### Extração e exportação vetorial
+
+`draw/strokes.py` extrai traços vetoriais e exporta SVG/JSON; `draw/export.py`
+também cobre SVG em escala física e DXF. A ordem temporal original ainda não
+é reconstruída.
+
+### CI e testes automatizados
+
+O workflow está em `.github/workflows/ci.yml`; o tree atual contém `selftest.py`
+e testes `pytest`. A data do último run remoto não é registrada neste backlog.
+
 ## P0
 
-### 1. v0.2: traço vetorial (ordem, caminho e suavização)
+### 1. Integração do modelo de tinta pareada
 
-Contexto: hoje o canvas é uma máscara de pixels. Para reproduzir no
-Paint, interpretar formas e salvar um desenho editável, a tinta precisa
-virar traços: lista ordenada de pontos, com suavização.
+Contexto: existe um ONNX experimental em
+`models/experimental/ink-pairs-v3/`. Ele precisa de frames alinhados
+`before/after` e prevê tinta nova, enquanto o app atual processa uma observação
+por frame e mantém um canvas acumulativo. O app agora tem `--pair-ink-model` /
+`DRAW_PAIR_INK_MODEL` opt-in e usa a previsão como evidência complementar à
+heurística; o runtime do ONNX ainda não foi validado localmente.
 
 Critério de aceite:
 
-- `draw/strokes.py` extrai traços de uma máscara de tinta.
-- Cada traço tem pontos ordenados, comprimento e um caminho suavizado.
-- Exporta SVG e JSON, com largura e altura da folha.
-- Teste sintético: cena com círculo, linha e X produz pelo menos
-  3 traços, SVG válido e JSON que volta a carregar.
-- O pipeline v0.1 continua passando no selftest.
+- Um adaptador fornece pares de frames retificados com o pré-processamento do
+  treino.
+- A máscara de tinta nova atualiza o canvas sem apagar traços antigos quando
+  não há evento de tinta; a borracha e a mão continuam com comportamento
+  definido.
+- Teste de contrato usa o ONNX Runtime em mais de uma resolução e compara
+  resultado com o checkpoint de treino.
+- O modo é opt-in e o app informa claramente quando o modelo não foi validado.
 
-Relacionado: roadmap, v0.2.
+Estado: adaptador e modo opt-in implementados; faltam validação real do ONNX,
+teste de webcam, medição de latência e revisão explícita do comportamento de
+apagamento/oclusão.
 
 ### 2. v0.3: reprodução dos traços no Paint via controle do mouse
 
@@ -68,7 +87,7 @@ Critério de aceite:
 
 ### 5. CI e testes automatizados
 
-Contexto: hoje só existe `tests/selftest.py`, sem CI.
+Contexto: manter o workflow e a suíte alinhados com os contratos atuais.
 
 Critério de aceite:
 
@@ -77,10 +96,8 @@ Critério de aceite:
 - O workflow falha se qualquer um deles falhar.
 - README documenta como rodar os testes localmente.
 
-Estado: feito na branch chore/tudo-pendente, com workflow em
-.github/workflows/ci.yml rodando selftest, pytest completo e
-verificação geométrica. Falta confirmar o primeiro run verde no
-GitHub, que o próprio PR desta branch deve disparar.
+Estado: workflow presente em `.github/workflows/ci.yml`; confirmar o estado
+dos runs no provedor antes de considerar o CI operacional.
 
 ### 6. Calibração para iluminação real
 

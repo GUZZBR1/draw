@@ -15,3 +15,9 @@ dataset/cases/*/overlays/
 .DS_Store
 .idea/
 .vscode/
+
+# Local Kaggle outputs and model artifacts; use the manifests/READMEs
+# beside them to track provenance without committing generated binaries.
+/models/experimental/ink-pairs-v3/model.onnx
+/models/experimental/ink-pairs-v3/checkpoint.pt
+/models/experimental/ink-pairs-v3/training.log

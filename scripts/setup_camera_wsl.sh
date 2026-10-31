@@ -28,13 +28,13 @@
 # Se algo falhar sem saida, o script imprime um bloco de diagnostico
 # pronto para copiar e colar num pedido de ajuda.
 #
-# Rodar de novo e seguro. Apos reiniciar o WSL, so o attach precisa
-# ser refeito.
+# Rodar de novo verifica o estado atual. Apos reiniciar o WSL, o attach
+# da camera pode precisar ser refeito; outras conexoes USB sao preservadas.
 # DRAW_DRY_RUN=1 mostra os comandos sem executar nada.
 
 set -uo pipefail
 
-SCRIPT_VERSION="v8"
+SCRIPT_VERSION="v9"
 DRY_RUN="${DRAW_DRY_RUN:-0}"
 BUSID_ARG=""
 
@@ -161,14 +161,29 @@ else
       fi
     done
   fi
-  tools_ok || warn "usbip nao ficou no PATH. A limpeza de portas antigas sera pulada."
+  tools_ok || warn "usbip nao ficou no PATH. O setup continuara sem a ferramenta de inspecao USB local."
 fi
 
 # --- 2. Preflight do Windows ---------------------------------------------------
 
-say "usbipd-win (lado Windows)..."
+say "PowerShell e usbipd-win (lado Windows)..."
+# Alguns ambientes WSL iniciam o shell sem acrescentar os caminhos do
+# Windows ao PATH. A interoperabilidade ainda pode estar ativa e o exe
+# existir no caminho padrao; nesse caso, use-o sem classificar a interop
+# como desligada.
+if ! command -v powershell.exe >/dev/null 2>&1; then
+  for candidate in \
+    "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe" \
+    "/mnt/c/Windows/SysWOW64/WindowsPowerShell/v1.0/powershell.exe" \
+    "/mnt/c/Windows/System32/powershell.exe"; do
+    if [ -x "$candidate" ]; then
+      export PATH="$(dirname "$candidate"):$PATH"
+      break
+    fi
+  done
+fi
 command -v powershell.exe >/dev/null 2>&1 \
-  || die "powershell.exe nao acessivel pelo WSL. A interoperabilidade com o Windows parece desligada (interop). Sem ela nao ha como controlar o usbipd. Confira se o WSL esta com interop ativo e tente de novo."
+  || die "powershell.exe nao foi encontrado no PATH nem nos caminhos padrao do Windows montado em /mnt/c. Confira se a interop do WSL esta ativa e se o Windows esta montado."
 
 if command -v usbipd.exe >/dev/null 2>&1; then
   USBIPD="$(command -v usbipd.exe)"
@@ -229,7 +244,7 @@ add_candidate() { # $1 = linha completa da lista do usbipd
 while IFS= read -r line; do
   lower="$(printf '%s' "$line" | tr '[:upper:]' '[:lower:]')"
   case "$lower" in
-    *camera*|*webcam*|"web cam"*|*uvc*|*facetime*|"user facing"*|"hd cam"*)
+    *camera*|*webcam*|"web cam"*|*video*|*uvc*|*facetime*|"user facing"*|"hd cam"*)
       add_candidate "$line" ;;
   esac
 done <<EOF
@@ -339,30 +354,6 @@ try_attach() {
 
 attach_is_busy() {
   printf '%s' "$ATTACH_OUT" | grep -qi 'device busy'
-}
-
-clear_stale_state() {
-  say "Limpando registros antigos de attach dos dois lados."
-  if command -v usbip >/dev/null 2>&1; then
-    if [ "$DRY_RUN" = "1" ]; then
-      run sudo usbip port
-    else
-      local ports_out ports port
-      ports_out="$(sudo usbip port 2>/dev/null || true)"
-      echo "Portas usbip neste WSL agora:"
-      printf '%s\n' "$ports_out"
-      ports="$(printf '%s\n' "$ports_out" | sed -n 's/^Port \([0-9][0-9]*\): <Port in Use>.*/\1/p')"
-      for port in $ports; do
-        echo "Desanexando a porta usbip $port."
-        run sudo usbip detach -p "$port"
-      done
-    fi
-  else
-    echo "usbip nao esta no PATH deste WSL. A limpeza de portas foi pulada."
-  fi
-  echo "Reiniciando o servico usbipd no Windows. Clique em Sim na confirmacao de administrador."
-  run powershell.exe -NoProfile -Command \
-    "Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile','-Command','Restart-Service usbipd -Force') -Verb RunAs -Wait"
 }
 
 VETO_INSTANCE=""
@@ -545,7 +536,7 @@ EOF
 if [ "$STATE" = "Attached" ]; then
   say "A camera ja esta anexada ao WSL. Nada a fazer aqui."
 else
-  clear_stale_state
+  say "Preservando outras conexoes USB/IP; nenhuma porta sera desanexada globalmente."
   case "$STATE" in
     Shared*) : ;;  # ja compartilhada (normal ou forcada)
     *) bind_usbipd 0 ;;

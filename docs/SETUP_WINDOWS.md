@@ -30,8 +30,9 @@ Opções úteis:
 - `./scripts/setup_camera_wsl.sh --dry-run` só mostra o que o
   script faria, sem executar nada.
 
-Depois de reiniciar o WSL, rode o script de novo. Só o attach
-precisa ser refeito.
+Depois de reiniciar o WSL, rode o script de novo para conferir e,
+se necessário, refazer o attach da câmera. As outras conexões USB/IP
+do WSL são preservadas.
 
 ## O que o script faz, e por quê
 
@@ -46,7 +47,7 @@ precisa ser refeito.
    câmera só, escolhe sozinho. Com várias, pergunta pelo número.
    Sem nenhuma, para com uma mensagem clara.
 4. **Compartilha e anexa.** Faz o `bind` e o `attach` da câmera
-   para dentro do WSL e limpa registros antigos de attach.
+   para dentro do WSL sem desanexar outros dispositivos USB/IP.
 5. **Confere o resultado.** Espera o dispositivo de vídeo aparecer
    no WSL e corrige a permissão: quem roda o Draw precisa estar no
    grupo `video`.

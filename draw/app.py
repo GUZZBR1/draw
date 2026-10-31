@@ -7,6 +7,7 @@ Uso:
   python main.py --markers                        # folha-modelo impressa
   python main.py --neural modelo.onnx             # detector neural primario
   python main.py --ink-model modelo.onnx          # modelo aprendido de tinta
+  python main.py --pair-ink-model modelo.onnx     # modelo temporal before/after
   python main.py --hand-model modelo.task         # mascara de mao no canvas
   python main.py --source 1                       # outra webcam local
   python main.py --source /dev/video2             # porta V4L2 especifica
@@ -43,6 +44,7 @@ from . import hand as hand_module
 from . import ink as ink_module
 from . import light as light_module
 from . import light_guard as light_guard_module
+from . import pair_ink as pair_ink_module
 try:
     from . import ink_model as ink_model_module
 except ImportError:
@@ -576,6 +578,51 @@ def _fit(image, max_h=700):
     return cv2.resize(image, (int(w * scale), max_h))
 
 
+def resolve_neural_model(argument, env_model, markers_mode=False):
+    """Resolve the single-frame page detector path."""
+    if markers_mode:
+        if argument is not None:
+            raise ValueError("--neural nao combina com --markers")
+        return None
+    model_path = argument or env_model or None
+    if argument == "" and not model_path:
+        raise ValueError(
+            "--neural sem caminho: passe o arquivo .onnx ou defina "
+            "a variavel DRAW_NEURAL_MODEL"
+        )
+    return model_path
+
+
+def resolve_ink_model(argument, env_model, markers_mode=False):
+    """Resolve the existing single-frame ink model path."""
+    if markers_mode:
+        if argument is not None:
+            raise ValueError("--ink-model nao combina com --markers")
+        return None
+    model_path = argument or env_model or None
+    if argument == "" and not model_path:
+        raise ValueError(
+            "--ink-model sem caminho: passe o arquivo .onnx ou defina "
+            "a variavel DRAW_INK_MODEL"
+        )
+    return model_path
+
+
+def resolve_pair_ink_model(argument, env_model, markers_mode=False):
+    """Resolve the temporal before/after ink model path."""
+    if markers_mode:
+        if argument is not None:
+            raise ValueError("--pair-ink-model nao combina com --markers")
+        return None
+    model_path = argument or env_model or None
+    if argument == "" and not model_path:
+        raise ValueError(
+            "--pair-ink-model sem caminho: passe o arquivo .onnx ou "
+            "defina a variavel DRAW_PAIR_INK_MODEL"
+        )
+    return model_path
+
+
 _BLANK_SHEET = None
 
 
@@ -714,7 +761,7 @@ def run(source=0, save_dir="captures", markers_mode=False, width=None,
         height=None, fps=None, backend=None, reconnect_attempts=3,
         open_timeout_ms=3000, neural_model=None, capture_all_frames=False,
         light_normalize="off", session_mode=False, hand_model=None,
-        ink_model=None, session_baseline=False):
+        ink_model=None, pair_ink_model=None, session_baseline=False):
     neural_detector = None
     if neural_model is not None and not markers_mode:
         neural_detector = neural_module.NeuralSheetDetector(neural_model)
@@ -739,6 +786,14 @@ def run(source=0, save_dir="captures", markers_mode=False, width=None,
                     f"Modelo de tinta ativo: {ink_model}. "
                     "A heuristica segue como reserva por frame."
                 )
+
+    pair_ink_detector = None
+    if pair_ink_model is not None and not markers_mode:
+        pair_ink_detector = pair_ink_module.PairInkDetector(pair_ink_model).load()
+        print(
+            f"Modelo temporal de tinta ativo: {pair_ink_model}. "
+            "Ele complementa a heuristica e ainda e experimental."
+        )
 
     session_ink = None
     if session_baseline and not markers_mode:
@@ -897,6 +952,7 @@ def run(source=0, save_dir="captures", markers_mode=False, width=None,
     ink_accumulator = ink_module.InkAccumulator()
     corner_history = deque(maxlen=_INK_CORNER_HISTORY)
     ink_session_open = False
+    pair_previous_frame = None
     accumulated_canvas = None
     # Buffers donos dos canvas renderizados no laco. O acumulado
     # mora em canvas_buffer de um frame de deteccao ao outro, e
@@ -974,6 +1030,7 @@ def run(source=0, save_dir="captures", markers_mode=False, width=None,
                 ink_session_open = False
                 session_corners = None
                 freeze_pending = False
+                pair_previous_frame = None
 
             frame_number += 1
             # Presenca e o estado do rastreador: warp_sheet com
@@ -983,6 +1040,8 @@ def run(source=0, save_dir="captures", markers_mode=False, width=None,
             # de tinta e o fallback de exibicao, que retifica sob
             # demanda.
             sheet_present = tracker.corners is not None
+            if not sheet_present:
+                pair_previous_frame = None
             warped = None
 
             if ran_detection and tracker.corners is not None:
@@ -995,6 +1054,7 @@ def run(source=0, save_dir="captures", markers_mode=False, width=None,
                         session_corners = None
                         freeze_pending = False
                     corner_history.clear()
+                    pair_previous_frame = None
                     ink_session_open = True
                 if restart_reference:
                     # Tecla C: novo ponto zero da sessao. O canvas
@@ -1006,6 +1066,7 @@ def run(source=0, save_dir="captures", markers_mode=False, width=None,
                     session_ink.reset()
                     baseline_armed = True
                     freeze_pending = True
+                    pair_previous_frame = None
                 corner_history.append(tracker.corners.copy())
                 ink_corners = np.median(
                     np.stack(corner_history), axis=0
@@ -1039,6 +1100,26 @@ def run(source=0, save_dir="captures", markers_mode=False, width=None,
                             ink_warped, visible)
                 else:
                     observed = ink_source(ink_warped)
+                if (
+                    pair_ink_detector is not None
+                    and pair_previous_frame is not None
+                    and ink_warped is not None
+                    and (session_ink is None or session_ink.ready)
+                ):
+                    before_warped = paper_module.warp_sheet(
+                        pair_previous_frame, warp_corners
+                    )
+                    if before_warped is not None:
+                        before_gray = cv2.cvtColor(
+                            before_warped, cv2.COLOR_BGR2GRAY
+                        )
+                        after_gray = cv2.cvtColor(
+                            ink_warped, cv2.COLOR_BGR2GRAY
+                        )
+                        new_ink = pair_ink_detector.predict(
+                            after_gray, before_gray
+                        )
+                        observed = cv2.bitwise_or(observed, new_ink)
                 accumulated_canvas = ink_module.render_canvas(
                     ink_accumulator.update(
                         observed, visible,
@@ -1185,6 +1266,8 @@ def run(source=0, save_dir="captures", markers_mode=False, width=None,
             handle_capture_key(key, frame)
             if key in (ord("q"), 27):
                 break
+            if pair_ink_detector is not None:
+                pair_previous_frame = frame.copy()
             continue
 
         key = cv2.waitKey(1) & 0xFF
@@ -1233,6 +1316,15 @@ def main():
         "usa a variavel de ambiente DRAW_INK_MODEL. Sem o arquivo ou "
         "com erro de carga, o app avisa uma vez e segue com a "
         "heuristica",
+    )
+    parser.add_argument(
+        "--pair-ink-model",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="MODELO.onnx",
+        help="modelo temporal before/after de tinta nova; pode usar "
+        "DRAW_PAIR_INK_MODEL sem esta flag",
     )
     parser.add_argument(
         "--hand-model",
@@ -1402,26 +1494,20 @@ def main():
     if args.check:
         parsed = parse_source(args.source)
         sys.exit(run_check(parsed, open_timeout_ms=args.open_timeout_ms))
-    neural_model = None
-    if args.neural is not None:
-        if args.markers:
-            parser.error("--neural nao combina com --markers")
-        neural_model = args.neural or os.environ.get("DRAW_NEURAL_MODEL")
-        if not neural_model:
-            parser.error(
-                "--neural sem caminho: passe o arquivo .onnx ou defina "
-                "a variavel DRAW_NEURAL_MODEL"
-            )
-    ink_model = None
-    if args.ink_model is not None:
-        if args.markers:
-            parser.error("--ink-model nao combina com --markers")
-        ink_model = args.ink_model or os.environ.get("DRAW_INK_MODEL")
-        if not ink_model:
-            parser.error(
-                "--ink-model sem caminho: passe o arquivo .onnx ou "
-                "defina a variavel DRAW_INK_MODEL"
-            )
+    try:
+        neural_model = resolve_neural_model(
+            args.neural, os.environ.get("DRAW_NEURAL_MODEL"), args.markers
+        )
+        ink_model = resolve_ink_model(
+            args.ink_model, os.environ.get("DRAW_INK_MODEL"), args.markers
+        )
+        pair_ink_model = resolve_pair_ink_model(
+            args.pair_ink_model,
+            os.environ.get("DRAW_PAIR_INK_MODEL"),
+            args.markers,
+        )
+    except ValueError as error:
+        parser.error(str(error))
     if args.session_baseline and args.markers:
         parser.error("--session-baseline nao combina com --markers")
     hand_model = None
@@ -1452,9 +1538,10 @@ def main():
             session_mode=args.session,
             hand_model=hand_model,
             ink_model=ink_model,
+            pair_ink_model=pair_ink_model,
             session_baseline=args.session_baseline,
         )
-    except (RuntimeError, FileNotFoundError) as error:
+    except (RuntimeError, FileNotFoundError, ValueError) as error:
         print(f"Erro: {error}")
         sys.exit(2)
 
