@@ -11,27 +11,37 @@ import json
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
 
 from tools.runner.watch import WatchState, detect_collapse
 
+# Os historicos reais moram no laboratorio do autor, fora do repo.
+# Sem eles, estes dois casos saem como skip com o motivo declarado:
+# antes, o arquivo ausente virava FileNotFoundError na coleta e a
+# suite parecia quebrada num clone limpo (mesma familia do skip
+# manual de tests/test_accumulator_*.py).
 LAB = os.path.expanduser("~/workspace/draw-lab/ink-flagship")
 
 
-def _history(path):
+def _history(relative):
+    path = os.path.join(LAB, relative)
+    if not os.path.exists(path):
+        pytest.skip(f"historico de laboratorio ausente: {path}")
     with open(path) as f:
         return json.load(f)["history"]
 
 
 def test_v2_lrbug_collapses():
-    history = _history(os.path.join(LAB, "v5-output-v2-lrbug",
+    history = _history(os.path.join("v5-output-v2-lrbug",
                                     "pairs_metrics.json"))
     verdict = detect_collapse(history)
     assert verdict["collapsed"] is True
 
 
 def test_v3_healthy_run_not_collapsed():
-    history = _history(os.path.join(LAB, "v5-output-v3",
+    history = _history(os.path.join("v5-output-v3",
                                     "pairs_metrics.json"))
     verdict = detect_collapse(history)
     assert verdict["collapsed"] is False

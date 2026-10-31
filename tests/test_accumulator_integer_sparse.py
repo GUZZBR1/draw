@@ -28,14 +28,35 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from draw import ink as ink_new  # noqa: E402
 
+
+def _skip_without(path, hint):
+    """Fora do pytest, o teste de script pede o arquivo e sai com 2.
+
+    Dentro do pytest, um arquivo que o operador precisa preparar a
+    mao NÃO pode morrer no import: o sys.exit(2) daqui derrubava a
+    coleta da suite inteira (INTERNALERROR) num clone limpo. Vira
+    skip com o motivo declarado.
+    """
+    message = (
+        f"{path} nao existe; {hint} "
+        "O teste diferencial precisa da copia congelada da "
+        "implementacao anterior."
+    )
+    if __name__ != "__main__":
+        import pytest
+        pytest.skip(message, allow_module_level=True)
+    print(f"ERRO: {message}")
+    sys.exit(2)
+
 _BEFORE = (
     Path.home()
     / "workspace/draw-lab/bottleneck-2026-10-30/ink-optim/ink_before.py"
 )
 if not _BEFORE.exists():
-    print(f"ERRO: {_BEFORE} nao existe; copie draw/ink.py para la "
-          "antes de otimizar o acumulador.")
-    sys.exit(2)
+    _skip_without(
+        _BEFORE,
+        "copie draw/ink.py para la antes de otimizar o acumulador.",
+    )
 _spec = importlib.util.spec_from_file_location(
     "draw._ink_before_optim", _BEFORE
 )
