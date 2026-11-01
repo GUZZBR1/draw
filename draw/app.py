@@ -562,6 +562,29 @@ _INK_REOPEN_NEW_PX = 200
 _INK_TURN_MIN_CANVAS_PX = 2000
 _INK_TURN_MAX_OVERLAP = 0.30
 _INK_TURN_PASSES = 2
+# HOTFIX 2026-11-01 (draw-lab/page-turn-falsefire-2026-11-01): o
+# gatilho de cobertura acima foi REPROVADO no teste ao vivo. Na
+# mesa real, o ajuste da folha do caderno aberto oscila (o proprio
+# codigo registra oscilacao de ate 314 px nos cantos): o warp
+# balanca, a saida do modelo desencontra do canvas acumulado e a
+# cobertura desaba SEM pagina nenhuma virar — o evento disparava
+# a cada 2-5 s, salvando snapshot e zerando o canvas sem parar.
+# A prova offline usou warps estaticos com tremor de +-1-3 px,
+# mansos demais pra expor isso; o teste negativo era borracha,
+# nao balanco de geometria. Decisao: o disparo automatico por
+# cobertura fica DESLIGADO por padrao, atras da flag
+# DRAW_PAGE_TURN_EVENT=1, ate existir um gatilho provado contra
+# serie de balanco de geometria realista. O codigo do evento e o
+# snapshot ficam intactos (versao estrita futura); com a flag
+# desligada, nenhum colapso de cobertura zera o canvas — a troca
+# de pagina segue pelo caminho pre-existente de drop/reaparicao
+# da folha, que abre geracao nova do mesmo jeito.
+_ENV_TURN_EVENT_VAR = "DRAW_PAGE_TURN_EVENT"
+
+
+def _page_turn_event_enabled():
+    """True so com DRAW_PAGE_TURN_EVENT=1 (ver o hotfix acima)."""
+    return os.environ.get(_ENV_TURN_EVENT_VAR, "").strip() == "1"
 
 
 class _ConfirmedInkAccumulator:
@@ -620,8 +643,16 @@ class _ConfirmedInkAccumulator:
             self._settled = False
             self._quiet_streak = 0
         # Virada: cobertura da mascara nova sobre o canvas velho.
+        # Portao do hotfix 2026-11-01: sem DRAW_PAGE_TURN_EVENT=1
+        # o bloco nem roda — turn fica False sempre, a trabalhadora
+        # nunca gera evento e o laco nunca zera o canvas por
+        # colapso de cobertura.
         turn = False
-        if canvas_before >= _INK_TURN_MIN_CANVAS_PX and not self._turn_fired:
+        if (
+            _page_turn_event_enabled()
+            and canvas_before >= _INK_TURN_MIN_CANVAS_PX
+            and not self._turn_fired
+        ):
             covered = int(np.count_nonzero(mask_now & (self._canvas > 0)))
             if covered <= _INK_TURN_MAX_OVERLAP * canvas_before:
                 self._low_overlap_streak += 1
