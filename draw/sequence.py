@@ -49,7 +49,7 @@ sessão explícito.
 
 import json
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 from . import export as export_module

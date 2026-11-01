@@ -11,11 +11,10 @@ import math
 import sys
 from pathlib import Path
 
-import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from draw import config, ink, paper, shapes, strokes  # noqa: E402
-from draw.shapes import Shape, classify_group, classify_strokes, group_strokes  # noqa: E402
+from draw.shapes import classify_group, classify_strokes, group_strokes  # noqa: E402
 from tests.selftest import build_scene  # noqa: E402
 
 

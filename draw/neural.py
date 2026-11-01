@@ -689,7 +689,13 @@ class NeuralSheetDetector:
 
         if "mask_logits" in by_name and "presence_logit" in by_name:
             logits = by_name["mask_logits"]
-            presence = by_name["presence_logit"]
+            raw_presence = np.asarray(by_name["presence_logit"])
+            if raw_presence.size != 1:
+                raise ValueError(
+                    "saida 'presence_logit' precisa conter um valor; "
+                    f"veio {raw_presence.shape}"
+                )
+            presence = float(raw_presence.reshape(-1)[0])
             if logits.ndim != 4:
                 raise ValueError(
                     "saída 'mask_logits' precisa ter forma [N, C, H, W]; "
@@ -720,7 +726,7 @@ class NeuralSheetDetector:
                     "(fundo, papel) ou 4 (fundo, papel, mão, tinta); "
                     f"veio {channels}"
                 )
-            self.last_presence_logit = float(presence[0])
+            self.last_presence_logit = presence
         elif "logits" in by_name:
             logits = by_name["logits"]
             if logits.ndim != 4 or logits.shape[0] != 1 or logits.shape[1] != 4:

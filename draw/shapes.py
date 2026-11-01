@@ -123,7 +123,7 @@ def _jsonable_params(params):
     for key, value in params.items():
         if isinstance(value, (list, tuple)):
             out[key] = [
-                [float(a), float(b)] if isinstance(v, (list, tuple)) else float(v)
+                [float(v[0]), float(v[1])] if isinstance(v, (list, tuple)) else float(v)
                 for v in value
             ] if value and isinstance(value[0], (list, tuple)) else [
                 float(v) for v in value
@@ -235,7 +235,6 @@ def _order_group_points(group):
     a unknown — melhor que inventar uma ordem)."""
     if not group:
         return []
-    ordered = [list(group[0].points)]
     used = {0}
     path = list(group[0].points)
     # Estende pelo fim enquanto houver traço ligável.

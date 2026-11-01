@@ -55,6 +55,7 @@ from . import hand as hand_module
 from . import ink as ink_module
 from . import light as light_module
 from . import light_guard as light_guard_module
+from . import manifest as manifest_module
 from . import pair_ink as pair_ink_module
 try:
     from . import ink_model as ink_model_module
@@ -63,7 +64,6 @@ except ImportError:
     # dele ainda nao faz parte do pacote publicado. Sem o modulo,
     # --ink-model avisa e o app segue so com a heuristica.
     ink_model_module = None
-from . import manifest as manifest_module
 from . import neural as neural_module
 from . import page_clean as page_clean_module
 from . import paper as paper_module
@@ -160,6 +160,7 @@ class _SheetTracker:
         self.verdict = None
         self.missed = False
         self._pending = None
+        self._pending_hits = 0
         self._pending_since = None
         self._frames_since_seen = 0
         self._last_seen_at = None
@@ -175,6 +176,7 @@ class _SheetTracker:
         self.corners = corners
         self.verdict = verdict
         self._pending = None
+        self._pending_hits = 0
         self._pending_since = None
         self._frames_since_seen = 0
         self._last_seen_at = now
@@ -234,8 +236,10 @@ class _SheetTracker:
                     <= _SHEET_NEAR_LIMIT_PX
                 ):
                     self._pending = _blend_corners(self._pending, detected)
+                    self._pending_hits += 1
                 else:
                     self._pending = detected.copy()
+                    self._pending_hits = 1
                     self._pending_since = now
 
                 if (
@@ -257,6 +261,7 @@ class _SheetTracker:
         elif self.corners is not None:
             if ran_detection:
                 self._pending = None
+                self._pending_hits = 0
                 self._pending_since = None
                 self.missed = True
             self._frames_since_seen += 1
@@ -270,6 +275,7 @@ class _SheetTracker:
             self.corners = None
             self.verdict = None
             self._pending = None
+            self._pending_hits = 0
             self._pending_since = None
             self._frames_since_seen = 0
             self.missed = False
@@ -316,23 +322,14 @@ class _LatestFrameCapture:
         self._last_read_error = None
         self._dead = False
         self._stopped = False
-        self._error = None
 
     def start(self):
         self._thread.start()
         return self
 
     def _pump(self):
-        # Um driver que levanta (cv2 levanta em varios modos de falha)
-        # matava a thread com traceback na saida de erro e um
-        # PytestUnhandledThreadExceptionWarning na suite. O desfecho
-        # visivel tem de ser o mesmo das falhas de read(): fonte
-        # morta, aviso na janela e saida limpa.
         try:
             self._pump_loop()
-        except Exception as error:  # noqa: BLE001 - vai para o aviso
-            with self._condition:
-                self._error = error
         finally:
             with self._condition:
                 if not self._stopped:
@@ -473,21 +470,7 @@ class _PngWriter:
             if item is None:
                 return
             path, image, on_done = item
-            # imwrite devolve False (e pode levantar) em disco cheio,
-            # caminho inválido ou codec ausente. Sem este guarda, a
-            # thread da escritora morria e todo save seguinte ficava
-            # na fila para sempre, com o close() esperando o teto de
-            # _PNG_DRAIN_SECONDS.
-            try:
-                written = cv2.imwrite(str(path), image)
-            except Exception as error:  # noqa: BLE001 - vira aviso
-                written = False
-                error_text = str(error)
-            else:
-                error_text = "imwrite devolveu False"
-            if not written:
-                print(f"Aviso: nao consegui salvar {path} ({error_text}).")
-                continue
+            cv2.imwrite(str(path), image)
             if on_done is not None:
                 on_done(path)
 
@@ -542,7 +525,6 @@ class _PageCleanWorker:
         self._published = None
         self._version = 0
         self._stopped = False
-        self._error = None
         # Estado privado da trabalhadora (so ela toca):
         self._worker_generation = -1
         self._union = None
@@ -608,18 +590,7 @@ class _PageCleanWorker:
                 warped, generation = self._pending
                 self._pending = None
                 self._last_pass_start = time.monotonic()
-            # Uma excecao do modelo (shape errado, sessao morta, ONNX
-            # sem memoria) matava esta thread em silencio: o canvas
-            # congelava no ultimo quadro e nada era impresso. O erro
-            # fica guardado, e o laco principal o reporta.
-            try:
-                mask = self._page_clean.ink_mask(warped)
-            except Exception as error:  # noqa: BLE001 - vai para o laco
-                with self._condition:
-                    self._error = error
-                    self._stopped = True
-                    self._condition.notify_all()
-                return
+            mask = self._page_clean.ink_mask(warped)
             with self._condition:
                 if self._stopped:
                     return
@@ -639,12 +610,6 @@ class _PageCleanWorker:
                     self._union.copy(),
                 )
                 self._condition.notify_all()
-
-    @property
-    def error(self):
-        """A excecao que matou a trabalhadora, ou None."""
-        with self._condition:
-            return self._error
 
     def stop(self):
         # O teto cobre uma passada em voo: a trabalhadora so ve o
@@ -717,137 +682,79 @@ def _video_nodes():
     return capture_module.video_nodes()
 
 
-def run_check(source=0):
-    """Validacao da camera, porta por porta. Retorna 0 ou 1.
+def _read_first_frame(capture, timeout_s):
+    """Tenta obter um frame até o prazo; capture.read() pode bloquear."""
+    deadline = time.monotonic() + max(0.0, timeout_s)
+    while True:
+        try:
+            ok, frame = capture.read()
+        except Exception as error:
+            return None, error
+        if time.monotonic() > deadline:
+            return None, TimeoutError("nenhum frame recebido dentro do prazo")
+        if ok and frame is not None:
+            return frame, None
 
-    O `source` importa: a versao anterior abria sempre o
-    /dev/video0, qualquer que fosse o indice pedido, e com uma URL
-    caia no 0 tambem. Agora o indice pedido e o testado, e uma URL
-    e aberta como URL.
-    """
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None, TimeoutError("nenhum frame recebido dentro do prazo")
+        time.sleep(min(0.05, remaining))
+
+
+def run_check(source=0, open_timeout_ms=3000, first_frame_timeout_s=5.0):
+    """Valida a fonte informada, lê um frame e sempre libera a captura."""
+    parsed = parse_source(source)
     print(f"PASS: OpenCV disponivel. Versao {cv2.__version__}.")
     all_ok = _check_models()
+    print(f"Testando fonte: {parsed!r}.")
 
-    if not isinstance(source, int):
-        return 0 if _check_remote_source(source) and all_ok else 1
-
-    nodes = _video_nodes()
-    if not nodes:
-        print("FAIL: nenhum /dev/video* existe neste sistema.")
-        if is_wsl():
-            print(
-                "  Correcao: anexe a camera com "
-                "bash scripts/setup_camera_wsl.sh. A alternativa e uma "
-                "camera via rede com --source."
-            )
-        else:
-            print("  Correcao: conecte uma webcam a este computador.")
-        return 1
-    print(f"PASS: dispositivos de video encontrados: {', '.join(nodes)}.")
-
-    node = f"/dev/video{source}"
-    if node not in nodes:
-        print(
-            f"FAIL: {node} nao existe. Os dispositivos deste sistema "
-            f"sao: {', '.join(nodes)}."
-        )
-        print(
-            "  Correcao: use --source com um dos indices acima, ou "
-            "conecte a camera pedida."
-        )
-        return 1
-
-    access = os.access(node, os.R_OK | os.W_OK)
-    group_note = ""
+    capture = None
     try:
-        import grp
+        read_timeout_ms = max(1, int(first_frame_timeout_s * 1000))
+        capture = _open_capture(
+            parsed,
+            open_timeout_ms=open_timeout_ms,
+            read_timeout_ms=read_timeout_ms,
+        )
+        if not capture.isOpened():
+            print(f"FAIL: a fonte {parsed!r} nao abriu.")
+            return 1
 
-        gid = os.stat(node).st_gid
+        print(f"PASS: fonte {parsed!r} aberta.")
+        frame, read_error = _read_first_frame(capture, first_frame_timeout_s)
+        if read_error is not None:
+            if isinstance(read_error, TimeoutError):
+                print(
+                    f"FAIL: a fonte {parsed!r} abriu, mas nao entregou "
+                    f"um frame antes do prazo de {first_frame_timeout_s:g} "
+                    "segundos. O backend pode ultrapassar o prazo se "
+                    "capture.read() bloquear."
+                )
+            else:
+                print(f"FAIL: erro ao ler frame da fonte {parsed!r}: {read_error}")
+            return 1
+
+        height, width = frame.shape[:2]
         try:
-            group_name = grp.getgrgid(gid).gr_name
-        except KeyError:
-            group_name = str(gid)
-        in_group = gid in os.getgroups()
-        group_note = (
-            f" Grupo dono de {node}: {group_name}. "
-            f"Este processo esta nesse grupo: {'sim' if in_group else 'nao'}."
-        )
-    except Exception:
-        group_note = ""
-    if access:
-        print(f"PASS: este processo le e escreve em {node}.{group_note}")
-    else:
-        print(
-            f"FAIL: este processo nao tem permissao de leitura e "
-            f"escrita em {node}.{group_note}"
-        )
-        print(
-            "  Correcao definitiva: sudo usermod -aG video $USER "
-            "(vale nas proximas sessoes)."
-        )
-        print('  Correcao nesta sessao: sg video -c "python3 main.py".')
-        all_ok = False
-
-    capture = cv2.VideoCapture(source)
-    if not capture.isOpened():
-        print(
-            f"FAIL: nao consegui abrir {node}. Outro programa "
-            "provavelmente esta usando a camera."
-        )
+            fps = float(capture.get(cv2.CAP_PROP_FPS))
+        except Exception:
+            fps = 0.0
+        fps_text = f"{fps:g} FPS" if fps > 0 else "FPS indisponivel"
+        print(f"PASS: primeiro frame recebido: {width}x{height}, {fps_text}.")
+        return 0 if all_ok else 1
+    except capture_module.CaptureError as error:
+        print(f"FAIL: {error}")
         return 1
-    _configure_local_capture(capture)
-    frame = None
-    deadline = time.time() + 3.0
-    while time.time() < deadline:
-        ok, candidate = capture.read()
-        if ok and candidate is not None:
-            frame = candidate
-            break
-        time.sleep(0.1)
-    capture.release()
-    if frame is not None:
-        print(
-            f"PASS: quadro lido de {node}. "
-            f"Formato (altura, largura, canais): {frame.shape}."
-        )
-    else:
-        print(
-            f"FAIL: {node} abriu, mas nenhum quadro chegou em 3 "
-            "segundos. A camera pode estar ocupada ou travada."
-        )
-        all_ok = False
+    except Exception as error:
+        print(f"FAIL: erro ao testar a fonte {parsed!r}: {error}")
+        return 1
+    finally:
+        if capture is not None:
+            try:
+                capture.release()
+            except Exception:
+                pass
 
-    return 0 if all_ok else 1
-
-
-def _check_remote_source(url):
-    """Abre uma fonte de rede e confere que um quadro chega. 0/1."""
-    print(f"PASS: fonte de rede informada: {url}.")
-    capture = cv2.VideoCapture(url)
-    if not capture.isOpened():
-        print(
-            "FAIL: nao consegui abrir a fonte de rede. Confira a URL, "
-            "se a camera esta transmitindo e se este computador "
-            "alcanca o endereco."
-        )
-        return 0
-    frame = None
-    deadline = time.time() + 5.0
-    while time.time() < deadline:
-        ok, candidate = capture.read()
-        if ok and candidate is not None:
-            frame = candidate
-            break
-        time.sleep(0.1)
-    capture.release()
-    if frame is None:
-        print("FAIL: a fonte abriu, mas nenhum quadro chegou em 5 segundos.")
-        return 0
-    print(
-        "PASS: quadro lido da fonte de rede. "
-        f"Formato (altura, largura, canais): {frame.shape}."
-    )
-    return 1
 
 
 def _check_models():
@@ -963,14 +870,6 @@ def _compose_view(camera_img, canvas_img):
     target_h = 640
     cam = _fit(camera_img, target_h)
     sheet = _fit(canvas_img, target_h)
-    if sheet is canvas_img:
-        # _fit devolve o PRÓPRIO array quando a altura já cabe; o
-        # putText abaixo escreve nele. Sem esta cópia, compor a vista
-        # com um canvas de 640 de altura pintava "folha ao vivo" no
-        # canvas do chamador (e no _BLANK_SHEET, que é cache de
-        # módulo). O caminho normal (canvas 850x1200) já sai do _fit
-        # como array novo e não paga a cópia.
-        sheet = sheet.copy()
     if cam.shape[0] != sheet.shape[0]:
         h = min(cam.shape[0], sheet.shape[0])
         cam = cv2.resize(cam, (int(cam.shape[1] * h / cam.shape[0]), h))
@@ -996,50 +895,49 @@ def _compose_view(camera_img, canvas_img):
     return view
 
 
-def _message_view(last_view, title, lines):
-    """Aviso desenhado sobre a ultima vista, ou sobre fundo solido.
+def _dead_source_view(last_view):
+    """Quadro de aviso da fonte morta, desenhado sobre a ultima vista.
 
-    A fonte Hershey do OpenCV nao tem acento: as mensagens chegam
-    sem acentuacao, como o restante dos textos que o app desenha.
+    Sem nenhum quadro exibido ainda, o aviso vai sobre um fundo
+    solido no formato da vista composta. O texto usa a mesma
+    mensagem do aviso no console, sem acentos, como o restante dos
+    textos que o app desenha com a fonte Hershey.
     """
     if last_view is not None:
         view = last_view.copy()
     else:
         view = np.full((640, 1280, 3), (30, 30, 30), dtype=np.uint8)
     cv2.putText(
-        view, title, (40, 90), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3
+        view,
+        "A fonte de video morreu",
+        (40, 90),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        1.2,
+        (0, 0, 255),
+        3,
     )
-    for index, line in enumerate(lines):
-        cv2.putText(
-            view,
-            line,
-            (40, 140 + 40 * index),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
-            (255, 255, 255),
-            2,
-        )
+    cv2.putText(
+        view,
+        "A camera parou de entregar quadros.",
+        (40, 140),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.8,
+        (255, 255, 255),
+        2,
+    )
+    cv2.putText(
+        view,
+        "Feche outros programas usando a camera e tente de novo.",
+        (40, 180),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.8,
+        (255, 255, 255),
+        2,
+    )
     return view
 
 
-def _dead_source_view(last_view):
-    """Quadro de aviso da fonte morta, desenhado sobre a ultima vista."""
-    return _message_view(
-        last_view,
-        "A fonte de video morreu",
-        [
-            "A camera parou de entregar quadros.",
-            "Feche outros programas usando a camera e tente de novo.",
-        ],
-    )
-
-
-def _error_view(last_view, title, lines):
-    """Quadro de aviso de falha do pipeline, no formato da vista."""
-    return _message_view(last_view, title, lines)
-
-
-def _detect_sheet_combined(frame, neural_detector):
+def _detect_sheet_combined(frame, neural_detector, classic_detect=None):
     """Detecção do modo sem marcadores: neural primário, clássico reserva.
 
     Sem detector neural, é o clássico puro, o comportamento de sempre.
@@ -1399,6 +1297,21 @@ def run(source=0, save_dir="captures", markers_mode=False, width=None,
             # no acumulador, como fazia o carimbo tirado no laco.
 
             loop_frames += 1
+            if dataset_writer is not None:
+                frame_name = f"frame_{loop_frames:08d}.jpg"
+                frame_path = dataset_path / frame_name
+                if not cv2.imwrite(
+                    str(frame_path), frame, [cv2.IMWRITE_JPEG_QUALITY, 95]
+                ):
+                    print(f"Erro ao salvar frame: {frame_path}")
+                    break
+                height_px, width_px = frame.shape[:2]
+                dataset_writer.writerow(
+                    [loop_frames, time.time_ns(), frame_name, width_px, height_px]
+                )
+                dataset_manifest.flush()
+                if loop_frames % 100 == 0:
+                    print(f"Frames salvos nesta sessao: {loop_frames}.")
             if auto_capture and loop_frames % 10 == 0:
                 save_raw_frame(frame)
 
@@ -1423,6 +1336,7 @@ def run(source=0, save_dir="captures", markers_mode=False, width=None,
                     ink_session_open = False
                     session_corners = None
                     freeze_pending = False
+                    pair_previous_frame = None
                     clean_mask = None
                     if ink_worker is not None:
                         clean_generation = ink_worker.new_generation()
@@ -1436,6 +1350,8 @@ def run(source=0, save_dir="captures", markers_mode=False, width=None,
                 # de tinta e o fallback de exibicao, que retifica sob
                 # demanda.
                 sheet_present = tracker.corners is not None
+                if not sheet_present:
+                    pair_previous_frame = None
                 warped = None
 
                 if ran_detection and tracker.corners is not None:
@@ -1443,15 +1359,6 @@ def run(source=0, save_dir="captures", markers_mode=False, width=None,
                         # Folha nova na cena: canvas e geometria recomecam.
                         ink_accumulator.reset()
                         clean_mask = None
-                        # accumulated_canvas tambem zera: sem isto, o
-                        # painel continuava exibindo o canvas da folha
-                        # ANTERIOR ate a trabalhadora publicar a
-                        # primeira mascara da geracao nova (ate ~250 ms
-                        # de cadencia mais a passada do modelo), e a
-                        # tecla s salvava esse canvas errado. Medido no
-                        # harness headless: 22 quadros com a tinta velha
-                        # depois de a folha voltar.
-                        accumulated_canvas = None
                         if ink_worker is not None:
                             clean_generation = ink_worker.new_generation()
                             clean_applied_version = 0
@@ -1461,6 +1368,7 @@ def run(source=0, save_dir="captures", markers_mode=False, width=None,
                             session_corners = None
                             freeze_pending = False
                         corner_history.clear()
+                        pair_previous_frame = None
                         ink_session_open = True
                     if restart_reference:
                         # Tecla C: novo ponto zero da sessao. O canvas
@@ -1472,6 +1380,7 @@ def run(source=0, save_dir="captures", markers_mode=False, width=None,
                         session_ink.reset()
                         baseline_armed = True
                         freeze_pending = True
+                        pair_previous_frame = None
                     corner_history.append(tracker.corners.copy())
                     ink_corners = np.median(
                         np.stack(corner_history), axis=0
@@ -1514,6 +1423,26 @@ def run(source=0, save_dir="captures", markers_mode=False, width=None,
                                     ink_warped, visible)
                         else:
                             observed = ink_source(ink_warped)
+                        if (
+                            pair_ink_detector is not None
+                            and pair_previous_frame is not None
+                            and ink_warped is not None
+                            and (session_ink is None or session_ink.ready)
+                        ):
+                            before_warped = paper_module.warp_sheet(
+                                pair_previous_frame, warp_corners
+                            )
+                            if before_warped is not None:
+                                before_gray = cv2.cvtColor(
+                                    before_warped, cv2.COLOR_BGR2GRAY
+                                )
+                                after_gray = cv2.cvtColor(
+                                    ink_warped, cv2.COLOR_BGR2GRAY
+                                )
+                                new_ink = pair_ink_detector.predict(
+                                    after_gray, before_gray
+                                )
+                                observed = cv2.bitwise_or(observed, new_ink)
                         accumulated_canvas = ink_module.render_canvas(
                             ink_accumulator.update(
                                 observed, visible,
@@ -1535,26 +1464,6 @@ def run(source=0, save_dir="captures", markers_mode=False, width=None,
                         accumulated_canvas = ink_module.render_canvas(
                             clean_mask, out=canvas_buffer
                         )
-                    # Trabalhadora morta por excecao: sem isto o canvas
-                    # congelava no ultimo quadro e nem o console nem a
-                    # janela diziam nada (o erro morria na thread).
-                    worker_error = ink_worker.error
-                    if worker_error is not None:
-                        print(
-                            "A tinta pagina->limpa falhou e a thread "
-                            f"parou: {worker_error}. O canvas nao avanca."
-                        )
-                        cv2.imshow("Draw", _error_view(
-                            last_view,
-                            "A tinta pagina->limpa falhou",
-                            [
-                                "O canvas parou de atualizar.",
-                                "Veja a mensagem no terminal e reinicie "
-                                "o app.",
-                            ],
-                        ))
-                        cv2.waitKey(_DEAD_NOTICE_MS)
-                        break
 
             status = frame.copy()
             if markers_mode:
@@ -1618,9 +1527,41 @@ def run(source=0, save_dir="captures", markers_mode=False, width=None,
                         2,
                     )
                 if markers_mode:
-                    ink_mask = ink_module.extract_ink(
-                        warped, clear_markers=True
+                    display_warped = warped
+                else:
+                    # Retifica sob demanda: o warp por quadro sumiu com
+                    # a presenca sem warp do upstream, e a exibicao, a
+                    # amostragem da sessao e a tecla v precisam da folha
+                    # retificada deste quadro.
+                    display_warped = paper_module.warp_sheet(
+                        frame, tracker.corners
                     )
+                # ink_mask ja veio de extract_ink sobre a entrada com
+                # luz normalizada; o modelo de tinta do upstream so o
+                # substitui quando esta ativo.
+                if ink_extractor is not None:
+                    ink_mask = ink_source(display_warped)
+                else:
+                    ink_mask = ink_module.extract_ink(
+                        _ink_input(display_warped, winning_light["mode"]),
+                        clear_markers=markers_mode,
+                    )
+                if session_tracker is not None:
+                    # Amostragem reduzida: uma amostra a cada 5 quadros
+                    # retificados, não a cada quadro — o thinning e o
+                    # rastreamento a cada quadro são custo sem ganho.
+                    session_counter += 1
+                    if session_counter % 5 == 1:
+                        session_tracker.update(
+                            strokes_module.extract_strokes(ink_mask),
+                            frame_index=loop_frames,
+                            timestamp_ms=int(time.time() * 1000),
+                            corners=(
+                                None if markers_mode else tracker.corners
+                            ),
+                            sheet_locked=True,
+                        )
+                if markers_mode:
                     canvas = ink_module.render_canvas(
                         ink_mask, out=view_canvas_buffer
                     )
@@ -1633,9 +1574,6 @@ def run(source=0, save_dir="captures", markers_mode=False, width=None,
                     # congelamento que a trabalhadora existe para tirar.
                     canvas = _blank_sheet()
                 else:
-                    ink_mask = ink_source(
-                        paper_module.warp_sheet(frame, tracker.corners)
-                    )
                     canvas = ink_module.render_canvas(
                         ink_mask, out=view_canvas_buffer
                     )
@@ -1651,9 +1589,28 @@ def run(source=0, save_dir="captures", markers_mode=False, width=None,
                         canvas,
                         lambda path: print(f"Canvas salvo em {path}"),
                     )
+                if key == ord("v"):
+                    save_path.mkdir(parents=True, exist_ok=True)
+                    base = save_path / f"strokes_{int(time.time())}"
+                    strokes = strokes_module.extract_strokes(ink_mask)
+                    svg_path, json_path = strokes_module.export_strokes(
+                        strokes, base
+                    )
+                    print(f"{len(strokes)} tracos salvos em {svg_path} "
+                          f"e {json_path}")
+                if key == ord("o") and session_tracker is not None:
+                    save_path.mkdir(parents=True, exist_ok=True)
+                    base = save_path / f"session_{int(time.time())}"
+                    svg_path, json_path = sequence_module.export_session(
+                        session_tracker, base
+                    )
+                    print(f"sessao com {len(session_tracker.ordered)} tracos "
+                          f"ordenados salva em {svg_path} e {json_path}")
                 handle_capture_key(key, frame)
                 if key in (ord("q"), 27):
                     break
+                if pair_ink_detector is not None:
+                    pair_previous_frame = frame.copy()
                 continue
 
             key = cv2.waitKey(1) & 0xFF
@@ -1662,15 +1619,12 @@ def run(source=0, save_dir="captures", markers_mode=False, width=None,
                 break
 
     finally:
-        # Epilogo sempre roda: captura liberada, trabalhadora de
-        # tinta parada, fila de PNG drenada e janela destruida
-        # mesmo quando o laco morre por excecao. Sem o finally, um
-        # erro no meio do laco vazava a camera aberta e a thread
-        # daemon ficava lendo o dispositivo ate o processo sair.
         frame_source.stop()
         if ink_worker is not None:
             ink_worker.stop()
         png_writer.close()
+        if dataset_manifest is not None:
+            dataset_manifest.close()
         cv2.destroyAllWindows()
 
 
