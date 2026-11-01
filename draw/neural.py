@@ -194,11 +194,11 @@ def _load_session(model_path):
         str(path), sess_options=options, providers=["CPUExecutionProvider"]
     )
     input_names = [item.name for item in session.get_inputs()]
-    if input_names != ["image"]:
+    if len(input_names) != 1:
         raise ValueError(
-            "modelo incompatível com o detector de folha: esperava a "
-            "entrada única 'image'; recebi "
-            f"{input_names}. Modelos temporais de tinta usam outro contrato."
+            "modelo incompatível com o detector de folha: esperava uma "
+            f"entrada; recebi {input_names}. Modelos temporais de tinta "
+            "usam outro contrato."
         )
     return session
 

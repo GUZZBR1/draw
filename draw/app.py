@@ -590,7 +590,14 @@ class _PageCleanWorker:
                 warped, generation = self._pending
                 self._pending = None
                 self._last_pass_start = time.monotonic()
-            mask = self._page_clean.ink_mask(warped)
+            try:
+                mask = self._page_clean.ink_mask(warped)
+            except Exception as error:  # noqa: BLE001 - reported by the main loop
+                with self._condition:
+                    self._error = error
+                    self._stopped = True
+                    self._condition.notify_all()
+                return
             with self._condition:
                 if self._stopped:
                     return
@@ -870,6 +877,14 @@ def _compose_view(camera_img, canvas_img):
     target_h = 640
     cam = _fit(camera_img, target_h)
     sheet = _fit(canvas_img, target_h)
+    if sheet is canvas_img:
+        # _fit devolve o PRÓPRIO array quando a altura já cabe; o
+        # putText abaixo escreve nele. Sem esta cópia, compor a vista
+        # com um canvas de 640 de altura pintava "folha ao vivo" no
+        # canvas do chamador (e no _BLANK_SHEET, que é cache de
+        # módulo). O caminho normal (canvas 850x1200) já sai do _fit
+        # como array novo e não paga a cópia.
+        sheet = sheet.copy()
     if cam.shape[0] != sheet.shape[0]:
         h = min(cam.shape[0], sheet.shape[0])
         cam = cv2.resize(cam, (int(cam.shape[1] * h / cam.shape[0]), h))
@@ -892,6 +907,32 @@ def _compose_view(camera_img, canvas_img):
         # resize antigo cortava a altura para 632; com 1280x720
         # ele nem rodava e a vista saia com 1596 de largura).
         view = cv2.resize(view, (1600, 640))
+    return view
+
+
+def _message_view(last_view, title, lines):
+    """Aviso desenhado sobre a ultima vista, ou sobre fundo solido.
+
+    A fonte Hershey do OpenCV nao tem acento: as mensagens chegam
+    sem acentuacao, como o restante dos textos que o app desenha.
+    """
+    if last_view is not None:
+        view = last_view.copy()
+    else:
+        view = np.full((640, 1280, 3), (30, 30, 30), dtype=np.uint8)
+    cv2.putText(
+        view, title, (40, 90), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3
+    )
+    for index, line in enumerate(lines):
+        cv2.putText(
+            view,
+            line,
+            (40, 140 + 40 * index),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (255, 255, 255),
+            2,
+        )
     return view
 
 
@@ -935,6 +976,12 @@ def _dead_source_view(last_view):
         2,
     )
     return view
+
+
+
+def _error_view(last_view, title, lines):
+    """Quadro de aviso de falha do pipeline, no formato da vista."""
+    return _message_view(last_view, title, lines)
 
 
 def _detect_sheet_combined(frame, neural_detector, classic_detect=None):
@@ -1359,6 +1406,7 @@ def run(source=0, save_dir="captures", markers_mode=False, width=None,
                         # Folha nova na cena: canvas e geometria recomecam.
                         ink_accumulator.reset()
                         clean_mask = None
+                        accumulated_canvas = None
                         if ink_worker is not None:
                             clean_generation = ink_worker.new_generation()
                             clean_applied_version = 0
@@ -1464,6 +1512,22 @@ def run(source=0, save_dir="captures", markers_mode=False, width=None,
                         accumulated_canvas = ink_module.render_canvas(
                             clean_mask, out=canvas_buffer
                         )
+                    worker_error = ink_worker.error
+                    if worker_error is not None:
+                        print(
+                            "A tinta pagina->limpa falhou e a thread "
+                            f"parou: {worker_error}. O canvas nao avanca."
+                        )
+                        cv2.imshow("Draw", _error_view(
+                            last_view,
+                            "A tinta pagina->limpa falhou",
+                            [
+                                "O canvas parou de atualizar.",
+                                "Veja a mensagem no terminal e reinicie o app.",
+                            ],
+                        ))
+                        cv2.waitKey(_DEAD_NOTICE_MS)
+                        break
 
             status = frame.copy()
             if markers_mode:
