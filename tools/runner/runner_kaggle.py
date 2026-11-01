@@ -27,10 +27,32 @@ import os
 import sys
 import urllib.request
 
-sys.path.insert(0, "/opt/muse/skills/custom-connector-setup/bin")
-from dynamic_credentials import add_surrogate_to_request, read_json_response
-
 from .recipe import Recipe
+
+# O conector custom.kaggle desta maquina e o unico provedor de
+# credencial do runner. O import dele era feito na importacao do
+# modulo, com um caminho absoluto de uma maquina especifica: em
+# qualquer clone sem /opt/muse o modulo nem carregava, e a suite
+# inteira morria na coleta (ModuleNotFoundError em
+# tools/runner/tests/test_cycle.py). Agora o import e preguicoso e
+# o erro aparece na primeira chamada de rede, com mensagem clara.
+_CONNECTOR_BIN = "/opt/muse/skills/custom-connector-setup/bin"
+
+
+def _credentials():
+    """O modulo de credencial do conector, ou erro explicito."""
+    if _CONNECTOR_BIN not in sys.path:
+        sys.path.insert(0, _CONNECTOR_BIN)
+    try:
+        import dynamic_credentials
+    except ImportError as error:
+        raise RuntimeError(
+            "credencial do Kaggle indisponivel: o conector "
+            "custom.kaggle nao esta instalado nesta maquina "
+            f"({_CONNECTOR_BIN}). O runner precisa dele para falar "
+            "com a API do Kaggle."
+        ) from error
+    return dynamic_credentials
 
 BASE = "https://www.kaggle.com/api/v1"
 USER = "guzzbr"
@@ -48,11 +70,12 @@ def call(path, payload=None):
         data = json.dumps(payload).encode()
         headers["Content-Type"] = "application/json"
     request = urllib.request.Request(BASE + path, data=data, headers=headers)
-    add_surrogate_to_request(
+    credentials = _credentials()
+    credentials.add_surrogate_to_request(
         request, "custom.kaggle", allowed_hosts=["www.kaggle.com"])
     opener = urllib.request.build_opener(NoRedirect())
     with opener.open(request, timeout=120) as response:
-        return read_json_response(response)
+        return credentials.read_json_response(response)
 
 
 def push(recipe, mode=None):

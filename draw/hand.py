@@ -37,7 +37,16 @@ import cv2
 import numpy as np
 
 _ENV_MODEL_VAR = "DRAW_HAND_MODEL"
-_DEFAULT_CANDIDATES = ("models/hand_landmarker.task",)
+# O caminho convencional e resolvido a partir da RAIZ DO REPO, como
+# o do detector neural e o do pagina->limpa; era relativo ao CWD e
+# um app aberto de outro diretorio perdia a mascara de mao sem
+# aviso (o modelo existia, so nao era achado). O CWD continua como
+# segunda tentativa, para quem roda a partir de uma copia local.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_DEFAULT_CANDIDATES = (
+    str(_REPO_ROOT / "models" / "hand_landmarker.task"),
+    "models/hand_landmarker.task",
+)
 _MIN_CONFIDENCE = 0.3
 _HULL_SCALE = 1.30
 _DILATE_PX = 15
@@ -52,7 +61,7 @@ def _resolve_model_path(model_path):
         return env
     for candidate in _DEFAULT_CANDIDATES:
         if Path(candidate).exists():
-            return candidate
+            return str(candidate)
     return None
 
 

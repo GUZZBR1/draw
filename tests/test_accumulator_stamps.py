@@ -28,19 +28,37 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from draw import ink as ink_new  # noqa: E402
 
-# Baseline da regressao: draw/ink.py antes dos carimbos (upstream
-# ca51fce). O carregamento e preguicoso para a coleta do pytest nao
-# morrer: este script e standalone (ver "Uso" acima) e nao define
-# testes pytest; sem a baseline, main() falha com a mesma mensagem
-# de antes, so que ao rodar, nao ao importar.
-_PRE_STAMP = Path("/tmp/ink_pre_stamp.py")
-ink_old = None
-if _PRE_STAMP.exists():
-    _spec = importlib.util.spec_from_file_location(
-        "draw._ink_pre_stamp", _PRE_STAMP
+
+def _skip_without(path, hint):
+    """Fora do pytest, o teste de script pede o arquivo e sai com 2.
+
+    Dentro do pytest, um arquivo que o operador precisa preparar a
+    mao NÃO pode morrer no import: o sys.exit(2) daqui derrubava a
+    coleta da suite inteira (INTERNALERROR) num clone limpo. Vira
+    skip com o motivo declarado.
+    """
+    message = (
+        f"{path} nao existe; {hint} "
+        "O teste diferencial precisa da copia congelada da "
+        "implementacao anterior."
     )
-    ink_old = importlib.util.module_from_spec(_spec)
-    _spec.loader.exec_module(ink_old)
+    if __name__ != "__main__":
+        import pytest
+        pytest.skip(message, allow_module_level=True)
+    print(f"ERRO: {message}")
+    sys.exit(2)
+
+_PRE_STAMP = Path("/tmp/ink_pre_stamp.py")
+if not _PRE_STAMP.exists():
+    _skip_without(
+        _PRE_STAMP,
+        "copie draw/ink.py para la antes de mudar o acumulador.",
+    )
+_spec = importlib.util.spec_from_file_location(
+    "draw._ink_pre_stamp", _PRE_STAMP
+)
+ink_old = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(ink_old)
 
 H, W = 1200, 850
 N_FRAMES = 60
