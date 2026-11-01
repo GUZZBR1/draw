@@ -226,8 +226,13 @@ class PageCleanInk:
         )
         return self._session.run(None, {self._input_name: tensor})[0]
 
-    def ink_mask(self, warped_bgr):
-        """Máscara uint8 0/255 da tinta, no tamanho do warp de entrada."""
+    def ink_prob(self, warped_bgr):
+        """Probabilidade de tinta por pixel (float32 0..1), no
+        tamanho do warp de entrada. É a saída crua do mosaico, antes
+        do limiar: quem acumula passadas (confirmação entre passadas
+        no app) precisa dela, porque o binário limiarizado joga fora
+        a diferença entre tinta fraca estável e ruído de uma passada.
+        """
         if self._session is None:
             self.load()
         h, w, tiles = self._tiles(warped_bgr)
@@ -240,5 +245,9 @@ class PageCleanInk:
                 hh = min(_PATCH, h - y)
                 ww = min(_PATCH, w - x)
                 logits[y:y + hh, x:x + ww] = out[index, 0, :hh, :ww]
-        prob = 1.0 / (1.0 + np.exp(-logits))
+        return 1.0 / (1.0 + np.exp(-logits))
+
+    def ink_mask(self, warped_bgr):
+        """Máscara uint8 0/255 da tinta, no tamanho do warp de entrada."""
+        prob = self.ink_prob(warped_bgr)
         return np.where(prob > self.threshold, 255, 0).astype(np.uint8)
