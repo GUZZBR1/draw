@@ -756,7 +756,11 @@ class NeuralSheetDetector:
         mask = cv2.resize(
             mask_small, (frame_w, frame_h), interpolation=cv2.INTER_NEAREST
         )
-        self.last_presence_logit = float(presence)
+        # `presence` aqui pode ser escalar (ramo `logits`, constantes) ou
+        # array (ramo `mask_logits` + `presence_logit`, saída do arquivo):
+        # reduzir ao primeiro elemento antes de converter, senão o ramo
+        # legado quebra com TypeError no float().
+        self.last_presence_logit = float(np.asarray(presence).flat[0])
         return self.last_presence_logit, mask * 255
 
     def __call__(self, frame):

@@ -96,7 +96,13 @@ def test_pair_ink_model_flag_cannot_be_used_with_markers_mode():
 def test_pairwise_ink_model_is_rejected_as_page_detector(tmp_path, monkeypatch):
     class FakeSession:
         def get_inputs(self):
-            return [types.SimpleNamespace(name="pair")]
+            # Modelo temporal de verdade: duas entradas (before/after).
+            # O contrato novo aceita uma única entrada com qualquer nome,
+            # então só o par é recusado como detector de folha.
+            return [
+                types.SimpleNamespace(name="before"),
+                types.SimpleNamespace(name="after"),
+            ]
 
     class FakeRuntime(types.ModuleType):
         class SessionOptions:
