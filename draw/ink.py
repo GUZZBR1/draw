@@ -434,7 +434,14 @@ class InkAccumulator:
         if visible_mask is None:
             visible = np.ones(ink.shape, dtype=bool)
         elif visible_mask.dtype == bool:
-            visible = visible_mask
+            # Cópia obrigatória: este array entra na janela de votos
+            # e fica vivo por window frames. Guardar a referência do
+            # chamador fazia um buffer reciclado (o caso natural de
+            # quem reusa a máscara entre frames) reescrever o
+            # passado da janela: medido, 10.404 px de histórico
+            # viravam "nunca visível" quando o buffer era zerado
+            # depois. O custo é uma cópia booleana de página cheia.
+            visible = visible_mask.copy()
         else:
             visible = visible_mask > 0
         evidence = (
@@ -459,7 +466,13 @@ class InkAccumulator:
         self.state[enter] = True
         self.state[clear] = False
         self._update_stamps(evidence, visible, t_ms)
-        return (self.state * 255).astype(np.uint8)
+        # np.multiply(..., dtype=uint8) em vez de state * 255: a
+        # multiplicação de bool por inteiro promove para int64 e
+        # aloca 8 MB por frame antes do astype. O out implícito do
+        # ufunc escreve direto no uint8 e o resultado é o mesmo.
+        canvas = np.empty(self._shape, dtype=np.uint8)
+        np.multiply(self.state, 255, out=canvas, dtype=np.uint8)
+        return canvas
 
     def _update_stamps(self, evidence, visible, t_ms):
         """Mantém first_seen/last_update sobre o estado já atualizado.

@@ -280,14 +280,14 @@ O kernel da v3 levou 44,7 minutos numa T4. O kernel da v2 levou 3 horas e 51 min
 
 ## Arquitetura
 
-- `draw/` é o pacote principal. `app.py` tem o loop da webcam, as janelas e as validações de câmera. `paper.py` tem a detecção clássica, o portão de textura e a homografia. `neural.py` tem o detector neural por ONNX, com presença, máscara e quadrilátero. `ink.py` tem a heurística de tinta e o canvas acumulativo. `ink_model.py` tem o extrator do modelo aprendido de tinta. `hand.py` tem a máscara de mão do MediaPipe. `config.py` guarda o tamanho da folha retificada e os dados dos marcadores.
+- `draw/` é o pacote principal. `app.py` tem o loop da webcam, as janelas e as validações de câmera. `paper.py` tem a detecção clássica, o portão de textura e a homografia. `neural.py` tem o detector neural por ONNX, com presença, máscara e quadrilátero. `page_clean.py` tem a tinta pelo modelo página→limpa. `ink.py` tem a heurística de tinta e o canvas acumulativo. `hand.py` tem a máscara de mão do MediaPipe. `manifest.py` confere o sha256 dos modelos contra `models/MANIFEST.json`. `config.py` guarda o tamanho da folha retificada e os dados dos marcadores. O extrator do modelo aprendido de tinta (`ink_model.py`) não está neste repositório: o caminho dele fica atrás de `--ink-model`.
 - `template/` tem o gerador da folha-modelo imprimível, usado só pelo modo `--markers`. O PNG gerado não entra no versionamento.
 - `bridge/` tem a ponte de captura no Windows. Um `ffmpeg.exe` no Windows serve a webcam como stream MJPEG e o Draw consome pelo `--source`. O passo a passo fica em [bridge/README.md](bridge/README.md).
 - `scripts/` tem os scripts de instalação. Hoje guarda `setup_camera_wsl.sh`, o instalador da câmera do WSL.
-- `tests/` tem os testes sem webcam. Hoje guarda `selftest.py`, que valida detecção, homografia, extração de tinta e o portão de textura em cenas sintéticas.
-- `tools/` tem as ferramentas de apoio do projeto. As ferramentas de treino (`label_frames.py`, `eval_real_frames.py` e outras) ficaram na branch `training-zone`.
+- `tests/` tem os testes sem webcam: `selftest.py` valida detecção, homografia, extração de tinta e o portão de textura em cenas sintéticas; os `test_*.py` cobrem o adaptador ONNX (com modelos minúsculos de verdade), a tinta, o `page_clean`, o manifesto, a composição de vista e o estado de sessão do app. `pytest` roda tudo.
+- `tools/` tem as ferramentas de apoio do projeto. As ferramentas de treino `label_frames.py` (rotula frames capturados) e `eval_real_frames.py` (o harness dos frames reais, o portão de qualquer modelo neural) ficaram na branch `training-zone`, fora da main.
 - `verification/` é o registro da verificação formal limitada da v0. Ele guarda a skill do projeto e o script que prova propriedades da homografia com sondas numéricas. É um registro histórico de uma etapa concluída, não uma etapa do pipeline.
-- `docs/` tem a documentação de instalação, com o guia do Windows com WSL.
+- `docs/` tem a instalação (guia do Windows com WSL), a auditoria de produto (`docs/auditoria/`) e a análise de código (`docs/analise/`, com as sondas que a sustentam em `docs/analise/probes/`).
 - `main.py` é o ponto de entrada. Ele só chama o app.
 - `VISION.md` é o documento de visão do projeto.
 
@@ -296,6 +296,8 @@ O kernel da v3 levou 44,7 minutos numa T4. O kernel da v2 levou 3 horas e 51 min
 Sem webcam por perto, o pipeline inteiro se valida com cenas sintéticas.
 
 ```bash
+pip install -r requirements-dev.txt   # pytest, ruff, onnx (fixtures)
+pytest                                 # suíte inteira, ~6 s
 python tests/selftest.py
 python -m pytest tests/ -q
 python verification/run_verification.py

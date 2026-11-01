@@ -67,19 +67,19 @@ DRAW_NEURAL_MODEL.
 
 import os
 from pathlib import Path
+from typing import NamedTuple, Tuple
 
 import cv2
 import numpy as np
 
 from . import paper as _paper
+from .manifest import verify_model
 
 _INPUT_SIZE = 384
 _ORT_INTRA_THREADS = 4
 _ENV_THREADS_VAR = "DRAW_ORT_THREADS"
 _MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 _STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
-_MASK_THRESHOLD = 0.5
-_PAPER_CLASS = 1
 _MIN_CONTOUR_AREA_RATIO = 0.01
 _SEGMENTATION_PRESENCE_MIN_RATIO = _MIN_CONTOUR_AREA_RATIO
 _FIT_MAX_DISPLACE_PX = 100.0
@@ -137,9 +137,19 @@ _FIT_EXCURSION_DIAG_FRAC = 0.15
 
 
 def _fit_plausible(corners, frame_shape):
-    """True se o quadrilátero passa na guarda de plausibilidade."""
+    """True se o quadrilátero passa na guarda de plausibilidade.
+
+    A primeira regra é finitude. Toda comparação com NaN é falsa, e
+    sem esta linha um quadrilátero com NaN atravessava as outras
+    regras sem disparar nenhuma: a guarda aprovava justamente o
+    ajuste mais inválido possível. Infinito já era recusado pela
+    comparação com a margem do quadro, mas a regra explícita cobre
+    os dois casos com a mesma mensagem.
+    """
     quad = np.asarray(corners, dtype=np.float64)
     if quad.shape != (4, 2):
+        return False
+    if not np.all(np.isfinite(quad)):
         return False
     edges = np.array(
         [np.linalg.norm(quad[(i + 1) % 4] - quad[i]) for i in range(4)]
@@ -174,18 +184,27 @@ def _load_session(model_path):
             f"modelo ONNX nao encontrado: {path}. Passe o caminho do "
             f"arquivo .onnx ou defina a variavel {_ENV_MODEL_VAR}."
         )
+    # Integridade opcional: com models/MANIFEST.json no lugar, o
+    # hash do arquivo é conferido antes de a sessão abrir; sem
+    # manifesto, nada muda (ver draw/manifest.py).
+    verify_model(path)
     options = ort.SessionOptions()
     options.intra_op_num_threads = _ort_intra_threads()
     session = ort.InferenceSession(
         str(path), sess_options=options, providers=["CPUExecutionProvider"]
     )
     input_names = [item.name for item in session.get_inputs()]
-    if input_names != ["image"]:
+    if len(input_names) != 1:
         raise ValueError(
-            "modelo incompatível com o detector de folha: esperava a "
-            "entrada única 'image'; recebi "
-            f"{input_names}. Modelos temporais de tinta usam outro contrato."
+            "modelo incompatível com o detector de folha: esperava "
+            "uma única entrada de imagem; recebi "
+            f"{input_names}. Modelos temporais de tinta (before/after) "
+            "usam outro contrato."
         )
+    # O nome da entrada única vem do arquivo (ver _session_contract):
+    # um export com entrada "input" é válido; só o número de entradas
+    # é recusado aqui, na carga, para o modelo temporal não passar
+    # por detector de folha.
     return session
 
 
@@ -207,12 +226,74 @@ def _ort_intra_threads():
     return _ORT_INTRA_THREADS
 
 
+class _SessionContract(NamedTuple):
+    """O que o arquivo ONNX diz sobre si mesmo.
+
+    input_name é o nome que o feed do session.run precisa usar —
+    nunca um literal no código. size é a resolução quadrada de
+    entrada, já resolvida (o dinâmico cai em _INPUT_SIZE). outputs
+    são os nomes das saídas, na ordem do arquivo, para não
+    reconstruir a lista a cada frame.
+    """
+
+    input_name: str
+    size: Tuple[int, int]
+    outputs: Tuple[str, ...]
+
+
+def _session_contract(session):
+    """Lê e valida o contrato de entrada/saída de uma sessão ONNX.
+
+    O adaptador antigo mandava o tensor no feed com o nome literal
+    "image" e lia só shape[2], presumindo quadrado. Um export com
+    entrada "input" quebrava no primeiro frame (não na carga), e um
+    export retangular era esmagado para quadrado sem aviso. Aqui o
+    nome vem do arquivo e a resolução é validada na primeira
+    chamada, com erro explícito.
+    """
+    inputs = session.get_inputs()
+    if len(inputs) != 1:
+        raise RuntimeError(
+            "o modelo ONNX precisa de exatamente uma entrada de imagem; "
+            f"este arquivo declara {[spec.name for spec in inputs]}"
+        )
+    spec = inputs[0]
+    shape = list(spec.shape)
+    if len(shape) != 4:
+        raise RuntimeError(
+            "a entrada do modelo precisa ser [N, C, H, W]; o arquivo "
+            f"declara {spec.name} com forma {shape}"
+        )
+    height, width = shape[2], shape[3]
+    fixed = [
+        dimension for dimension in (height, width)
+        if isinstance(dimension, int) and dimension > 0
+    ]
+    if len(fixed) == 2:
+        if fixed[0] != fixed[1]:
+            raise RuntimeError(
+                "entrada retangular não é suportada: o pré-processamento "
+                "esmaga o frame para uma resolução quadrada e deformaria "
+                f"a imagem em silêncio (o arquivo declara {height}x{width})"
+            )
+        size = (fixed[0], fixed[1])
+    elif len(fixed) == 0:
+        size = (_INPUT_SIZE, _INPUT_SIZE)
+    else:
+        raise RuntimeError(
+            "entrada com altura fixa e largura dinâmica (ou o inverso) "
+            f"não é suportada; o arquivo declara {shape}"
+        )
+    return _SessionContract(
+        input_name=spec.name,
+        size=size,
+        outputs=tuple(output.name for output in session.get_outputs()),
+    )
+
+
 def _session_input_size(session):
     """Resolução de entrada: a do arquivo, se fixa; senão _INPUT_SIZE."""
-    shape = session.get_inputs()[0].shape
-    if len(shape) > 2 and isinstance(shape[2], int) and shape[2] > 0:
-        return shape[2]
-    return _INPUT_SIZE
+    return _session_contract(session).size[0]
 
 
 def _order_corners(points):
@@ -511,7 +592,8 @@ class NeuralSheetDetector:
     def __init__(self, model_path):
         self.model_path = str(model_path)
         self._session = None
-        self._resolved_input_size = None
+        self._contract = None
+        self._contract_session = None
         self._edge_lines = None
         self._memory_mask = None
         self.last_presence_logit = None
@@ -521,6 +603,19 @@ class NeuralSheetDetector:
         if self._session is None:
             self._session = _load_session(self.model_path)
         return self._session
+
+    def contract(self):
+        """O contrato do arquivo carregado (nome da entrada, resolução).
+
+        É lido uma vez por sessão. Um teste que injeta a sessão em
+        _session (sem passar pelo disco) continua funcionando: o
+        contrato é resolvido da sessão em uso, não do caminho.
+        """
+        session = self._get_session()
+        if self._contract is None or self._contract_session is not session:
+            self._contract = _session_contract(session)
+            self._contract_session = session
+        return self._contract
 
     def load(self):
         """Carrega a sessão agora, para erro de modelo falhar cedo."""
@@ -574,35 +669,65 @@ class NeuralSheetDetector:
         O SegFormer de quatro classes exporta apenas logits semânticos;
         nesse caso, papel e tinta formam a região da folha (a mão continua
         excluída) e a própria área prevista fornece um sinal de presença.
+
+        O nome da entrada e a lista de saídas vêm do arquivo
+        (contract()), nunca de literais: um export com entrada
+        "input" ou com uma saída auxiliar a mais deixa de quebrar no
+        primeiro frame. Um mask_logits de quatro canais é lido pelo
+        argmax (papel + tinta), não mais como fundo x classe 1.
         """
         session = self._get_session()
-        if self._resolved_input_size is None:
-            self._resolved_input_size = _session_input_size(session)
-        size = self._resolved_input_size
+        contract = self.contract()
+        input_h, input_w = contract.size
         frame_h, frame_w = frame.shape[:2]
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         resized = cv2.resize(
             rgb,
-            (size, size),
+            (input_w, input_h),
             interpolation=cv2.INTER_LINEAR,
         ).astype(np.float32)
         tensor = ((resized / 255.0 - _MEAN) / _STD).transpose(2, 0, 1)
         tensor = tensor[None].astype(np.float32)
-        output_names = [output.name for output in session.get_outputs()]
-        outputs = session.run(output_names, {"image": tensor})
+        output_names = list(contract.outputs)
+        outputs = session.run(output_names, {contract.input_name: tensor})
         by_name = dict(zip(output_names, outputs))
 
         if "mask_logits" in by_name and "presence_logit" in by_name:
             logits = by_name["mask_logits"]
-            channel_bg, channel_paper = logits[0, 0], logits[0, 1]
-            peak = np.maximum(channel_bg, channel_paper)
-            exp_bg = np.exp(channel_bg - peak)
-            exp_paper = np.exp(channel_paper - peak)
-            probability = exp_paper / (exp_bg + exp_paper)
-            mask_small = (probability > _MASK_THRESHOLD).astype(np.uint8)
-            presence = float(by_name["presence_logit"][0])
+            presence = by_name["presence_logit"]
+            if logits.ndim != 4:
+                raise ValueError(
+                    "saída 'mask_logits' precisa ter forma [N, C, H, W]; "
+                    f"veio {logits.shape}"
+                )
+            channels = int(logits.shape[1])
+            if channels == 2:
+                # canais do contrato legado: 0 = fundo, 1 = papel.
+                # prob(papel) > 0,5 <=> exp_papel > exp_fundo <=>
+                # logit_papel > logit_fundo: o softmax de dois canais
+                # que existia aqui dava a mesma máscara e custava um
+                # exp sobre 2 x lado x lado por frame.
+                mask_small = (
+                    logits[0, 1] > logits[0, 0]
+                ).astype(np.uint8)
+            elif channels == 4:
+                # Export híbrido: máscara semântica de quatro classes
+                # com cabeça de presença treinada. Antes, esta forma
+                # era lida em silêncio como fundo x classe 1 (máscara
+                # errada, sem erro nenhum).
+                classes = np.argmax(logits[0], axis=0)
+                mask_small = (
+                    (classes == _PAPER_CLASS) | (classes == _INK_CLASS)
+                ).astype(np.uint8)
+            else:
+                raise ValueError(
+                    "saída 'mask_logits' precisa ter 2 canais "
+                    "(fundo, papel) ou 4 (fundo, papel, mão, tinta); "
+                    f"veio {channels}"
+                )
+            self.last_presence_logit = float(presence[0])
             self.last_paper_fraction = float(mask_small.mean())
-        elif output_names == ["logits"]:
+        elif "logits" in by_name:
             logits = by_name["logits"]
             if logits.ndim != 4 or logits.shape[0] != 1 or logits.shape[1] != 4:
                 raise ValueError(
@@ -624,7 +749,7 @@ class NeuralSheetDetector:
         else:
             raise ValueError(
                 "saídas ONNX incompatíveis: esperava 'mask_logits' e "
-                "'presence_logit' ou apenas 'logits' com quatro classes; "
+                "'presence_logit' ou 'logits' com quatro classes; "
                 f"recebi {output_names}"
             )
 
