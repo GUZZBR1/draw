@@ -1,6 +1,6 @@
 # Kaggle capture pool — audit and release record
 
-**State:** local preflight approved; Kaggle create was accepted for asynchronous private creation, but the exact slug is absent from `datasets list --mine`; remote publication remains unverified.
+**State:** Kaggle release verified. `guzzbr/draw-real-capture-pool-v1` exists as dataset ID `13001954`, version `1`, status `ready`, and `isPrivate: true`. The complete remote file set (5,387 files; 213,839,598 bytes) matches the local release by name, size, and SHA-256.
 **Branch:** `training-zone`
 **Candidate:** `guzzbr/draw-real-capture-pool-v1`
 **Local release ID:** `20261031-v4-preflight`
@@ -64,17 +64,17 @@ Both ZIPs passed archive integrity checks and contain 5,086 JPEGs and 297 masks,
 - [x] Manifest records all three review passes and upload eligibility.
 - [x] Kaggle title shortened to satisfy the platform's 6–50 character limit; `isPrivate: true` retained.
 - [x] Submit one private Kaggle create request after all reviews passed; no public flag was used.
-- [x] Perform the final exact account-list check: slug absent. `status/files/metadata` returned 403.
-- [ ] Remote existence, privacy, version, file sizes, and downloaded hashes remain **unverified**; stop without retrying create/update.
-- [ ] After upload, verify remote privacy, version, file list/sizes, and downloaded archive hashes; record remote version here.
+- [x] Initial exact account-list check recorded the slug as absent; after refreshing OAuth, `kaggle datasets list --mine --sort-by updated` shows it.
+- [x] Remote existence, privacy (`isPrivate: true`), version (`1`), status (`ready`), file list, sizes, and downloaded SHA-256 values verified.
+- [x] After-upload verification completed against all 5,387 remote files; detailed per-file hashes are in `.kaggle-staging/remote-audit-20261101/verified-file-hashes.json`.
 
 ## Known limitations
 
 The package is exploratory. Pseudo-masks have only thumbnail-level triage, fine ink boundaries are not pixel-verified, and 255 is ignored. The user-provided scene descriptions/tags are absent for these frames. The previous training session is not a holdout. This release does not support real-world quality claims or supervised ground-truth evaluation.
 
-## Follow-up audit — 2026-10-31
+## Initial blocked audit — 2026-10-31 (superseded)
 
-**Result: blocked before any Kaggle create/update.** The earlier asynchronous create response still cannot be resolved into a verified remote dataset. No duplicate create was attempted, and no existing dataset was updated.
+**Historical result:** at this stage the earlier asynchronous create response could not be resolved. The final verification below supersedes the blocked state. No duplicate create was attempted.
 
 Fresh Kaggle CLI 2.2.4 queries from `training-zone` returned:
 
@@ -93,9 +93,9 @@ Local read-only checks reconfirmed the six staged package-file SHA-256 values an
 
 This audit was recorded on local `training-zone` HEAD `670031da361cee01abbc62f183347984ba77b98a` before the follow-up commit. The worktree was clean before this documentation change; it was already two commits ahead of `origin/training-zone`. No push was performed.
 
-## Additional recheck — 2026-10-31 22:09 BRT
+## Additional recheck — 2026-10-31 22:09 BRT (before credential-cache inspection)
 
-The follow-up recheck found no `KAGGLE_API_TOKEN`, `~/.kaggle/access_token`, or `~/.kaggle/kaggle.json`, but `kaggle auth login` reports an existing CLI-managed session for `guzzbr` and `kaggle auth print-access-token` succeeds. The token value was not displayed or recorded. Despite that session, `datasets list --mine` and exact slug search still return no results; candidate `status` says authentication is required and candidate `files`/`metadata` still return HTTP 403. Opening the public URL `https://www.kaggle.com/datasets/guzzbr/draw-real-capture-pool-v1` returns Kaggle's “We can't find that page” / HTTP 404. That public response does not establish absence of a private dataset.
+This historical check found no `KAGGLE_API_TOKEN`, `~/.kaggle/access_token`, or `~/.kaggle/kaggle.json`; it did not inspect the modern `~/.kaggle/credentials.json` file. `kaggle auth login` reported an existing CLI-managed session for `guzzbr`, but the cached access token was stale. At that time, list/search had no result, `status` requested authentication, and files/metadata returned 403. An unauthenticated browser returned 404, which did not establish absence of a private dataset. The final resolution below supersedes these observations.
 
 The plan's metadata query was also attempted for all listed datasets. `guzzbr/drawink-corpus` metadata and its first page of files were readable; metadata requests for the other listed slugs returned HTTP 403. File-list requests for `guzzbr/draw-real-seg-pilot-v1` and `guzzbr/draw-realbg-v2` also returned HTTP 403. The public corpus is unchanged and is not eligible for a re-upload; the capture pool has a distinct review-only contract and must remain private. No Kaggle dataset version was confirmed, and no create/update was attempted.
 
@@ -110,3 +110,47 @@ An OAuth refresh with `kaggle auth login --force --no-launch-browser` could not 
 ## CLI 2.2.5 recheck — 2026-10-31
 
 To rule out the installed CLI patch-level warning, the same candidate queries were run with an isolated `pipx run --spec kaggle==2.2.5` invocation. `datasets list --mine` and exact search again returned no results; `status` again required authentication; `files` and `metadata` returned HTTP 403 with “You don't have access to this resource.” The CLI upgrade did not change the result. The OAuth access token and any verification code were not written to the repository or this report. Candidate absence, privacy, and remote file contents remain unverified; do not create a duplicate or update any dataset until Kaggle account/API access is corrected.
+
+## Final resolution and remote verification — 2026-11-01
+
+This section supersedes the earlier blocked findings.
+
+### Cause and fix
+
+The working OAuth credentials were in `~/.kaggle/credentials.json` (mode `0600`), owned by `guzzbr` with scope `resources.admin:*`. Its cached access token expired at `2026-11-01T01:00:50Z`. At the time of the first failing requests it was about 16 minutes past expiration. The installed Kaggle CLI's `KaggleCredentials.access_token_has_expired()` keeps using a token until its expiry is more than 30 minutes old, so the CLI continued sending a stale token and private dataset calls failed.
+
+I refreshed the cached access token through the CLI's installed `KaggleCredentials.refresh_access_token()` routine. The cache now expires at `2026-11-01T13:22:13Z`. The token value was not saved in the repository or report. Normal CLI queries now work, and `kaggle datasets list --mine --sort-by updated` includes the capture pool. Exact text search remains unreliable, but the direct status, metadata, and file endpoints confirm the dataset.
+
+### Capture pool
+
+| Check | Verified result |
+|---|---|
+| Slug / dataset ID | `guzzbr/draw-real-capture-pool-v1` / `13001954` |
+| Current version / status | `1` / `ready` |
+| Privacy / owner | `isPrivate: true` / `guzzbr` |
+| Remote file count / total file bytes | `5,387` / `213,839,598` |
+| File types | 5,086 JPEGs, 297 PNG pseudo-masks, 2 CSVs, 1 JSON, 1 Markdown file |
+| Local comparison | All 5,387 names, sizes, and SHA-256 hashes match the staged release |
+
+The full remote dataset was downloaded and compared against `images.zip`, `pseudo_masks.zip`, `README.md`, `dataset_manifest.json`, `frames.csv`, and `privacy_exclusions.csv` in `.kaggle-staging/release-v4-preflight/`. There were zero missing files, extra files, size mismatches, or SHA-256 mismatches. The per-file hash inventory is `.kaggle-staging/remote-audit-20261101/verified-file-hashes.json` (SHA-256 `ed2fb83d2d2ae5c65e8f20ca830610d251205dfca0235b00e9e6956df9dd2709`); the paginated file-list inventory is `files.json` (SHA-256 `eece4344526d5b1cc7eeded58f88dcb4fc2b48076a31a97d3c9da192aed48a6c`); the summary audit is `dataset-audit.json` (SHA-256 `cbded7e6757f2d69e017c21f05c9badf777fdc8508760936f974f2a61aa959ed`). These local ignored audit artifacts contain no credentials.
+
+The remote files preserve the intended contract: 5,086 original JPEGs; 297 separate exploratory pseudo-masks; 4,789 frames without masks; no human ground truth; no train/validation/test or holdout split. Scene descriptions remain metadata and are not pixel masks.
+
+### Other planned datasets
+
+Authenticated metadata and status queries confirmed these versions and privacy states. No other update was eligible: the review pool has a distinct contract; 297 of its image/mask pairs overlap the pilot, so the sets must not be merged automatically; the background holdout remains unchanged; and no new synthetic data or reviewed temporal labels were available.
+
+| Slug | Current version | Privacy | Action |
+|---|---:|---|---|
+| `guzzbr/draw-real-seg-pilot-v1` | 1 | Private | Unchanged; exploratory pseudo-label contract |
+| `guzzbr/draw-ink-real-v1` | 1 | Private | Unchanged; no new compatible package |
+| `guzzbr/draw-realbg-v2` | 1 | Private | Unchanged; holdout preserved |
+| `guzzbr/draw-ink-synth-v1` | 2 | Private | Unchanged; no material new synthetic data |
+| `guzzbr/draw-ink-pairs-v1` | 1 | Private | Unchanged; no reviewed temporal delta labels |
+| `guzzbr/draw-segformer-expert-pilot-v1` | 1 | Private | Unchanged; no new adjudicated samples |
+| `guzzbr/draw-drawfmt-v1` | 1 | Private | Unchanged; source licensing constraints preserved |
+| `guzzbr/drawink-corpus` | 1 | Public | Unchanged; no new redistributable corpus content |
+| `guzzbr/drawink-corpus-full` | 1 | Private | Unchanged; no redistribution |
+| `guzzbr/drawink-corpus-pilot` | 1 | Private | Unchanged; no compatible new package |
+
+The capture-pool release was already created and verified as version 1, so no duplicate create or content-identical update was submitted. No kernel or training job was started. No push was performed.
