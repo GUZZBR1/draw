@@ -92,3 +92,11 @@ Consequently, available queries do not verify that the candidate is absent, nor 
 Local read-only checks reconfirmed the six staged package-file SHA-256 values and both ZIP integrity checks. The staged `dataset-metadata.json` still declares `isPrivate: true`; this is local intent only, not evidence of remote privacy. Contents remain 5,086 original JPEGs, 297 separate exploratory pseudo-masks, and 4,789 unlabeled frames. Scene labels are not pixel masks, there are no human ground-truth masks, and all samples remain review-only. No kernel or training job was started.
 
 This audit was recorded on local `training-zone` HEAD `670031da361cee01abbc62f183347984ba77b98a` before the follow-up commit. The worktree was clean before this documentation change; it was already two commits ahead of `origin/training-zone`. No push was performed.
+
+## Additional recheck — 2026-10-31 22:09 BRT
+
+The follow-up recheck found no Kaggle credentials in this environment: `KAGGLE_API_TOKEN`, `~/.kaggle/access_token`, and `~/.kaggle/kaggle.json` are absent. `datasets list --mine` and exact slug search still return no results; candidate `status` requires authentication and candidate `files`/`metadata` still return HTTP 403. Opening the public URL `https://www.kaggle.com/datasets/guzzbr/draw-real-capture-pool-v1` returns Kaggle's “We can't find that page” / HTTP 404. That public response does not establish absence of a private dataset.
+
+The plan's metadata query was also attempted for all listed datasets. `guzzbr/drawink-corpus` metadata and its first page of files were readable; metadata requests for the other listed slugs returned HTTP 403. File-list requests for `guzzbr/draw-real-seg-pilot-v1` and `guzzbr/draw-realbg-v2` also returned HTTP 403. The public corpus is unchanged and is not eligible for a re-upload; the capture pool has a distinct review-only contract and must remain private. No Kaggle dataset version was confirmed, and no create/update was attempted.
+
+The local release hashes, byte sizes, ZIP integrity, and `isPrivate: true` metadata were rechecked again. The main checkout remains on `main` with its existing local changes; this recheck changed only this report on `training-zone`. The documented access blocker still prevents verifying candidate existence/privacy/files or safely updating another dataset.
