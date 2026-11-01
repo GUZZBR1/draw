@@ -2,11 +2,11 @@
 
 **Data:** 2026-10-31  
 **Branch-alvo:** `training-zone`  
-**Objetivo:** preparar e publicar revisões privadas, rastreáveis e corretamente rotuladas dos datasets Draw que podem ser montados com os dados locais e remotos existentes. Este plano não autoriza iniciar kernels de treino.
+**Objetivo:** preparar revisões privadas e rastreáveis dos datasets Draw e, quando os gates da etapa de treino abaixo passarem, executar um treino Kaggle privado de segmentação single-frame. A detecção temporal continua sendo uma tarefa e um dataset separados.
 
 ## Instrução para o chat executor
 
-Leia este documento inteiro antes de agir. Trabalhe somente no worktree da branch `training-zone`; não mude nem transporte alterações da `main`. Pode preparar, validar e criar/atualizar datasets privados no Kaggle usando os dados descritos aqui, pois isso foi pedido pelo usuário. **Não inicie kernels nem treine modelos nesta tarefa.** Preserve os originais, não publique dados da webcam como públicos e não chame pseudo-rótulos de ground truth.
+Leia este documento inteiro antes de agir. Trabalhe somente no worktree da branch `training-zone`; não mude nem transporte alterações da `main`. Preserve os originais, não publique dados da webcam como públicos e não chame pseudo-rótulos de ground truth. A autorização atual permite iniciar somente kernels privados de treino, e somente após todos os gates da seção 10 passarem. Não publique novos datasets nem altere versões de dataset sem necessidade documentada.
 
 Antes de qualquer upload, faça o preflight local abaixo. Se um artefato falhar, publique somente os pacotes que passaram e registre o bloqueio dos outros. Não remova dados, não substitua uma versão anterior sem manter uma revisão rastreável e não altere datasets públicos.
 
@@ -26,7 +26,7 @@ Rótulos de cena (por exemplo, “mão escrevendo”) servem para filtrar e estr
 - O checkout principal continua em `main`, 5 commits à frente de `origin/main`, com alterações locais preexistentes. Não trocar a branch principal, não fazer cherry-pick delas e não as limpar.
 - Todo código, documentação, configuração, manifestos de pacote e commits desta tarefa ficam em `training-zone`. Capturas privadas volumosas e checkpoints não entram no Git.
 - A pasta de capturas atualmente está no checkout principal em `/home/gusta/projetos/coimbra/draw/captures/`; leia-a como fonte. Gere pacote temporário dentro do worktree `training-zone`, mantendo os JPEGs originais intactos.
-- Não fazer push de branch/commit sem pedido explícito. Kaggle dataset upload/update foi solicitado nesta tarefa, mas kernel launch/treino não.
+- Não fazer push de branch/commit sem pedido explícito. A autorização de treino é condicionada à seção 10 e não autoriza ativação do modelo na câmera ao vivo.
 
 ## 3. Inventário verificado
 
@@ -107,7 +107,7 @@ O preflight deve falhar fechado e gerar relatório JSON/CSV:
 3. Atualizar `draw-real-seg-pilot-v1` somente se o conteúdo mantiver o mesmo contrato e a revisão explicitar que são pseudo-labels exploratórios. Não fundir automaticamente as 719 imagens antigas com 5.086 frames novos; primeiro cruzar hashes e preservar os dois manifestos de origem.
 4. Não atualizar o holdout `draw-realbg-v2` com dados de treino. Não incorporar novos pares reais ao `draw-ink-pairs-v1` sem rótulos temporais revisados; criar pacote temporal privado separado para pares sem rótulo/revisão.
 5. Não copiar material do `drawink-corpus-full`, CVL, DIBCO ou DocUNet para uma edição pública sem autorização/licença verificada por fonte.
-6. Publicação Kaggle só ocorre depois dos gates da etapa C. A instrução desta tarefa autoriza criar/atualizar **datasets** privados; não autoriza publicar dados públicos nem iniciar kernel/treino.
+6. Publicação Kaggle só ocorre depois dos gates da etapa C. A instrução original autorizava criar/atualizar datasets privados; a autorização atual permite apenas kernels privados após a seção 10 e não permite publicar dados públicos.
 7. Após upload, verificar `kaggle datasets files`, versão, privacidade, tamanhos e hashes por download amostral ou integral conforme viável. Guardar slug, version number, arquivo-lista, hashes e logs no relatório local.
 
 ### Etapa E — fechamento local
@@ -115,7 +115,7 @@ O preflight deve falhar fechado e gerar relatório JSON/CSV:
 - Registrar no branch `training-zone` documentação, scripts reutilizáveis, schemas, relatórios e manifestos leves. Não versionar JPEGs, máscaras privadas grandes, tokens ou checkpoints pesados.
 - Commit local na branch `training-zone`; não fazer push sem pedido explícito.
 - Encerrar a tarefa com relatório: datasets criados/atualizados, versão e privacy, contagens por estado de anotação, hashes, preflight, arquivos não enviados e motivo.
-- Não iniciar Kaggle kernel. O treino é tarefa posterior, com autorização separada.
+- A regra original de não iniciar kernel foi substituída pela autorização condicional da seção 10, concedida pelo usuário em 2026-11-01. Se qualquer gate falhar, registrar bloqueio e não iniciar treino.
 
 ## 6. Protocolo do Senado e critérios de decisão
 
@@ -164,4 +164,35 @@ Revisão de arquitetura, crítica adversarial e verificação são gates indepen
 
 ## 9. Resultado esperado desta execução
 
-Ao terminar, deve haver datasets privados Kaggle novos/atualizados e auditáveis **somente para os pacotes que passaram o preflight**, uma nota de release e evidência de verificação remota. Se os dados locais atuais não passarem como treino supervisionado (resultado esperado: não passam), publicar apenas pool de revisão/experimento com essa limitação clara. Nenhuma execução de kernel, treinamento ou alegação de qualidade real nesta tarefa.
+Ao terminar, deve haver evidência local auditável do preflight e, somente se a seção 10 passar, resultado de kernel privado. Se não houver dados compatíveis para qualidade real, nenhum resultado sintético ou pseudo-label deve ser apresentado como validação de câmera.
+
+## 10. Etapa F — treino Kaggle single-frame (autorização condicional)
+
+Esta etapa foi acrescentada em 2026-11-01. Ela autoriza um kernel privado somente quando os dados e o pipeline forem verificados antes da execução. O treino single-frame marca pixels visíveis de tinta (`classe 3`). Pares before/after, máscaras de delta e métricas temporais pertencem a outra tarefa; não os anexar nem comparar seus resultados com IoU de segmentação.
+
+### 10.1 Dados elegíveis e limites
+
+- A entrada elegível para esta rodada exploratória é `guzzbr/draw-synthetic-v1-part1` a `part8`, versões privadas 1. Os seis primeiros pacotes contêm 2.400 cenas de treino; `part7` e `part8` contêm 300 cenas de validação e 300 de teste, respectivamente. Cada cena tem imagem 512×512 e máscara por pixel com classes `0=background`, `1=paper`, `2=hand`, `3=ink`; `ink_full` é auxiliar e nunca é entrada/target do treino.
+- O `split_manifest.json` é obrigatório e deve conferir seed 42, IDs por cena e separação das fontes de fundo, mão e papel; não dividir ou embaralhar cenas depois. Falhar se houver sobreposição de fonte, pares ausentes, classe sem pixels ou máscara fora de `{0,1,2,3,255}`.
+- Os datasets são sintéticos. Resultado desta rodada é **exploratório/sintético**, não demonstra qualidade em câmera real e não recebe rótulo de avaliação humana.
+- `guzzbr/draw-real-capture-pool-v1` (5.086 frames, 297 pseudo-máscaras e 4.789 sem máscara) é somente revisão. Não anexar ao treino. `guzzbr/draw-real-seg-pilot-v1` (719 pseudo-rótulos) também fica fora desta rodada. Não usar cenas descritas, pseudo-máscaras ou consenso de agentes como ground truth.
+- `guzzbr/draw-ink-pairs-v1` é temporal e fica fora deste treino. `guzzbr/draw-realbg-v2` preserva seu papel de holdout e não deve ser aberto antes do fechamento das decisões de modelo. Não misturar `draw-ink-synth-v1` (rótulos de tinta/impressão em páginas documentais) com o contrato 4-classes desta rodada.
+
+### 10.2 Auditoria obrigatória pré-kernel
+
+Antes de `kaggle kernels push` ou outra execução, registrar para cada input utilizado: slug, versão atual, status `ready`, privacidade, metadata, listagem integral de nomes/tamanhos e SHA-256 do conteúdo baixado ou hash manifesto equivalente verificável. Para o dataset sintético, comparar todos os arquivos e tamanhos com os ZIPs baixados; conferir hashes por arquivo, integridade dos arquivos, dimensões, classes e contagens de split. Confirmar também a versão privada do cache `guzzbr/mit-b0-cache` e a fonte/código exatos do treino. Não incluir input cuja privacidade, conteúdo ou versão não possa ser confirmada.
+
+### 10.3 Critérios e comparação definidos antes do treino
+
+- Código registra seed 42 (Python, NumPy, PyTorch e CUDA), hash do código/configuração/manifesto, hash por arquivo e fingerprint do dataset, slugs/versões/privacidade dos inputs, ambiente/PyTorch/GPU, contagens de pixels e amostras, checkpoints, ONNX e hashes de saída.
+- Seleção de checkpoint usa somente `val_mean_iou`; `test` não participa de treino, early stopping, limiar, pesos ou seleção. Avaliar `test` uma vez, após selecionar o checkpoint, e reportar suas métricas separadamente.
+- Reportar em validação e teste sintéticos, por classe: IoU, Dice, precision e recall; reportar também precision/recall de tinta com tolerância de 2 e 3 px ao lado da IoU estrita. Não usar accuracy global como critério.
+- Baseline congelado antes desta rodada: execução `synthetic_only`, mesmo manifesto de 3.000 cenas (hash remoto `9ba05ab08ad5bf276a96b527777424b8e143958a31d192e7862d458af105c931`), 2.400 pares de treino; validação `mIoU=0.9177034868`, `IoU_ink=0.7433429512`, ONNX validado (`max_abs_diff=5.72e-05`, mínimo IoU de argmax 1,0). Comparar `novo - baseline` na validação; não usar o teste para decidir hiperparâmetros. Para leitura diagnóstica, avaliar baseline e candidato uma única vez no mesmo teste sintético, sem seleção posterior baseada nesse resultado.
+- Aceite técnico de exportação: ONNX Runtime efetivamente executado; `onnx_validation.status=ok`, `max_abs_diff <= 1e-3` e `min_argmax_iou >= 0.99`. Falta de ONNX Runtime, validação pulada, teste ausente ou hash/manifesto ausente significa **não validado**, nunca sucesso.
+- Gate comparativo pré-fixado: na validação, aceitar como candidato exploratório apenas se `mIoU >= baseline - 0.005` e `IoU_ink >= baseline - 0.01`, além do gate ONNX. Isso não autoriza integração ao vivo nem alegação real; qualquer falha mantém o baseline e registra o resultado como reprovado.
+
+### 10.4 Execução e artefatos
+
+- Executar em kernel `is_private=true`, GPU confirmada dentro do runtime e apenas com os oito chunks sintéticos e o cache privado de pesos necessários. O pool de revisão e o pacote real pseudo não são inputs. Não criar/atualizar datasets Kaggle para a rodada; não fazer push da branch.
+- Salvar `best.pt`, `last.pt`, `.onnx`, `classes.json`, `metrics.json`, `training_config.json`, `split_manifest.json`, `artifact_hashes.json`, inventário de hashes de input e log completo em output privado do kernel. Se CUDA, preflight, classes, hash, exportação ou validação ONNX falhar, parar e marcar execução como bloqueada/não validada.
+- Registrar kernel/versão/estado, datasets/versões/privacidade, splits/contagens, métricas por classe e baseline, teste sintético, hashes, limitações e próximo ciclo de anotação. Manter segmentação e detecção temporal em seções e métricas distintas.

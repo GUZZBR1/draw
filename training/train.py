@@ -38,9 +38,13 @@ métricas possam ser testados sem GPU e sem torch instalado.
 """
 
 import argparse
+import hashlib
+import importlib.metadata
 import json
 import math
 import os
+import platform
+import random
 import sys
 from pathlib import Path
 
@@ -64,6 +68,81 @@ def load_config(path):
     assert cfg["model"]["num_classes"] == NUM_CLASSES, "config deve ter 4 classes"
     assert len(cfg["loss"]["cross_entropy_class_weights"]) == NUM_CLASSES
     return cfg
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _package_exists(name):
+    try:
+        importlib.metadata.version(name)
+        return True
+    except importlib.metadata.PackageNotFoundError:
+        return False
+
+
+def hash_input_tree(root):
+    """Hash every file in a mounted dataset and return a stable inventory."""
+    root = Path(root)
+    files = []
+    for path in sorted(p for p in root.rglob("*") if p.is_file()):
+        files.append({
+            "path": path.relative_to(root).as_posix(),
+            "bytes": path.stat().st_size,
+            "sha256": sha256_file(path),
+        })
+    canonical = json.dumps(files, sort_keys=True, separators=(",", ":")).encode()
+    return {
+        "root": str(root),
+        "file_count": len(files),
+        "total_bytes": sum(item["bytes"] for item in files),
+        "inventory_sha256": hashlib.sha256(canonical).hexdigest(),
+        "files": files,
+    }
+
+
+def validate_source_splits(manifest_path, expected_counts):
+    """Require a generator manifest and disjoint original sources per split."""
+    path = Path(manifest_path)
+    if not path.is_file():
+        raise ValueError("split_manifest.json é obrigatório para treino Kaggle rastreável")
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    scenes = manifest.get("scenes")
+    if not isinstance(scenes, list):
+        raise ValueError("split_manifest.json precisa conter scenes")
+    scene_counts = {split: sum(x.get("split") == split for x in scenes) for split in ("train", "val", "test")}
+    if scene_counts != expected_counts:
+        raise ValueError(f"contagem do split_manifest diverge dos arquivos: {scene_counts} != {expected_counts}")
+    source_splits = manifest.get("splits")
+    if not isinstance(source_splits, dict) or not source_splits:
+        raise ValueError("split_manifest.json precisa identificar fontes originais por split")
+    for source_kind, splits in source_splits.items():
+        if not all(isinstance(splits.get(split), list) for split in ("train", "val", "test")):
+            raise ValueError(f"fontes incompletas no split_manifest: {source_kind}")
+        sets = {split: set(splits[split]) for split in ("train", "val", "test")}
+        for left, right in (("train", "val"), ("train", "test"), ("val", "test")):
+            overlap = sets[left] & sets[right]
+            if overlap:
+                raise ValueError(f"vazamento de fonte {source_kind} entre {left}/{right}: {sorted(overlap)[:3]}")
+    scene_source_fields = {
+        "backgrounds": "background_source",
+        "hands": "hand_source",
+        "papers": "paper_source",
+    }
+    for scene in scenes:
+        split = scene.get("split")
+        if split not in ("train", "val", "test"):
+            raise ValueError(f"split inválido em scene {scene.get('id')}: {split}")
+        for kind, field in scene_source_fields.items():
+            source = scene.get(field)
+            if source is not None and kind in source_splits and source not in source_splits[kind][split]:
+                raise ValueError(f"fonte {field} da scene {scene.get('id')} diverge do split_manifest")
+    return manifest
 
 
 # ---------------------------------------------------------------- dataset
@@ -425,6 +504,23 @@ def evaluate(model, loader, device):
     return metrics
 
 
+def require_valid_evaluation(metrics, split_name):
+    """Fail closed when an evaluation has missing support or invalid metrics."""
+    if not isinstance(metrics, dict) or metrics.get("supervised_px", 0) <= 0:
+        raise ValueError(f"split {split_name} sem pixels supervisionados")
+    if metrics.get("mean_iou") is None or not math.isfinite(metrics["mean_iou"]):
+        raise ValueError(f"split {split_name} sem mean_iou válido")
+    for class_name in CLASSES.values():
+        class_metrics = metrics.get(class_name)
+        if not isinstance(class_metrics, dict) or class_metrics.get("iou") is None:
+            raise ValueError(f"split {split_name} sem suporte IoU para classe {class_name}")
+        for metric_name in ("iou", "dice", "precision", "recall"):
+            value = class_metrics.get(metric_name)
+            if value is None or not math.isfinite(value):
+                raise ValueError(f"split {split_name} com {metric_name} inválida para {class_name}")
+    return metrics
+
+
 # ---------------------------------------------------------------- ONNX
 def _make_onnx_dummy(model, size):
     """Create the export sample on the same device as the model parameters."""
@@ -559,6 +655,7 @@ def smoke(smoke_dir):
     weights = compute_class_weights(counts)
     assert len(weights) == NUM_CLASSES and all(w > 0 for w in weights), weights
     pred = load_mask(mask_dir / "scene_0001.png")
+    pred[pred == IGNORE_INDEX] = 0  # predições são classes 0..3, nunca ignore
     # Predição perfeita exceto 1 px de tinta deslocado: IoU estrita cai,
     # tolerância de 2-3 px deve recuperar.
     pred_shifted = pred.copy()
@@ -637,7 +734,9 @@ def smoke(smoke_dir):
                 return _Output(eval_logits.to(pixel_values.device))
 
         images_t = torch.zeros((1, 3, 64, 64), dtype=torch.float32)
-        eval_metrics = evaluate(_FixedModel(), [(images_t, target_t)], "cpu")
+        eval_metrics = require_valid_evaluation(
+            evaluate(_FixedModel(), [(images_t, target_t)], "cpu"), "smoke"
+        )
         assert eval_metrics["ink"]["iou"] == 1.0, eval_metrics["ink"]
         assert eval_metrics["ink"]["support_px"] == 36, eval_metrics["ink"]
         assert eval_metrics["supervised_px"] == 64 * 64 - ignored, eval_metrics
@@ -670,6 +769,13 @@ def main(argv=None):
         help="Diretório opcional com images/ e masks/ para adicionar ao treino sintético; val/test continuam em --data-dir.",
     )
     parser.add_argument("--out-dir", default="out")
+    parser.add_argument(
+        "--dataset-provenance-json",
+        default=None,
+        help="JSON com slugs/versões/privacidade dos inputs Kaggle usados.",
+    )
+    parser.add_argument("--baseline-metrics-json", default=None, help="Métricas congeladas do baseline, somente para comparação na validação.")
+    parser.add_argument("--require-cuda", action="store_true", help="Falha antes do treino se CUDA/GPU estiver ausente.")
     parser.add_argument("--smoke", action="store_true", help="Smoke test sem GPU, sem treino.")
     parser.add_argument("--smoke-dir", default="/tmp/draw-smoke")
     parser.add_argument("--epochs", type=int, default=None)
@@ -687,10 +793,22 @@ def main(argv=None):
     epochs = args.epochs or tr["epochs"]
     batch_size = args.batch_size or tr["batch_size"]
     torch.manual_seed(tr["seed"])
+    random.seed(tr["seed"])
     np.random.seed(tr["seed"])
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(tr["seed"])
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    if args.require_cuda and device != "cuda":
+        raise RuntimeError("GPU CUDA requerida para este kernel; treino não iniciado")
     if device == "cpu":
         print("AVISO: sem GPU; o treino completo em CPU é inviável. Use o Kaggle com GPU.", file=sys.stderr)
+
+    config_path = Path(args.config)
+    data_root = Path(args.data_dir)
+    manifest_path = data_root / "split_manifest.json"
+    input_fingerprint = hash_input_tree(data_root)
 
     out_dir = Path(args.out_dir)
     (out_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
@@ -700,13 +818,30 @@ def main(argv=None):
         if (real_root / "train" / "images").is_dir():
             real_root = real_root / "train"
         real_pairs = pair_images_masks(real_root)
-    synthetic_train_pairs = pair_images_masks(Path(args.data_dir) / "train")
+    synthetic_train_pairs = pair_images_masks(data_root / "train")
+    synthetic_val_pairs = pair_images_masks(data_root / "val")
+    synthetic_test_pairs = pair_images_masks(data_root / "test")
+    split_counts = {
+        "train": len(synthetic_train_pairs),
+        "val": len(synthetic_val_pairs),
+        "test": len(synthetic_test_pairs),
+    }
+    source_manifest = validate_source_splits(manifest_path, split_counts)
+    split_pixel_counts = {
+        split: pixel_counts(pairs).tolist()
+        for split, pairs in (("train", synthetic_train_pairs), ("val", synthetic_val_pairs), ("test", synthetic_test_pairs))
+    }
+    for split, counts_for_split in split_pixel_counts.items():
+        if any(count <= 0 for count in counts_for_split):
+            raise ValueError(f"split {split} não tem pixel válido para cada uma das quatro classes: {counts_for_split}")
     train_ds = build_dataset(
         args.data_dir, "train", cfg, augment=True, extra_pairs=real_pairs
     )
     val_ds = build_dataset(args.data_dir, "val", cfg, augment=False)
+    test_ds = build_dataset(args.data_dir, "test", cfg, augment=False)
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=tr["num_workers"])
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=tr["num_workers"])
+    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=tr["num_workers"])
     train_pairs = synthetic_train_pairs + real_pairs
     counts = pixel_counts(train_pairs)
     print(
@@ -762,26 +897,69 @@ def main(argv=None):
     except Exception as exc:  # noqa: BLE001 - registrar, não perder o treino
         print(f"AVISO: exportação ONNX falhou ({exc}); métricas serão escritas sem ONNX.", file=sys.stderr)
         onnx_check = {"status": "failed", "error": str(exc)}
-    final_metrics = evaluate(model, val_loader, device)
+    final_metrics = require_valid_evaluation(evaluate(model, val_loader, device), "val")
+    # O teste só é aberto uma vez, após seleção do checkpoint por val_mean_iou.
+    final_metrics["test"] = require_valid_evaluation(evaluate(model, test_loader, device), "test")
     final_metrics["onnx_validation"] = onnx_check
     final_metrics["history"] = history
     final_metrics["train_pixel_counts"] = counts.tolist()
+    final_metrics["split_pixel_counts"] = split_pixel_counts
+    if args.baseline_metrics_json:
+        baseline = json.loads(Path(args.baseline_metrics_json).read_text(encoding="utf-8"))
+        baseline_mean = baseline.get("mean_iou")
+        baseline_ink = baseline.get("ink", {}).get("iou")
+        candidate_mean = final_metrics.get("mean_iou")
+        candidate_ink = final_metrics.get("ink", {}).get("iou")
+        if None in (baseline_mean, baseline_ink, candidate_mean, candidate_ink):
+            raise ValueError("baseline/candidato sem mean_iou ou ink IoU para comparação")
+        delta_mean = candidate_mean - baseline_mean
+        delta_ink = candidate_ink - baseline_ink
+        final_metrics["baseline_comparison"] = {
+            "scope": "synthetic validation only; test was not used for selection",
+            "baseline_mean_iou": baseline_mean,
+            "candidate_mean_iou": candidate_mean,
+            "delta_mean_iou": delta_mean,
+            "baseline_ink_iou": baseline_ink,
+            "candidate_ink_iou": candidate_ink,
+            "delta_ink_iou": delta_ink,
+            "criteria": {"mean_iou_min": baseline_mean - 0.005, "ink_iou_min": baseline_ink - 0.01},
+            "gate_pass": candidate_mean >= baseline_mean - 0.005 and candidate_ink >= baseline_ink - 0.01,
+        }
     final_metrics["train_source_counts"] = {
         "synthetic": len(synthetic_train_pairs),
         "real": len(real_pairs),
     }
     cfg["data_sources"] = {
-        "synthetic_root": str(Path(args.data_dir)),
+        "synthetic_root": str(data_root),
         "real_train_root": str(Path(args.real_train_dir)) if args.real_train_dir else None,
         "train_pair_counts": final_metrics["train_source_counts"],
-        "validation_and_test_source": "synthetic --data-dir only",
+        "validation_source": "synthetic --data-dir val only",
+        "test_source": "synthetic --data-dir test, evaluated once after checkpoint selection",
+    }
+    if args.dataset_provenance_json:
+        cfg["dataset_provenance"] = json.loads(Path(args.dataset_provenance_json).read_text(encoding="utf-8"))
+    cfg["reproducibility"] = {
+        "seed": tr["seed"],
+        "python": platform.python_version(),
+        "platform": platform.platform(),
+        "packages": {
+            name: (importlib.metadata.version(name) if _package_exists(name) else None)
+            for name in ("torch", "transformers", "numpy", "opencv-python", "onnx", "onnxruntime")
+        },
+        "device": device,
+        "gpu_name": torch.cuda.get_device_name(0) if device == "cuda" else None,
+        "code_sha256": sha256_file(Path(__file__).resolve()),
+        "config_sha256": sha256_file(config_path),
+        "input_fingerprint": input_fingerprint,
+        "split_manifest_sha256": sha256_file(manifest_path),
+        "split_counts": split_counts,
     }
 
     (out_dir / "classes.json").write_text(json.dumps(CLASSES, indent=2), encoding="utf-8")
     (out_dir / "metrics.json").write_text(json.dumps(final_metrics, indent=2), encoding="utf-8")
     (out_dir / "training_config.json").write_text(json.dumps(cfg, indent=2), encoding="utf-8")
     # split_manifest: cópia validada, se o gerador a forneceu.
-    manifest_src = Path(args.data_dir) / "split_manifest.json"
+    manifest_src = manifest_path
     if manifest_src.exists():
         split_manifest = json.loads(manifest_src.read_text(encoding="utf-8"))
     else:
@@ -793,6 +971,16 @@ def main(argv=None):
     (out_dir / "split_manifest.json").write_text(
         json.dumps(split_manifest, indent=2), encoding="utf-8"
     )
+    artifact_paths = [
+        out_dir / "classes.json", out_dir / "metrics.json", out_dir / "training_config.json",
+        out_dir / "split_manifest.json", out_dir / "checkpoints" / "best.pt",
+        out_dir / "checkpoints" / "last.pt", onnx_path,
+    ]
+    artifact_hashes = {
+        p.relative_to(out_dir).as_posix(): {"bytes": p.stat().st_size, "sha256": sha256_file(p)}
+        for p in artifact_paths if p.is_file()
+    }
+    (out_dir / "artifact_hashes.json").write_text(json.dumps(artifact_hashes, indent=2), encoding="utf-8")
     print(f"ONNX: {onnx_path} | métricas: {out_dir / 'metrics.json'} | val_mean_iou: {final_metrics['mean_iou']:.4f}")
     if onnx_check.get("status") != "ok":
         print(
