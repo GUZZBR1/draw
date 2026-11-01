@@ -40,7 +40,7 @@ _PROJECT_ROOT = str(Path(__file__).resolve().parents[1])
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
-from draw import export as stroke_export
+from draw import export as stroke_export  # noqa: E402
 
 SHEET_SCALE = stroke_export.sheet_scale(paper="A4")
 PAPER_W_PX = SHEET_SCALE.canvas_width_px

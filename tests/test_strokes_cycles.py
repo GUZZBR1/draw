@@ -9,7 +9,6 @@ descartados pelo min_length=15, e a cena sintética reportava só
 é travada aqui com formas isoladas, sem webcam.
 """
 
-import math
 import sys
 from pathlib import Path
 

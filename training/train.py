@@ -40,7 +40,6 @@ métricas possam ser testados sem GPU e sem torch instalado.
 import argparse
 import json
 import math
-import os
 import sys
 from pathlib import Path
 
@@ -50,7 +49,7 @@ import numpy as np
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
-from tools import seg_metrics as shared_metrics
+from tools import seg_metrics as shared_metrics  # noqa: E402
 
 CLASSES = {0: "background", 1: "paper", 2: "hand", 3: "ink"}
 NUM_CLASSES = 4
@@ -65,7 +64,7 @@ IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 def load_config(path):
     with open(path, encoding="utf-8") as f:
         cfg = json.load(f)
-    tr = cfg["training"]
+    assert "training" in cfg, "config sem bloco training"
     assert cfg["model"]["num_classes"] == NUM_CLASSES, "config deve ter 4 classes"
     assert len(cfg["loss"]["cross_entropy_class_weights"]) == NUM_CLASSES
     return cfg

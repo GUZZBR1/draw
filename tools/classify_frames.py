@@ -354,7 +354,6 @@ def main() -> int:
         frame_count = int(acc["frames"])
         cats = acc["categories"]
         paper_fraction = acc["paper"] / frame_count if frame_count else 0
-        quality_fraction = acc["quality"] / frame_count if frame_count else 0
         clip_count = sum(value for name, value in cats.items() if name.startswith("paper_") or name in {"printed_paper", "hand_over_paper", "hand_elsewhere", "pen_without_hand"})
         clip_fraction = clip_count / frame_count if frame_count else 0
         if clip_state is not None:

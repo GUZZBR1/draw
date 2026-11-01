@@ -12,7 +12,6 @@ com a justificativa medida. Nenhum limiar é alterado aqui.
 import sys
 from pathlib import Path
 
-import cv2
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
