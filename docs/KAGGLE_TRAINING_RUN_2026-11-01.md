@@ -1,6 +1,6 @@
 # Kaggle single-frame segmentation training — 2026-11-01
 
-**State:** private kernel `guzzbr/draw-segformer-synthetic-only-20261101`, version 2, was accepted and reported `RUNNING` by Kaggle. Version 1 failed before completing an epoch and produced no model artifacts. No result is claimed until version 2 reaches a terminal state and its metrics, ONNX validation, and artifact hashes are checked.
+**State:** private kernel `guzzbr/draw-segformer-synthetic-only-20261101`, version 2, completed successfully. Version 1 failed before completing an epoch and produced no model artifacts. Version 2's metrics, ONNX validation, data fingerprint, and artifact hashes were downloaded and checked.
 
 ## Scope and label authority
 
@@ -51,8 +51,55 @@ The existing Kaggle kernel `guzzbr/draw-segformer-v1-4class` is not the baseline
 - Embedded current branch training code SHA-256: `0f08df81b926429f6ca614ef3d2afa6a2d1f81490c3657510216e0175cd961cb`; config SHA-256: `e1f049a8812c3679d68530523e6938dc925f1090d56c5fb1a943b897730054b5`.
 - Version 1 was private and did pass the mounted-data fingerprint, split and label checks on a Tesla T4. It failed at the end of the first training epoch because `train.py` called `require_valid_evaluation` without defining it. No epoch checkpoint or model output was saved. That missing fail-closed validation helper was added, covered by the local smoke test, embedded in version 2, and the new private version was pushed. Version 2's first status is `RUNNING`.
 
+## Version 2 result
+
+- Final Kaggle status: `KernelWorkerStatus.COMPLETE`; runtime was `3,841.15 s` (about 64 min). Kernel metadata confirms `is_private=true`, GPU enabled, and Tesla T4 machine shape. Runtime reported `GPU Tesla T4`.
+- Runtime packages: Python 3.13.15, PyTorch 2.11.0+cu128, Transformers 5.16.1, NumPy 2.1.3, OpenCV 4.14.0.94, ONNX 1.22.0, ONNX Runtime 1.20.1.
+- Full training completed all 30 epochs. Best checkpoint selected using validation only. Training source counts: 2,400 synthetic / 0 real; split counts: 2,400 train / 300 val / 300 test. The test split was evaluated once after checkpoint selection.
+- The runtime recomputed the input inventory: 9,001 files / 1,685,442,658 bytes, fingerprint `4d98f653506439d6cb059be6c1e94883a6f6a394ff916b1c10300f68cbe16dfa`; it matches the pre-kernel audit. Split manifest SHA-256 remained `9ba05ab08ad5bf276a96b527777424b8e143958a31d192e7862d458af105c931`.
+
+### Metrics
+
+All metrics below are from procedural synthetic labels. They are not human-reviewed and do not measure camera performance.
+
+| Split | Class | IoU | Dice | Precision | Recall |
+|---|---|---:|---:|---:|---:|
+| Val | background | 0.996586 | 0.998290 | 0.999802 | 0.996783 |
+| Val | paper | 0.985865 | 0.992882 | 0.992508 | 0.993257 |
+| Val | hand | 0.942276 | 0.970280 | 0.956242 | 0.984737 |
+| Val | ink | 0.747902 | 0.855771 | 0.825282 | 0.888600 |
+| Test | background | 0.998097 | 0.999047 | 0.999728 | 0.998368 |
+| Test | paper | 0.987072 | 0.993494 | 0.995675 | 0.991322 |
+| Test | hand | 0.951911 | 0.975363 | 0.965495 | 0.985436 |
+| Test | ink | 0.741492 | 0.851559 | 0.790154 | 0.923312 |
+
+Validation mIoU is `0.9181574974`, a delta of `+0.0004540106` against baseline `0.9177034868`. Validation ink IoU is `0.7479022100`, a delta of `+0.0045592588` against baseline `0.7433429512`. Both pre-fixed validation criteria passed. Synthetic test mIoU is `0.9196427878` and test ink IoU is `0.7414916808`. The baseline artifact has no stored test metrics, so only validation scores were compared between baseline and candidate; the test score above is candidate-only.
+
+The trainer currently records ink tolerance for the first validation/test batch (`ink_tolerance_sample`), not a full-split aggregate. The recorded samples are: val radius 2 px P/R `0.973748/0.999511`, radius 3 px `0.973748/1.000000`; test radius 2 px `0.999876/0.998782`, radius 3 px `1.000000/0.999865`. Treat these as examples, not aggregate split metrics. A next-cycle improvement is to aggregate tolerance over every image.
+
+### ONNX and artifacts
+
+ONNX validation passed on the same validation batch: `status=ok`, `max_abs_diff=6.484985e-05` (limit `1e-3`), minimum argmax IoU `1.0` (limit `0.99`), argmax agreement `1.0`.
+
+| Artifact | Bytes | SHA-256 |
+|---|---:|---|
+| `checkpoints/best.pt` | 14,932,509 | `beb7d6cb8ed529f8584180dcc57684fc9fc72fa86ce0be8d733621061c17f048` |
+| `checkpoints/last.pt` | 14,932,509 | `c934304761807b5f7992ed6189e9f881540a4eeef7f3dde507b0a25ef35e1c5d` |
+| `draw_segmentation_v1.onnx` | 15,181,516 | `5baa56e272df146d67e63983f576508e06d4e1fb3fd97339f3f622bfd8a5da1c` |
+| `classes.json` | 68 | `9a1211b27d7ec6af386aefc87def44453cebc86aba43ad045b4ded345f527c8c` |
+| `metrics.json` | 45,066 | `b085259c99a35c5866aaa222e2b5fbb6e7b6995fcd4e8fac8c7ab4b3290f3c4a` |
+| `training_config.json` | 1,710,863 | `babe75c054c1f6df8cd7e8c9a11a8b0c9ece0aeed7e0f54e008ca1c49f22fc40` |
+| `split_manifest.json` | 1,608,553 | `f065bf351e1dbcbb0e178773e55b31ed4704a71b1d5b11aeadb2534810a6e3a7` |
+| `artifact_hashes.json` | 936 | `e7807f34f1d12fff075f0b65e1d506b0c303cd9a819afdf6b422fe4b68318760` |
+
+All seven output artifacts listed in `artifact_hashes.json` were independently re-hashed locally and matched the recorded sizes and SHA-256 values. The downloaded private kernel outputs are retained under ignored `.kaggle-staging/remote-audit-20261101/current/new-kernel-output-v2/`.
+
+## Limitations and next cycle
+
+This successful run is an exploratory synthetic pretraining result only. There are still no human-reviewed real pixel masks and no independent real-camera holdout. Do not present the result as real-world quality, mix it with temporal-model metrics, or activate it in the live camera. Next cycle: annotate and adjudicate pixel-level real masks, reserve a new unseen capture session as real holdout, aggregate tolerance metrics over full splits, and evaluate baseline and candidate once on the frozen synthetic test without using it for model selection.
+
 The locally available `guzzbr/draw-training-code` version 3 was audited and found older than this branch's trainer. To avoid changing any Kaggle dataset version, the private notebook embeds and hashes the exact current branch `train.py` and `config.json`.
 
 ## Pending result fields
 
-Update this report after version 2 reaches a terminal state with: final kernel status and run time; runtime GPU and package versions; actual input fingerprint; train/val/test counts; per-class val/test metrics; baseline deltas and gates; ONNX validation; SHA-256 for `best.pt`, `last.pt`, ONNX, metrics/config/manifest and output hash manifest. If the run fails or validation is skipped, report it as failed/unvalidated and do not describe it as a successful training result.
+Final report fields are recorded above. Version 1 remains a failed code attempt; only version 2 passed the pre-fixed validation and ONNX gates.
