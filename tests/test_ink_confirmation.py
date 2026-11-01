@@ -11,6 +11,15 @@ sinteticos (sem modelo) e afirmam o comportamento novo:
 - traco estavel confirma (forte na 2a passada, lapis fraco na 3a);
 - pagina parada assenta (trava U2) e escrita nova reabre;
 - virada de pagina dispara o evento U3; borracha, nao.
+
+Hotfix 2026-11-01 (draw-lab/page-turn-falsefire-2026-11-01): o
+gatilho de cobertura do U3 disparou a cada 2-5 s ao vivo (o warp
+balanca com a oscilacao real dos cantos do caderno aberto e a
+cobertura desaba sem pagina virar; cada disparo zerava o canvas).
+O disparo automatico ficou atras de DRAW_PAGE_TURN_EVENT=1,
+DESLIGADO por padrao: os testes do caminho da virada ligam a
+flag explicitamente, e os testes novos do default afirmam que
+colapso de cobertura nao dispara nem zera nada.
 """
 
 import sys
@@ -106,7 +115,10 @@ def test_new_stroke_reopens_settled_page_and_enters():
     assert entered is not None, "traco novo nao entrou apos reabrir"
 
 
-def test_page_turn_fires_once_after_two_decorrelated_passes():
+def test_page_turn_fires_once_after_two_decorrelated_passes(monkeypatch):
+    # Caminho preservado do U3: so existe com a flag ligada
+    # (hotfix 2026-11-01 — default desligado, ver o docstring).
+    monkeypatch.setenv("DRAW_PAGE_TURN_EVENT", "1")
     acc = _acc()
     page_a = (10, 70, 10, 70)  # 3600 px confirmados
     for _ in range(4):
@@ -121,7 +133,10 @@ def test_page_turn_fires_once_after_two_decorrelated_passes():
     assert not third["turn"]  # uma vez por geracao
 
 
-def test_eraser_does_not_fire_turn():
+def test_eraser_does_not_fire_turn(monkeypatch):
+    # Com a flag LIGADA: a borracha segue sem disparar — o guarda
+    # negativo continua valendo pro caminho preservado do U3.
+    monkeypatch.setenv("DRAW_PAGE_TURN_EVENT", "1")
     acc = _acc()
     page = (10, 70, 10, 70)
     for _ in range(4):
@@ -176,6 +191,87 @@ def test_rigid_shift_without_new_ink_does_not_grow_canvas():
     old_px = int(np.count_nonzero(union))
     assert old_px >= 1.8 * 300  # uniao antiga: halo inteiro entra
     assert new_px <= 1.25 * 300  # confirmado + trava: ~so o nucleo
+
+
+def test_coverage_collapse_never_fires_turn_by_default(monkeypatch):
+    """Hotfix 2026-11-01: sem DRAW_PAGE_TURN_EVENT, colapso total
+    de cobertura (o falso disparo do balanco de geometria) NAO
+    dispara virada e o canvas fica intacto, passada apos passada."""
+    monkeypatch.delenv("DRAW_PAGE_TURN_EVENT", raising=False)
+    acc = _acc()
+    page_a = (10, 70, 10, 70)  # 3600 px confirmados
+    for _ in range(4):
+        acc.add(_prob(rects=[page_a]))
+    assert int(np.count_nonzero(acc.canvas)) == 3600
+    # Cobertura zero sustentada: era o disparo a cada 2 passadas.
+    for _ in range(6):
+        result = acc.add(_prob())
+        assert not result["turn"]
+    # Cobertura parcial descorrelacionada (retangulo disjunto):
+    # tambem nada.
+    disjoint = _prob(rects=[(80, 110, 100, 150)])
+    for _ in range(4):
+        result = acc.add(disjoint)
+        assert not result["turn"]
+    assert int(np.count_nonzero(acc.canvas)) >= 3600
+
+
+def test_worker_never_emits_turn_event_by_default(monkeypatch):
+    """Ponta a ponta com o default do hotfix: a tinta some de
+    repente (descorrelacao total, como no balanco ao vivo) e a
+    trabalhadora NAO emite evento de virada — o laco nunca recebe
+    canvas pra snapshot nem motivo pra abrir geracao nova, e o
+    canvas publicado segue com o desenho inteiro."""
+    monkeypatch.delenv("DRAW_PAGE_TURN_EVENT", raising=False)
+    monkeypatch.setattr(
+        app_module, "_PAGE_CLEAN_INTERVAL_SECONDS", 0.01
+    )
+    monkeypatch.setattr(app_module, "_SETTLED_PROBE_SECONDS", 0.05)
+
+    class _VanishingInk:
+        threshold = 0.7
+
+        def __init__(self):
+            self.calls = 0
+            self.vanished = False
+
+        def ink_prob(self, _warped):
+            self.calls += 1
+            if self.vanished:
+                return _prob()
+            return _prob(rects=[(10, 70, 10, 70)])
+
+    fake = _VanishingInk()
+    worker = app_module._PageCleanWorker(fake).start()
+    try:
+        warp = np.zeros((H, W, 3), dtype=np.uint8)
+        generation = worker.new_generation()
+        deadline = time.monotonic() + 5.0
+        mask = None
+        version = 0
+        while time.monotonic() < deadline:
+            worker.submit(warp, generation)
+            got = worker.poll(generation, version)
+            if got is not None:
+                version, mask = got
+                if int(np.count_nonzero(mask)) == 3600:
+                    break
+            time.sleep(0.01)
+        assert mask is not None
+        assert int(np.count_nonzero(mask)) == 3600
+
+        # A tinta some: varias sondas/passadas descorrelacionadas.
+        fake.vanished = True
+        for _ in range(30):
+            worker.submit(warp, generation)
+            time.sleep(0.01)
+        assert worker.take_turn_event(generation) is None
+        got = worker.poll(generation, 0)
+        assert got is not None
+        _version, mask = got
+        assert int(np.count_nonzero(mask)) == 3600
+    finally:
+        worker.stop()
 
 
 def test_worker_settles_probes_and_reopens(monkeypatch):
