@@ -163,7 +163,9 @@ def run_round(labeled, unlabeled, out_dir, steps, batch=4,
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    student = UNet()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    log(f"device: {device}")
+    student = UNet().to(device)
     teacher = copy.deepcopy(student)
     for p in teacher.parameters():
         p.requires_grad_(False)
@@ -189,8 +191,8 @@ def run_round(labeled, unlabeled, out_dir, steps, batch=4,
             imgs.append(to_tensor(np.ascontiguousarray(img_g)))
             targets.append(torch.from_numpy(
                 np.ascontiguousarray(mask_g))[None])
-        x_lab = torch.stack(imgs)
-        y_lab = torch.stack(targets)
+        x_lab = torch.stack(imgs).to(device)
+        y_lab = torch.stack(targets).to(device)
         logits = student(x_lab)
         loss_sup = supervised_loss(logits, y_lab)
 
@@ -204,8 +206,8 @@ def run_round(labeled, unlabeled, out_dir, steps, batch=4,
                 img_g, _, _, _ = geo_view(img_p, rng)
                 weak.append(to_tensor(np.ascontiguousarray(img_g)))
                 strong.append(to_tensor(strong_view(img_g, rng)))
-            x_weak = torch.stack(weak)
-            x_strong = torch.stack(strong)
+            x_weak = torch.stack(weak).to(device)
+            x_strong = torch.stack(strong).to(device)
             with torch.no_grad():
                 pseudo = torch.sigmoid(teacher(x_weak))
             conf = (pseudo >= INK_THR) | (pseudo <= BG_THR)
@@ -237,13 +239,13 @@ def run_round(labeled, unlabeled, out_dir, steps, batch=4,
         if v.dtype.is_floating_point)
 
     student.eval()
+    student.to("cpu")
     onnx_path = out_dir / "page_clean_round.onnx"
-    dummy = torch.zeros(1, 3, 64, 64)
+    dummy = torch.zeros(1, 3, 256, 256)
     torch.onnx.export(
         student, dummy, str(onnx_path), input_names=["image"],
         output_names=["logits"], opset_version=17, dynamo=False,
-        dynamic_axes={"image": {0: "n", 2: "h", 3: "w"},
-                      "logits": {0: "n", 2: "h", 3: "w"}})
+        dynamic_axes={"image": {0: "n"}, "logits": {0: "n"}})
     first = float(np.mean(sup_history[:3]))
     last = float(np.mean(sup_history[-3:]))
     metrics = {
