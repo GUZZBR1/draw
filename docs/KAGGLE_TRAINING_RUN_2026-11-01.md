@@ -98,7 +98,9 @@ All seven output artifacts listed in `artifact_hashes.json` were independently r
 
 An additional local CPU inference smoke used ONNX Runtime 1.20.1 on eight synthetic **training** images (no labels loaded, no metrics, no holdout). The model hash matched the artifact hash above. It accepted input `image` with shape `N×3×512×512` and produced finite `logits` with shape `8×4×128×128`; argmax returned all four class IDs across the batch. Batch inference took 2.50 s (about 0.313 s/frame at batch size 8 on this CPU; not a single-frame latency benchmark). The ephemeral environment and JSON result are under ignored `.kaggle-staging/model-inference-test-20261101*` paths.
 
-This smoke verifies that the exported ONNX runs locally, not that the new segmentation model is a drop-in replacement in the current app. `draw/neural.py` still requests `mask_logits` plus `presence_logit` and interprets two channels for paper detection; this model exports one four-class `logits` output for ink segmentation. Integration needs an explicit adapter/product change and separate validation, and was not attempted here.
+At the time of this training report, app integration had not yet been attempted. The follow-up branch `feature/segformer-runtime-support` adds a distinct opt-in adapter and CLI path; it leaves the legacy `draw/neural.py` paper detector unchanged. The smoke validates runtime execution and adapter contract, not camera quality or live latency.
+
+The adapter smoke then processed eight synthetic training frames through the application wrapper, verified class IDs and masks at source resolution, and warped the categorical output into paper coordinates. It loaded no labels and computed no quality metrics. Mean CPU inference was about 0.20 s/frame in this local smoke; this is not a camera throughput benchmark. Detailed ignored output: `.kaggle-staging/model-inference-test-20261101/adapter-smoke.json`.
 
 ## Limitations and next cycle
 

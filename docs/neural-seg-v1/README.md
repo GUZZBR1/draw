@@ -1,10 +1,10 @@
 # Segmentação neural v1 do Draw — background / paper / hand / ink
 
-> **Contexto atual:** este documento registra o plano original do modelo
-> single-frame de quatro classes. O app tem um adaptador para esse contrato
-> em `draw/neural.py`. O modelo temporal de tinta pareada tem um caminho
-> experimental opt-in próprio e continua aguardando validação de runtime e
-> webcam. Consulte [`INDEX.md`](INDEX.md) para navegar os documentos.
+> **Contexto atual:** o app tem um caminho experimental opt-in para o ONNX
+> single-frame em `draw/segmentation.py`, chamado por
+> `--segmentation-model`. `draw/neural.py` e `--neural` continuam sendo o
+> detector legado da folha. Segmentação visível e detecção temporal são
+> etapas distintas. Consulte [`INDEX.md`](INDEX.md) para navegar os documentos.
 
 Modelo de segmentação semântica com 4 classes, treinado no Kaggle,
 para o pipeline do Draw:
@@ -17,13 +17,13 @@ SegFormer-B0 (transfer learning)
 background / paper / hand / ink
 ```
 
-Depois, no Draw (fora deste projeto), o Codex usará assim:
+No Draw, quando `--segmentation-model` for solicitado:
 
 ```text
-paper      → área da folha e homografia
-hand       → região temporariamente bloqueada
-ink        → desenho visível
-background → ignorado
+paper      → pixel visível que pode votar para limpar tinta
+hand       → pixel desconhecido/ocluído; não adiciona nem apaga tinta
+ink        → evidência de tinta visível neste frame
+background → pixel desconhecido; não vota no acumulador
 ```
 
 Quando a mão cobrir o desenho, o modelo retorna `hand` — nunca
@@ -183,8 +183,8 @@ treino, não por este documento.
 
 ## Estado
 
-Este documento começou como plano de treino e interface. O status e o código
-avançaram desde então: `draw/neural.py` aceita o contrato single-frame de
-quatro classes; o modelo pareado de tinta tem integração experimental opt-in,
-sem validação local. Use [`INDEX.md`](INDEX.md) e os relatórios para o estado atual;
-este README preserva o escopo e as decisões originais do modelo v1.
+Este documento começou como plano de treino e interface. A integração atual
+é opt-in e usa `draw/segmentation.py`; ela não substitui o detector legado.
+O modelo foi treinado com dados sintéticos, portanto a integração técnica não
+comprova qualidade em câmera real. Use [`INDEX.md`](INDEX.md) e os relatórios
+para o estado e as limitações atuais.

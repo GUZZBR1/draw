@@ -132,12 +132,22 @@ def test_torch_loss_ignores_unknown_and_is_safe_for_all_unknown():
 
 
 def test_validation_without_any_labeled_pixels_fails_before_checkpoint_selection():
-    with pytest.raises(ValueError, match="não contém pixels rotulados válidos"):
-        require_valid_evaluation({"valid_px": 0, "mean_iou": None})
-    with pytest.raises(ValueError, match="não contém pixels rotulados válidos"):
-        require_valid_evaluation({"valid_px": 10, "mean_iou": None})
-    metrics = {"valid_px": 1, "mean_iou": 0.5}
-    assert require_valid_evaluation(metrics) is metrics
+    with pytest.raises(
+        ValueError, match="split validation sem pixels supervisionados"
+    ):
+        require_valid_evaluation(
+            {"valid_px": 0, "mean_iou": None}, "validation"
+        )
+    with pytest.raises(ValueError, match="split validation sem mean_iou válido"):
+        require_valid_evaluation(
+            {"supervised_px": 10, "mean_iou": None}, "validation"
+        )
+    class_metrics = {
+        key: {name: 0.5 for name in ("iou", "dice", "precision", "recall")}
+        for key in ("background", "paper", "hand", "ink")
+    }
+    metrics = {"supervised_px": 1, "mean_iou": 0.5, **class_metrics}
+    assert require_valid_evaluation(metrics, "validation") is metrics
 
 
 def test_ink_tolerance_is_undefined_without_annotated_ink():

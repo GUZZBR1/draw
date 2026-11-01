@@ -1,10 +1,9 @@
 # Integração do modelo de segmentação v1 (4 classes) com o Draw
 
-> Documento de interface. Não é implementação.
-> Quem integra é o Codex, depois, em `draw/neural.py`.
-> Este documento não altera o contrato atual e não simplifica o modelo
-> para caber nele: o modelo de 4 classes é o que é, e a integração é
-> que se adapta a ele.
+> Contrato do modelo e do caminho experimental opt-in.
+> A implementação está em `draw/segmentation.py` e `draw/app.py`.
+> Ela não substitui o detector legado `--neural` e não detecta traços
+> novos entre frames.
 
 ## 1. O que muda e o que não muda
 
@@ -32,17 +31,16 @@
   argumento ou pela variável `DRAW_NEURAL_MODEL`. O binário fica
   fora do repositório.
 
-### Contrato novo (v1, 4 classes)
+### Contrato novo (v1, 4 classes, `--segmentation-model`)
 
 - O modelo passa a segmentar **o que a câmera vê, pixel a pixel**,
   em 4 classes. Nada aqui é "o que está por baixo da mão" — ver
   a regra de rótulo visível na seção 6.
 - A única saída do ONNX v1 é a segmentação. **Não há `presence_logit`
-  no ONNX v1** (decisão na seção 4). Quem precisar do sinal de
-  presença deriva-o da máscara de paper, de forma determinística.
-- O pipeline de quadrilátero (`fit_quad`) continua idêntico. O que
-  muda é só a origem da máscara: antes, canal paper de um modelo
-  de 2 canais; agora, canal paper de um modelo de 4 canais.
+  no ONNX v1.**
+- O modelo não é usado para localizar a folha nesta integração. O
+  detector clássico ou o detector legado `--neural` continua responsável
+  pelos cantos; a nova opção fornece a máscara visível de tinta.
 
 ## 2. Input do ONNX v1
 
@@ -64,8 +62,8 @@ Ordem das operações, sem atalho: BGR → RGB → resize 512×512 →
 | Item | Valor |
 |---|---|
 | Nome do output | `logits` (único output do ONNX v1) |
-| Shape | `[1, 4, 512, 512]`, float32, logits (não probabilidades) |
-| Pós-processamento | softmax sobre o eixo dos canais (dimensão 1) e depois `argmax` sobre o mesmo eixo |
+| Shape do ONNX atual | `[1, 4, 128, 128]`, float32, logits (não probabilidades) |
+| Pós-processamento | redimensionar logits bilinearmente para 512×512 (como no avaliador do treino) e depois aplicar `argmax` sobre os canais |
 
 Ordem das classes, fixa e documentada em `classes.json`:
 
@@ -82,7 +80,13 @@ Ordem das classes, fixa e documentada em `classes.json`:
 que troque essa ordem é um modelo diferente e precisa de uma nova
 versão do documento, não de um ajuste silencioso na integração.
 
-## 4. Decisão: `paper_presence` — derivado da máscara, não cabeça auxiliar
+## 4. Proposta original de `paper_presence` (não implementada)
+
+Esta seção descreve a proposta anterior de também derivar a presença e
+os cantos da classe `paper`. Ela foi substituída pela separação de
+responsabilidades: este ONNX segmenta pixels; o detector clássico ou o
+detector legado `--neural` localiza a folha. A classe `paper` continua
+disponível em `predict_masks`, mas não decide presença no caminho atual.
 
 ### Decisão documentada
 
@@ -145,7 +149,12 @@ medida.
   como v2, como output adicional, sem quebrar a segmentação —
   nunca como substituto silencioso da máscara.
 
-## 5. Thresholds
+## 5. Thresholds da proposta original de localização da folha
+
+Os thresholds para `paper_presence` abaixo pertencem à proposta
+histórica da seção 7a. O caminho experimental atual não deriva cantos
+nem presença de folha; ele usa diretamente o `argmax` categórico e não
+introduz threshold de confiança.
 
 | Onde | Valor | Por quê |
 |---|---|---|
@@ -160,29 +169,31 @@ e a métrica que o justifica.
 
 ## 6. Como extrair cada máscara
 
-Todas as máscaras saem do mesmo `argmax`, na resolução 512×512, e
-só depois são redimensionadas para o tamanho do frame original,
-com `INTER_NEAREST` (nunca interpolação linear em máscara binária,
-que criaria valores intermediários falsos), em uint8 0/255.
+O ONNX atual emite logits 128×128. O consumidor redimensiona cada
+canal bilinearmente para 512×512 antes do `argmax`, como faz o avaliador
+do treino. O mapa categórico resultante é redimensionado para o frame
+original com `INTER_NEAREST`, preservando IDs inteiros sem criar classes
+intermediárias. `predict_classes` retorna IDs `uint8` 0..3;
+`predict_masks` retorna quatro máscaras booleanas nomeadas.
 
 ```text
-seg        = argmax(softmax(logits), dim=canais)   # [512, 512], valores 0..3
-paper_mask = (seg == 1)   # folha visível
-hand_mask  = (seg == 2)   # mão visível
-ink_mask   = (seg == 3)   # traço visível
+logits_512 = resize_bilinear(logits, 512, 512)     # [1, 4, 512, 512]
+seg        = argmax(logits_512, dim=canais)        # [512, 512], valores 0..3
+paper_mask = (seg == 1)   # folha visível, bool
+hand_mask  = (seg == 2)   # mão visível, bool
+ink_mask   = (seg == 3)   # traço visível, bool
 # background = (seg == 0), ignorado pelo Draw
-# cada máscara: resize para (frame_w, frame_h), INTER_NEAREST, * 255
+# IDs: resize para (frame_w, frame_h), INTER_NEAREST
 ```
 
 Pontos importantes:
 
-- As três máscaras estão em **coordenadas do frame original**,
-  não da folha retificada. O warp para a folha (homografia) vem
-  depois, a partir do quadrilátero de `paper_mask`, e é trabalho
-  da integração/app — não deste documento e não do modelo.
-- `hand_mask` e `ink_mask` são saídas novas do v1. O contrato
-  atual não as tem. A integração deve expô-las (ver seção 7),
-  mas o app atual não precisa usá-las até o Codex decidir como.
+- As classes ficam alinhadas ao frame original antes do warp para
+  coordenadas do papel. O app aplica a homografia já fornecida pelo
+  detector de folha, usando `INTER_NEAREST`.
+- `hand_mask` e `ink_mask` são saídas single-frame. O app usa tinta
+  visível como observação e mão/fundo como pixels desconhecidos; a
+  memória temporal continua no `InkAccumulator`.
 - As máscaras são mutuamente exclusivas por construção (argmax):
   um pixel é exatamente uma classe. Isso é o que implementa a
   regra de rótulo visível (abaixo).
@@ -207,13 +218,44 @@ sintética, **não** é classe de treinamento, **não** entra no ONNX
 e **não** deve ser usada como rótulo. Ela servirá, no futuro,
 para avaliar o sistema de memória do Draw — fora deste escopo.
 
-## 7. Conversão paper → contrato atual (o que o Codex fará depois)
+## 7. Integração atual do app
+
+O runtime está em `draw/segmentation.py` e é ativado explicitamente por
+`--segmentation-model MODELO.onnx` ou `DRAW_SEGMENTATION_MODEL`. A flag
+`--neural` e `draw/neural.py` permanecem no contrato legado de detecção
+de folha; não passe o ONNX de quatro classes a essa flag.
+
+No modo experimental, o app infere no frame da câmera e transforma o
+mapa de classes para coordenadas do papel com vizinho mais próximo.
+Classe 3 (`ink`) vira evidência de tinta; classes 1 (`paper`) e 3 são
+pixels visíveis. Classes 2 (`hand`) e 0 (`background`) são desconhecidas
+e não podem adicionar tinta nem votar para apagá-la. A observação de um
+único frame vai para o `InkAccumulator` existente, que continua sendo a
+memória temporal. Sem a flag, o app mantém a extração clássica. Uma falha
+durante a inferência é avisada e usa a extração clássica naquele frame;
+falha de dependência/contrato interrompe o carregamento explicitamente.
+
+O caminho está desligado por padrão e é exploratório. O smoke sintético
+valida execução e contrato, não a qualidade em câmera real ou latência ao
+vivo. Não houve ativação da câmera.
+
+Verificação desta integração: suíte completa com OpenCV contrib 4.10.0,
+ONNX Runtime 1.20.1: 203 testes passaram e 1 foi ignorado. O smoke ONNX
+usou somente imagens sintéticas do split de treino, sem rótulos ou métricas.
+
+## 7a. Proposta original de conversão paper → detector (substituída)
+
+O texto abaixo preserva o plano anterior de reutilizar a saída de paper
+para mudar o detector de folha. Ele não descreve o comportamento atual.
+Os passos e checklists nesta subseção estão arquivados como histórico,
+não são pendências da integração atual. Não execute o harness real/holdout
+proposto aqui para validar ou ajustar este modelo sintético.
 
 Passo a passo, reutilizando o que já existe:
 
 1. Rodar o ONNX v1 no frame (seção 2) e obter `logits`
-   `[1, 4, 512, 512]`.
-2. Softmax + argmax → `paper_mask` 512×512 (seção 6).
+   `[1, 4, 128, 128]` no artefato atual.
+2. Redimensionar logits bilinearmente para 512×512 e aplicar `argmax`.
 3. Redimensionar `paper_mask` para o tamanho do frame com
    `INTER_NEAREST`, em uint8 0/255.
 4. Chamar `fit_quad(máscara, frame)` — o mesmo de hoje, sem
@@ -273,7 +315,7 @@ resolver, não detalhe a improvisar na hora:
 
 | Arquivo | Conteúdo |
 |---|---|
-| `draw_segmentation_v1.onnx` | Modelo v1, input `image` `[1,3,512,512]`, output `logits` `[1,4,512,512]` |
+| `draw_segmentation_v1.onnx` | Modelo v1, input `image` `[1,3,512,512]`, output atual `logits` `[1,4,128,128]` |
 | `classes.json` | `{"0": "background", "1": "paper", "2": "hand", "3": "ink"}` |
 | `metrics.json` | Métricas por classe (IoU e Dice por classe, precision, recall) e métrica de ink com tolerância espacial |
 | `training_config.json` | Arquitetura, entrada, loss, seeds, hiperparâmetros — tudo para reproduzir o treino |

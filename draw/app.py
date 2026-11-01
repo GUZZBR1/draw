@@ -41,6 +41,7 @@ from . import light as light_module
 from . import light_guard as light_guard_module
 from . import neural as neural_module
 from . import paper as paper_module
+from . import segmentation as segmentation_module
 from . import sequence as sequence_module
 from . import strokes as strokes_module
 
@@ -229,6 +230,13 @@ def _ink_input(warped, light_normalize="off"):
     return light_module.normalize_light(warped, light_normalize)
 
 
+def _ink_observation_for_frame(warped, light_normalize="off", class_mask=None):
+    """Select experimental semantic ink or the unchanged classic extractor."""
+    if class_mask is not None:
+        return segmentation_module.ink_observation(class_mask)
+    return ink_module.extract_ink(_ink_input(warped, light_normalize)), None
+
+
 def detect_sheet_with_light_guard(frame, light_normalize="off"):
     """Delega para draw/light_guard.py (off primeiro, background depois)."""
     return light_guard_module.detect_sheet_with_light_guard(
@@ -326,10 +334,30 @@ def _fit(image, max_h=700):
     return cv2.resize(image, (int(w * scale), max_h))
 
 
+def _resolve_segmentation_model(explicit_path, environ=None):
+    """Resolve the opt-in segmentation model path; disabled by default."""
+    environ = os.environ if environ is None else environ
+    model_path = explicit_path or environ.get("DRAW_SEGMENTATION_MODEL")
+    if explicit_path is not None and not model_path:
+        raise ValueError(
+            "--segmentation-model sem caminho: informe MODELO.onnx ou "
+            "defina DRAW_SEGMENTATION_MODEL"
+        )
+    return model_path
+
+
 def run(source=0, save_dir="captures", markers_mode=False, width=None,
         height=None, fps=None, backend=None, reconnect_attempts=3,
         open_timeout_ms=3000, neural_model=None, capture_all_frames=False,
-        light_normalize="off", session_mode=False, hand_model=None):
+        light_normalize="off", session_mode=False, hand_model=None,
+        segmentation_model=None):
+    if segmentation_model is not None and markers_mode:
+        raise ValueError("--segmentation-model não combina com --markers")
+    if segmentation_model is not None and hand_model is not None:
+        raise ValueError(
+            "--segmentation-model já fornece a classe hand; não combine "
+            "com --hand-model"
+        )
     neural_detector = None
     if neural_model is not None and not markers_mode:
         neural_detector = neural_module.NeuralSheetDetector(neural_model)
@@ -337,6 +365,18 @@ def run(source=0, save_dir="captures", markers_mode=False, width=None,
         print(
             f"Detector neural ativo: {neural_model}. "
             "O classico cobre os frames em que o neural nao ve folha."
+        )
+
+    ink_segmenter = None
+    if segmentation_model is not None and not markers_mode:
+        ink_segmenter = segmentation_module.InkSegmentationModel(
+            segmentation_model
+        )
+        ink_segmenter.load()
+        print(
+            "Segmentação experimental de tinta ativa. Resultados sintéticos "
+            "não validam qualidade em câmera real; a extração clássica será "
+            "usada como fallback em falhas de inferência."
         )
 
     hand_masker = None
@@ -446,6 +486,7 @@ def run(source=0, save_dir="captures", markers_mode=False, width=None,
     accumulated_canvas = None
     frame_number = 0
     falhas_seguidas = 0
+    segmentation_warning_reported = False
     while True:
         ok, frame = capture.read()
         if not ok:
@@ -485,6 +526,8 @@ def run(source=0, save_dir="captures", markers_mode=False, width=None,
 
         if markers_mode:
             warped, markers = paper_module.warp_paper(frame)
+            frame_classes = None
+            warped_classes = None
         else:
             markers = {}
             if tracker.should_detect(frame_number):
@@ -508,6 +551,23 @@ def run(source=0, save_dir="captures", markers_mode=False, width=None,
                 if tracker.corners is not None
                 else None
             )
+            frame_classes = None
+            warped_classes = None
+            if ink_segmenter is not None and warped is not None:
+                try:
+                    frame_classes = ink_segmenter.predict_classes(frame)
+                    warped_classes = segmentation_module.warp_class_mask(
+                        frame_classes, tracker.corners
+                    )
+                except (RuntimeError, ValueError, cv2.error) as error:
+                    frame_classes = None
+                    warped_classes = None
+                    if not segmentation_warning_reported:
+                        print(
+                            "AVISO: segmentação ONNX falhou; usando a "
+                            f"extração clássica de tinta neste frame: {error}"
+                        )
+                        segmentation_warning_reported = True
 
             if ran_detection and tracker.corners is not None:
                 if not ink_session_open:
@@ -520,9 +580,22 @@ def run(source=0, save_dir="captures", markers_mode=False, width=None,
                     np.stack(corner_history), axis=0
                 ).astype(np.float32)
                 ink_warped = paper_module.warp_sheet(frame, ink_corners)
-                observed = ink_module.extract_ink(ink_warped)
-                visible = None
-                if hand_masker is not None:
+                if ink_segmenter is not None and frame_classes is not None:
+                    classes_for_accumulator = segmentation_module.warp_class_mask(
+                        frame_classes, ink_corners
+                    )
+                    observed, visible = _ink_observation_for_frame(
+                        ink_warped,
+                        winning_light["mode"],
+                        class_mask=classes_for_accumulator,
+                    )
+                else:
+                    observed, visible = _ink_observation_for_frame(
+                        ink_warped, winning_light["mode"]
+                    )
+                if hand_masker is not None and not (
+                    ink_segmenter is not None and frame_classes is not None
+                ):
                     camera_mask = hand_masker.mask(frame)
                     if camera_mask is not None:
                         hand_warped = paper_module.warp_sheet(
@@ -576,10 +649,17 @@ def run(source=0, save_dir="captures", markers_mode=False, width=None,
                     status_color,
                     2,
                 )
-            ink_mask = ink_module.extract_ink(
-                _ink_input(warped, winning_light["mode"]),
-                clear_markers=markers_mode,
-            )
+            if warped_classes is None and markers_mode:
+                ink_mask = ink_module.extract_ink(
+                    _ink_input(warped, winning_light["mode"]),
+                    clear_markers=True,
+                )
+            else:
+                ink_mask, _ = _ink_observation_for_frame(
+                    warped,
+                    winning_light["mode"],
+                    class_mask=warped_classes,
+                )
             if tracker is not None:
                 # Amostragem reduzida: uma amostra a cada 5 quadros
                 # retificados, não a cada quadro — o thinning e o
@@ -666,6 +746,14 @@ def main():
         help="detector neural (ONNX) como primario, com o classico de "
         "reserva. Sem caminho, usa a variavel de ambiente "
         "DRAW_NEURAL_MODEL",
+    )
+    parser.add_argument(
+        "--segmentation-model",
+        metavar="MODELO.onnx",
+        default=None,
+        help="usa o SegFormer ONNX de 4 classes para segmentar tinta visível "
+        "(experimental e opt-in); sem caminho, usa DRAW_SEGMENTATION_MODEL. "
+        "Não é detector de traços novos no tempo",
     )
     parser.add_argument(
         "--hand-model",
@@ -826,6 +914,21 @@ def main():
     if args.check:
         parsed = parse_source(args.source)
         sys.exit(run_check(parsed, open_timeout_ms=args.open_timeout_ms))
+    try:
+        segmentation_model = _resolve_segmentation_model(
+            args.segmentation_model
+        )
+    except ValueError as error:
+        parser.error(str(error))
+    if segmentation_model and args.markers:
+        parser.error("--segmentation-model não combina com --markers")
+    if segmentation_model and (
+        args.hand_model is not None or os.environ.get("DRAW_HAND_MODEL")
+    ):
+        parser.error(
+            "--segmentation-model já fornece a classe hand; não combine "
+            "com --hand-model"
+        )
     neural_model = None
     if args.neural is not None:
         if args.markers:
@@ -859,12 +962,13 @@ def main():
             reconnect_attempts=args.reconnect_attempts,
             open_timeout_ms=args.open_timeout_ms,
             neural_model=neural_model,
+            segmentation_model=segmentation_model,
             capture_all_frames=args.capture_all_frames,
             light_normalize=args.light_normalize,
             session_mode=args.session,
             hand_model=hand_model,
         )
-    except (RuntimeError, FileNotFoundError) as error:
+    except (RuntimeError, FileNotFoundError, ValueError) as error:
         print(f"Erro: {error}")
         sys.exit(2)
 
