@@ -94,6 +94,12 @@ ONNX validation passed on the same validation batch: `status=ok`, `max_abs_diff=
 
 All seven output artifacts listed in `artifact_hashes.json` were independently re-hashed locally and matched the recorded sizes and SHA-256 values. The downloaded private kernel outputs are retained under ignored `.kaggle-staging/remote-audit-20261101/current/new-kernel-output-v2/`.
 
+### Post-training ONNX inference smoke
+
+An additional local CPU inference smoke used ONNX Runtime 1.20.1 on eight synthetic **training** images (no labels loaded, no metrics, no holdout). The model hash matched the artifact hash above. It accepted input `image` with shape `N×3×512×512` and produced finite `logits` with shape `8×4×128×128`; argmax returned all four class IDs across the batch. Batch inference took 2.50 s (about 0.313 s/frame at batch size 8 on this CPU; not a single-frame latency benchmark). The ephemeral environment and JSON result are under ignored `.kaggle-staging/model-inference-test-20261101*` paths.
+
+This smoke verifies that the exported ONNX runs locally, not that the new segmentation model is a drop-in replacement in the current app. `draw/neural.py` still requests `mask_logits` plus `presence_logit` and interprets two channels for paper detection; this model exports one four-class `logits` output for ink segmentation. Integration needs an explicit adapter/product change and separate validation, and was not attempted here.
+
 ## Limitations and next cycle
 
 This successful run is an exploratory synthetic pretraining result only. There are still no human-reviewed real pixel masks and no independent real-camera holdout. Do not present the result as real-world quality, mix it with temporal-model metrics, or activate it in the live camera. Next cycle: annotate and adjudicate pixel-level real masks, reserve a new unseen capture session as real holdout, aggregate tolerance metrics over full splits, and evaluate baseline and candidate once on the frozen synthetic test without using it for model selection.
