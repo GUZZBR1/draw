@@ -13,8 +13,8 @@ Uso:
 Sem nenhuma flag, o caminho e o do reinicio de 2026-10-31: folha
 pelo detector neural v3 (models/draw_seg_v3_dyn.onnx, com o classico
 de reserva) e tinta pelo modelo pagina->limpa
-(models/page_clean_unet.onnx), acumulada com confirmacao entre
-passadas (voto sobre a probabilidade) no canvas. A pilha antiga de tinta (heuristica, --ink-model,
+(models/page_clean_unet.onnx), acumulada por uniao simples no
+canvas. A pilha antiga de tinta (heuristica, --ink-model,
 --session-baseline com a tecla C, --hand-model) so roda atras de
 --legacy-ink; passar qualquer uma dessas flags liga o legado com
 aviso.
@@ -463,54 +463,7 @@ _PAGE_CLEAN_INTERVAL_SECONDS = 0.25
 # Teto da espera pela trabalhadora de tinta na saida do app.
 _PAGE_CLEAN_STOP_TIMEOUT_SECONDS = 5.0
 
-# --- Acumulacao com confirmacao (U1) + trava de pagina assentada
-# (U2) + evento de virada (U3), draw-lab/page-turn-latency-2026-11-01.
-# A uniao direta de binarios limiarizados integrava o tremor de
-# registro entre passadas (1-3 px no espaco do papel): pagina vazia
-# parada acumulava o FP de mobiliario deslocado sem limite e traco
-# real engrossava com o tempo de exposicao (relatos ao vivo de
-# 2026-11-01; a regua de passada unica nao ve o efeito porque mede
-# um warp estatico). O gate abaixo e sobre a SAIDA do modelo
-# (probabilidade), nunca sobre diff cru de quadros: o churn medido
-# da webcam (1,5-2,0/bloco) supera o sinal do lapis (0,01-0,17),
-# entao diff cru engoliria o lapis junto.
-# Janela de voto: as ultimas 3 passadas, com duas regras de
-# confirmacao sobre a probabilidade somada na janela:
-# (a) forte: soma >= 1,9 — tinta de verdade (prob ~0,9-1,0 por
-#     passada) confirma na 2a passada;
-# (b) fraco consistente: presente (prob >= 0,5) nas 3 passadas da
-#     janela e soma >= 1,4 — o lapis fraco estavel (~0,5-0,6,
-#     fraco mas na MESMA posicao) confirma na 3a.
-# Copia deslocada de FP/tremor aparece de forma intermitente por
-# posicao: nao fecha (a) em 2 passadas consecutivas na mesma
-# posicao nem (b) nas 3. Atraso declarado da confirmacao: 1
-# passada extra pra tinta forte, 2 pro lapis, ou seja ~250-500 ms
-# a mais na cadencia de 250 ms, uma unica vez por pixel (depois
-# de confirmado, o pixel nao sai nem cresce sem novo voto
-# naquela posicao).
-_INK_VOTE_WINDOW = 3
-_INK_VOTE_SCORE = 1.4
-_INK_VOTE_SCORE_STRONG = 1.9
-_INK_VOTE_HIT = 0.5
-_INK_VOTE_MIN_HITS = 3
-# Trava (U2): passada que confirma <= _INK_SETTLE_NEW_PX pixels
-# novos conta como "sem novidade"; _INK_SETTLE_PASSES seguidas
-# travam a pagina. 25 px em 850x1200 e ~0,0025% da pagina: folga
-# pro residuo de confirmacao sem deixar traco real (centenas de px)
-# passar por novidade pequena.
-_INK_SETTLE_NEW_PX = 25
-_INK_SETTLE_PASSES = 3
-# Assentada, a trabalhadora nao roda passada por submit: guarda o
-# warp mais recente e sonda 1x a cada _SETTLED_PROBE_SECONDS. A
-# sonda e o preco de enxergar escrita nova sem rodar 4 passadas/s
-# pra sempre: atraso maximo declarado da reabertura ~1 s de sonda
-# + a confirmacao U1 que ja existia.
-_SETTLED_PROBE_SECONDS = 1.0
-# Reabertura por escrita nova: pixels fortes (prob > limiar) fora
-# do canvas, sustentados numa unica sonda, acima disto destravam.
-# Um rabisco real tem centenas de px fortes; o residuo de FP de uma
-# passada tem dezenas.
-_INK_REOPEN_NEW_PX = 200
+
 # Virada (U3): canvas com pelo menos _INK_TURN_MIN_CANVAS_PX e a
 # mascara da passada cobrindo <= _INK_TURN_MAX_OVERLAP dele por
 # _INK_TURN_PASSES passadas seguidas = pagina trocada (conteudo
@@ -545,107 +498,6 @@ def _page_turn_event_enabled():
     return os.environ.get(_ENV_TURN_EVENT_VAR, "").strip() == "1"
 
 
-class _ConfirmedInkAccumulator:
-    """Canvas de tinta por geracao, com confirmacao entre passadas.
-
-    Recebe o mapa de probabilidade de cada passada e mantem: a
-    janela das ultimas _INK_VOTE_WINDOW probabilidades, o canvas
-    confirmado (uint8 0/255) e os contadores da trava e da virada.
-    So a trabalhadora de tinta toca nesta classe.
-
-    add() devolve um dict com:
-    - canvas: copia do canvas confirmado (so muda quando ha pixel
-      novo confirmado);
-    - new_px: pixels confirmados nesta passada;
-    - changed: True se o canvas ganhou pixel (quem chama so
-      republica versao quando changed ou na primeira passada);
-    - settled: pagina assentada (U2);
-    - turn: evento de virada detectado nesta passada (U3, uma vez
-      por geracao).
-    """
-
-    def __init__(self, threshold=0.7):
-        self.threshold = float(threshold)
-        self.reset()
-
-    def reset(self):
-        self._canvas = None
-        self._window = deque(maxlen=_INK_VOTE_WINDOW)
-        self._quiet_streak = 0
-        self._settled = False
-        self._low_overlap_streak = 0
-        self._turn_fired = False
-
-    @property
-    def settled(self):
-        return self._settled
-
-    @property
-    def canvas(self):
-        return None if self._canvas is None else self._canvas.copy()
-
-    def add(self, prob):
-        prob = np.asarray(prob, dtype=np.float32)
-        if self._canvas is None or self._canvas.shape != prob.shape:
-            self._canvas = np.zeros(prob.shape, dtype=np.uint8)
-            self._window.clear()
-            self._quiet_streak = 0
-            self._settled = False
-            self._low_overlap_streak = 0
-        canvas_before = int(np.count_nonzero(self._canvas))
-        mask_now = prob > self.threshold
-        # Escrita nova sustentada reabre a trava: medida ANTES de
-        # confirmar, contra o canvas publicado.
-        strong_new = int(np.count_nonzero(mask_now & (self._canvas == 0)))
-        if self._settled and strong_new >= _INK_REOPEN_NEW_PX:
-            self._settled = False
-            self._quiet_streak = 0
-        # Virada: cobertura da mascara nova sobre o canvas velho.
-        # Portao do hotfix 2026-11-01: sem DRAW_PAGE_TURN_EVENT=1
-        # o bloco nem roda — turn fica False sempre, a trabalhadora
-        # nunca gera evento e o laco nunca zera o canvas por
-        # colapso de cobertura.
-        turn = False
-        if (
-            _page_turn_event_enabled()
-            and canvas_before >= _INK_TURN_MIN_CANVAS_PX
-            and not self._turn_fired
-        ):
-            covered = int(np.count_nonzero(mask_now & (self._canvas > 0)))
-            if covered <= _INK_TURN_MAX_OVERLAP * canvas_before:
-                self._low_overlap_streak += 1
-                if self._low_overlap_streak >= _INK_TURN_PASSES:
-                    turn = True
-                    self._turn_fired = True
-            else:
-                self._low_overlap_streak = 0
-        self._window.append(prob.copy())
-        stack = np.stack(list(self._window))
-        score = np.sum(stack, axis=0, dtype=np.float32)
-        hits = np.count_nonzero(stack >= _INK_VOTE_HIT, axis=0)
-        confirmed = (score >= _INK_VOTE_SCORE_STRONG) | (
-            (hits >= _INK_VOTE_MIN_HITS) & (score >= _INK_VOTE_SCORE)
-        )
-        new_mask = confirmed & (self._canvas == 0)
-        new_px = int(np.count_nonzero(new_mask))
-        if new_px:
-            self._canvas[new_mask] = 255
-        if new_px <= _INK_SETTLE_NEW_PX:
-            self._quiet_streak += 1
-            if self._quiet_streak >= _INK_SETTLE_PASSES:
-                self._settled = True
-        else:
-            self._quiet_streak = 0
-        return {
-            "canvas": self._canvas.copy(),
-            "new_px": new_px,
-            "changed": new_px > 0,
-            "settled": self._settled,
-            "turn": turn,
-            "strong_new": strong_new,
-        }
-
-
 class _PageCleanWorker:
     """Tinta pagina->limpa em thread propria, latest-wins.
 
@@ -653,13 +505,9 @@ class _PageCleanWorker:
     segue: a fila tem tamanho 1 e um warp nao processado e
     substituido pelo proximo, nunca acumulado. A trabalhadora roda
     passadas completas do modelo com pelo menos
-    _PAGE_CLEAN_INTERVAL_SECONDS entre inicios, alimenta o
-    _ConfirmedInkAccumulator da geracao (voto entre passadas sobre
-    a probabilidade; a uniao direta de binarios integrava o tremor
-    e foi aposentada) e publica (geracao, versao, mascara) so
-    quando o canvas confirmado muda; o laco colhe com poll() no
-    seu ritmo e renderiza. Pagina assentada, a trabalhadora para
-    de rodar passadas e sonda 1x/s com o warp mais recente.
+    _PAGE_CLEAN_INTERVAL_SECONDS entre inicios, acumula a uniao
+    das mascaras da geracao corrente e publica (geracao, versao,
+    mascara); o laco colhe com poll() no seu ritmo e renderiza.
 
     Geracao e o contrato de sessao da folha: folha nova ou folha
     que sai chama new_generation(), que descarta pendente e
@@ -687,23 +535,16 @@ class _PageCleanWorker:
         self._version = 0
         self._stopped = False
         self._error = None
-        # Trava de pagina assentada (U2): espelho compartilhado do
-        # estado do acumulador + warp guardado pra sonda periodica.
-        self._settled = False
-        self._probe_warp = None
-        self._probe_due = None
-        # Evento de virada (U3) pendente: (geracao, canvas anterior).
-        self._turn_event = None
-        # Geracao nova nao espera a cadencia (U4): a primeira
-        # passada da geracao roda assim que chega.
-        self._expedite = False
         # Estado privado da trabalhadora (so ela toca):
         self._worker_generation = -1
-        self._accumulator = _ConfirmedInkAccumulator(
-            threshold=getattr(page_clean, "threshold", 0.7)
-        )
-        self._published_once = False
+        self._union = None
         self._last_pass_start = None
+        # Evento de virada (U3, desligado por padrao): pendente
+        # (geracao, canvas anterior) + contadores da deteccao por
+        # cobertura sobre a uniao.
+        self._turn_event = None
+        self._low_overlap_streak = 0
+        self._turn_fired = False
 
     def start(self):
         self._thread.start()
@@ -715,11 +556,7 @@ class _PageCleanWorker:
             self._generation += 1
             self._pending = None
             self._published = None
-            self._settled = False
-            self._probe_warp = None
-            self._probe_due = None
             self._turn_event = None
-            self._expedite = True
             self._condition.notify_all()
             return self._generation
 
@@ -727,40 +564,8 @@ class _PageCleanWorker:
         with self._condition:
             if self._stopped or generation != self._generation:
                 return
-            if self._settled:
-                # Pagina assentada: submit nao vira passada; o warp
-                # fica guardado pra sonda periodica da trabalhadora.
-                # O notify e obrigatorio: a trabalhadora pode estar
-                # em espera sem teto esperando o primeiro warp de
-                # sonda (sem ele, a sonda nunca acordava).
-                self._probe_warp = (warped, generation)
-                self._condition.notify_all()
-                return
             self._pending = (warped, generation)
             self._condition.notify_all()
-
-    @property
-    def settled(self):
-        """True quando a pagina assentou e as passadas pararam."""
-        with self._condition:
-            return self._settled
-
-    def take_turn_event(self, generation):
-        """Canvas anterior se a virada (U3) disparou nesta geracao.
-
-        Devolve a copia do canvas da pagina que acabou e limpa o
-        evento; None se nao ha evento pendente pra esta geracao.
-        Quem chama (o laco) salva o snapshot e abre geracao nova.
-        """
-        with self._condition:
-            if (
-                self._turn_event is None
-                or self._turn_event[0] != generation
-            ):
-                return None
-            _gen, canvas = self._turn_event
-            self._turn_event = None
-            return canvas
 
     def poll(self, generation, after_version):
         """(versao, copia da mascara) se ha publicado novo da
@@ -775,42 +580,38 @@ class _PageCleanWorker:
                 return None
             return published[1], published[2].copy()
 
+    def take_turn_event(self, generation):
+        """Canvas anterior se a virada (U3) disparou nesta geracao.
+
+        Devolve a copia do canvas da pagina que acabou e limpa o
+        evento; None se nao ha evento pendente pra esta geracao.
+        Quem chama (o laco) salva o snapshot e abre geracao nova.
+        So dispara com DRAW_PAGE_TURN_EVENT=1 (ver o portao acima).
+        """
+        with self._condition:
+            if (
+                self._turn_event is None
+                or self._turn_event[0] != generation
+            ):
+                return None
+            _gen, canvas = self._turn_event
+            self._turn_event = None
+            return canvas
+
     def _work(self):
         while True:
             with self._condition:
-                # Assentada e sem pendente, a espera e a da sonda:
-                # acorda quando a sonda vence (ou por stop/novo
-                # submit/geracao nova, que notificam).
-                while True:
-                    if self._stopped:
-                        return
-                    if self._pending is not None:
-                        break
-                    if (
-                        self._settled
-                        and self._probe_warp is not None
-                        and self._probe_due is not None
-                    ):
-                        remaining = self._probe_due - time.monotonic()
-                        if remaining <= 0:
-                            self._pending = self._probe_warp
-                            self._probe_warp = None
-                            self._probe_due = None
-                            break
-                        self._condition.wait(timeout=remaining)
-                    else:
-                        self._condition.wait()
+                self._condition.wait_for(
+                    lambda: self._pending is not None or self._stopped
+                )
+                if self._stopped:
+                    return
                 # Cadencia: o intervalo corre com o pendente na
                 # mao; um submit durante a espera o substitui
                 # (latest-wins) e e ele que roda ao vencer. Se a
                 # geracao trocou, new_generation limpou o pendente
-                # e esta volta nao roda nada. Geracao nova (flag
-                # expedite) pula a espera uma vez: a primeira
-                # passada da pagina nova nao paga a cadencia.
+                # e esta volta nao roda nada.
                 while self._last_pass_start is not None:
-                    if self._expedite:
-                        self._expedite = False
-                        break
                     remaining = _PAGE_CLEAN_INTERVAL_SECONDS - (
                         time.monotonic() - self._last_pass_start
                     )
@@ -829,7 +630,7 @@ class _PageCleanWorker:
             # congelava no ultimo quadro e nada era impresso. O erro
             # fica guardado, e o laco principal o reporta.
             try:
-                prob = self._pass_prob(warped)
+                mask = self._page_clean.ink_mask(warped)
             except Exception as error:  # noqa: BLE001 - vai para o laco
                 with self._condition:
                     self._error = error
@@ -843,41 +644,51 @@ class _PageCleanWorker:
                     continue
                 if generation != self._worker_generation:
                     self._worker_generation = generation
-                    self._accumulator.reset()
-                    self._published_once = False
-                result = self._accumulator.add(prob)
-                self._settled = result["settled"]
-                if result["turn"] and self._turn_event is None:
-                    self._turn_event = (generation, result["canvas"])
-                # Republicar so quando o canvas muda: versao nova
-                # sem pixel novo era re-render puro no laco (a
-                # percepcao de "camada, camada, camada" ao vivo).
-                # A primeira passada da geracao publica sempre,
-                # mesmo vazia, pra o laco saber que o canvas existe.
-                if result["changed"] or not self._published_once:
-                    self._published_once = True
-                    self._version += 1
-                    self._published = (
-                        generation,
-                        self._version,
-                        result["canvas"],
-                    )
-                if self._settled:
-                    # Proxima sonda a partir desta passada; o warp
-                    # mais recente chega por submit enquanto isso.
-                    self._probe_due = (
-                        time.monotonic() + _SETTLED_PROBE_SECONDS
-                    )
+                    self._union = None
+                    self._low_overlap_streak = 0
+                    self._turn_fired = False
+                # Virada (U3): cobertura da mascara sobre a
+                # uniao acumulada. O bloco inteiro fica atras de
+                # _page_turn_event_enabled(): desligado por
+                # padrao, nenhum colapso de cobertura gera evento
+                # (hotfix 2026-11-01).
+                if (
+                    self._union is not None
+                    and not self._turn_fired
+                    and _page_turn_event_enabled()
+                ):
+                    canvas_before = int(np.count_nonzero(self._union))
+                    if canvas_before >= _INK_TURN_MIN_CANVAS_PX:
+                        covered = int(
+                            np.count_nonzero(mask & (self._union > 0))
+                        )
+                        if covered <= (
+                            _INK_TURN_MAX_OVERLAP * canvas_before
+                        ):
+                            self._low_overlap_streak += 1
+                            if (
+                                self._low_overlap_streak
+                                >= _INK_TURN_PASSES
+                                and self._turn_event is None
+                            ):
+                                self._turn_event = (
+                                    generation,
+                                    self._union.copy(),
+                                )
+                                self._turn_fired = True
+                        else:
+                            self._low_overlap_streak = 0
+                if self._union is None:
+                    self._union = mask
+                else:
+                    np.maximum(self._union, mask, out=self._union)
+                self._version += 1
+                self._published = (
+                    generation,
+                    self._version,
+                    self._union.copy(),
+                )
                 self._condition.notify_all()
-
-    def _pass_prob(self, warped):
-        """Probabilidade da passada: ink_prob quando o modelo a
-        expoe; senao a mascara binaria como probabilidade 0/1 (o
-        voto segue valendo, sem a graduacao do lapis fraco)."""
-        ink_prob = getattr(self._page_clean, "ink_prob", None)
-        if ink_prob is not None:
-            return ink_prob(warped)
-        return self._page_clean.ink_mask(warped).astype(np.float32) / 255.0
 
     @property
     def error(self):
@@ -1362,8 +1173,8 @@ def run(
             page_clean = candidate
             print(
                 f"Tinta pagina->limpa ativa: {candidate.model_path} "
-                f"(limiar {candidate.threshold}). Canvas por "
-                "confirmacao entre passadas."
+                f"(limiar {candidate.threshold}). Canvas por uniao "
+                "simples das mascaras."
             )
         except (RuntimeError, FileNotFoundError) as error:
             print(
@@ -1490,23 +1301,15 @@ def run(
     corner_history = deque(maxlen=_INK_CORNER_HISTORY)
     ink_session_open = False
     accumulated_canvas = None
-    # Canvas do caminho novo: a mascara acumulada com confirmacao
-    # entre passadas que a trabalhadora publica. None enquanto
-    # nenhuma folha foi lida nesta sessao.
+    # Canvas do caminho novo: a mascara acumulada e a uniao simples
+    # das mascaras do modelo pagina->limpa, sem acumulador temporal.
+    # None enquanto nenhuma folha foi lida nesta sessao.
     clean_mask = None
     # Geracao da tinta assincrona: acompanha a geracao da
     # trabalhadora; folha nova ou folha que sai sobe a geracao e a
     # versao aplicada volta a zero.
     clean_generation = 0
     clean_applied_version = 0
-    # Geometria congelada do caminho page-clean (U2): assentada a
-    # pagina, os cantos que retificam a tinta congelam (a mediana
-    # movel de 5 nao alimenta mais a tinta) — mover o caderno sem
-    # tinta nova nao move o desenho, que vive no espaco do papel.
-    # Descongela em escrita nova (trabalhadora destrava), salto de
-    # geometria confirmado, drop ou virada.
-    clean_frozen_corners = None
-    clean_last_corners = None
     # Buffers donos dos canvas renderizados no laco. O acumulado
     # mora em canvas_buffer de um frame de deteccao ao outro, e
     # view_canvas_buffer serve aos canvas transitorios de exibicao.
@@ -1570,8 +1373,6 @@ def run(
                     session_corners = None
                     freeze_pending = False
                     clean_mask = None
-                    clean_frozen_corners = None
-                    clean_last_corners = None
                     if ink_worker is not None:
                         clean_generation = ink_worker.new_generation()
                         clean_applied_version = 0
@@ -1600,8 +1401,6 @@ def run(
                         # harness headless: 22 quadros com a tinta velha
                         # depois de a folha voltar.
                         accumulated_canvas = None
-                        clean_frozen_corners = None
-                        clean_last_corners = None
                         if ink_worker is not None:
                             clean_generation = ink_worker.new_generation()
                             clean_applied_version = 0
@@ -1626,39 +1425,23 @@ def run(
                     ink_corners = np.median(
                         np.stack(corner_history), axis=0
                     ).astype(np.float32)
-                    clean_last_corners = ink_corners
                     if freeze_pending:
                         session_corners = ink_corners.copy()
                         freeze_pending = False
-                    # Descongelamento da geometria page-clean: a
-                    # trabalhadora destravou (escrita nova) ou o
-                    # rastreador confirmou salto pra longe dos
-                    # cantos congelados (caderno mudou de lugar:
-                    # re-registra a geometria; o canvas, que vive
-                    # no espaco do papel, nao se move).
-                    if clean_frozen_corners is not None and (
-                        (ink_worker is not None and not ink_worker.settled)
-                        or _corner_distance(
-                            tracker.corners, clean_frozen_corners
-                        ) > _SHEET_NEAR_LIMIT_PX
-                    ):
-                        clean_frozen_corners = None
                     warp_corners = (
                         session_corners
                         if session_ink is not None
                         and session_corners is not None
-                        else clean_frozen_corners
-                        if clean_frozen_corners is not None
                         else ink_corners
                     )
                     ink_warped = paper_module.warp_sheet(frame, warp_corners)
                     if page_clean is not None:
                         # Caminho novo: o warp vai para a trabalhadora
                         # de tinta e o laco segue sem esperar o modelo.
-                        # Sem referencia, sem pagina base: o canvas
-                        # confirmado mora na trabalhadora e entra
-                        # pelo poll() logo abaixo, quando uma versao
-                        # nova publica.
+                        # Sem referencia, sem pagina base, sem voto
+                        # temporal: a uniao das mascaras mora na
+                        # trabalhadora e entra no canvas pelo poll()
+                        # logo abaixo, quando uma versao nova publica.
                         ink_worker.submit(ink_warped, clean_generation)
                     else:
                         visible = None
@@ -1727,17 +1510,6 @@ def run(
                         clean_applied_version = 0
                         clean_mask = None
                         accumulated_canvas = None
-                        clean_frozen_corners = None
-                    # Congela a geometria quando a pagina assenta:
-                    # os cantos da ultima deteccao viram os cantos
-                    # da tinta ate um descongelamento (bloco de
-                    # deteccao acima).
-                    if (
-                        ink_worker.settled
-                        and clean_frozen_corners is None
-                        and clean_last_corners is not None
-                    ):
-                        clean_frozen_corners = clean_last_corners.copy()
                     # Trabalhadora morta por excecao: sem isto o canvas
                     # congelava no ultimo quadro e nem o console nem a
                     # janela diziam nada (o erro morria na thread).
