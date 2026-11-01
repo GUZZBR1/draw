@@ -71,3 +71,24 @@ Both ZIPs passed archive integrity checks and contain 5,086 JPEGs and 297 masks,
 ## Known limitations
 
 The package is exploratory. Pseudo-masks have only thumbnail-level triage, fine ink boundaries are not pixel-verified, and 255 is ignored. The user-provided scene descriptions/tags are absent for these frames. The previous training session is not a holdout. This release does not support real-world quality claims or supervised ground-truth evaluation.
+
+## Follow-up audit — 2026-10-31
+
+**Result: blocked before any Kaggle create/update.** The earlier asynchronous create response still cannot be resolved into a verified remote dataset. No duplicate create was attempted, and no existing dataset was updated.
+
+Fresh Kaggle CLI 2.2.4 queries from `training-zone` returned:
+
+| Query | Result |
+|---|---|
+| `kaggle datasets list --mine --format json` | `No datasets found`; does not establish absence because the status endpoint reports missing authentication in this environment. |
+| `kaggle datasets list -s 'draw real capture pool v1' --format json` | `No datasets found`. |
+| `kaggle datasets list --user guzzbr --format json` | Only the public `guzzbr/drawink-corpus` appeared; private datasets are not confirmed by this listing. |
+| `kaggle datasets status guzzbr/draw-real-capture-pool-v1` | Authentication required. |
+| `kaggle datasets files guzzbr/draw-real-capture-pool-v1` | HTTP 403 Forbidden. |
+| `kaggle datasets metadata guzzbr/draw-real-capture-pool-v1` | HTTP 403 Forbidden. |
+
+Consequently, available queries do not verify that the candidate is absent, nor do they verify remote privacy, version, files, sizes, or downloaded hashes. Per the no-duplicate rule, do not retry `create` or `update` until the exact candidate can be queried successfully. Do not report the private release as published. The same access block prevents safe review/update of other private Kaggle datasets from the plan.
+
+Local read-only checks reconfirmed the six staged package-file SHA-256 values and both ZIP integrity checks. The staged `dataset-metadata.json` still declares `isPrivate: true`; this is local intent only, not evidence of remote privacy. Contents remain 5,086 original JPEGs, 297 separate exploratory pseudo-masks, and 4,789 unlabeled frames. Scene labels are not pixel masks, there are no human ground-truth masks, and all samples remain review-only. No kernel or training job was started.
+
+This audit was recorded on local `training-zone` HEAD `670031da361cee01abbc62f183347984ba77b98a` before the follow-up commit. The worktree was clean before this documentation change; it was already two commits ahead of `origin/training-zone`. No push was performed.
